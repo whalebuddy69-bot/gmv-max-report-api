@@ -1,0 +1,12 @@
+node_modules
+dist
+reports/
+
+.env
+.env.*
+
+.claude
+.wrangler
+.vscode
+.DS_Store
+*.log
