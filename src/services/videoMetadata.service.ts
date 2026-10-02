@@ -96,9 +96,16 @@ export async function attachVideoMetadata<T extends { item_id?: unknown }>(rows:
   video_posted_at_source: string | null;
 })[]> {
   const ids = [...new Set(rows.map((r) => r.item_id).filter((id): id is string => typeof id === "string" && /^\d{16,22}$/.test(id)))];
-  const metadata: { item_id: string; username: string | null; posted_at: Date | null; posted_at_source: string | null }[] = ids.length
-    ? await AppDataSource.query("SELECT item_id, username, posted_at, posted_at_source FROM report_video_metadata WHERE item_id = ANY($1::text[])", [ids])
-    : [];
+  let metadata: { item_id: string; username: string | null; posted_at: Date | null; posted_at_source: string | null }[] = [];
+  if (ids.length) {
+    try {
+      metadata = await AppDataSource.query("SELECT item_id, username, posted_at, posted_at_source FROM report_video_metadata WHERE item_id = ANY($1::text[])", [ids]);
+    } catch (error) {
+      // Optional enrichment must not take the financial report offline during a rollout.
+      if ((error as { code?: string })?.code !== "42P01") throw error;
+      logger.warn("Video metadata table missing; serving report without enrichment");
+    }
+  }
   const byId = new Map(metadata.map((m) => [m.item_id, m]));
   return rows.map((row) => {
     const m = byId.get(String(row.item_id));
