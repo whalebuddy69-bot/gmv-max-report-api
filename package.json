@@ -9,6 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node -r reflect-metadata dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "migrate:video-metadata": "node -r reflect-metadata dist/db/migrateVideoMetadata.js",
     "create-user": "ts-node -P tsconfig.scripts.json -r reflect-metadata scripts/createUser.ts",
     "test": "vitest run",
     "test:watch": "vitest"

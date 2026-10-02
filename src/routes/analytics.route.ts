@@ -4,7 +4,9 @@ import * as analytics from "../services/analytics.service";
 import { writeAllMetricsWorkbook, writeLiveRoomsWorkbook } from "../services/excelExport.service";
 import { getStoreAuthorization } from "../services/storeAuthorization.service";
 import { createAuthorizeLink } from "../services/webOAuth.service";
-import { requireAuth } from "../middleware/auth";
+import { requireAuth, requireAdmin } from "../middleware/auth";
+import { startVideoMetadataRefresh } from "../services/videoMetadata.service";
+import { AppDataSource } from "../db/dataSource";
 import { parsePromotionType } from "./promotionType";
 import { ValidationError } from "../utils/errors";
 
@@ -13,6 +15,22 @@ const XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreads
 /** Everything gmv-max-report-web reads. All JWT-protected. */
 export const analyticsRouter = Router();
 analyticsRouter.use(requireAuth);
+
+/** Explicit one-store backfill, admin only; no arbitrary public-video lookups. */
+analyticsRouter.post("/video-metadata/refresh", requireAdmin, async (req, res, next) => {
+  try {
+    const { storeId, limit } = z.object({
+      storeId: z.string().regex(/^\d{16,22}$/),
+      limit: z.number().int().min(1).max(500).default(50),
+    }).parse(req.body);
+    const [target] = await AppDataSource.query("SELECT 1 FROM sync_targets WHERE store_id = $1 LIMIT 1", [storeId]);
+    if (!target) throw new ValidationError("ไม่พบร้านที่ระบุในระบบ");
+    const started = startVideoMetadataRefresh(storeId, limit);
+    res.status(started ? 202 : 409).json({ started, storeId });
+  } catch (error) {
+    next(error);
+  }
+});
 
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "ต้องเป็น YYYY-MM-DD");
 

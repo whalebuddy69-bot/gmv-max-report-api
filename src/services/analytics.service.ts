@@ -1,4 +1,5 @@
 import { AppDataSource } from "../db/dataSource";
+import { attachVideoMetadata } from "./videoMetadata.service";
 
 /**
  * Aggregation queries for the web dashboard.
@@ -415,7 +416,7 @@ export async function creatives(
     params
   );
 
-  return { rows: toNumbers(rows, MONEY_KEYS), total: Number(countRow?.total ?? 0) };
+  return { rows: await attachVideoMetadata(toNumbers(rows, MONEY_KEYS)), total: Number(countRow?.total ?? 0) };
 }
 
 const LIVE_ROOM_MONEY_KEYS = [

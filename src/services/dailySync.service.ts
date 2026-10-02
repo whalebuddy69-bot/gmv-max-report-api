@@ -14,6 +14,7 @@ import { MetricValue, ReportRow, StoreContext, TikTokApiService } from "./tiktok
 import { getAccessTokenForAdvertiser } from "./token.service";
 import { listStoresForAdvertiser, StoreSummary } from "./store.service";
 import { provisionCreatorForStore, ProvisionOutcome } from "./creatorProvisioning.service";
+import { startVideoMetadataRefresh } from "./videoMetadata.service";
 
 /**
  * Syncs GMV Max reports into the daily tables used by the analytics endpoints.
@@ -324,6 +325,10 @@ export async function syncTarget(target: SyncTarget, lookbackDays?: number): Pro
       ...counts,
       apiCalls: apiCallsSoFar,
     });
+
+    // Independent, bounded background enrichment. A public-page failure must never
+    // turn a successfully saved TikTok performance report into a failed sync.
+    startVideoMetadataRefresh(target.storeId);
 
     return {
       runId: run.id,

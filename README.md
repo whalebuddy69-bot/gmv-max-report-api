@@ -102,3 +102,20 @@ cron (ตั้งที่ `SYNC_CRON`) จะหาร้านจาก token
 ## deploy
 
 ตอนนี้รันบน Railway ต่อกับ Postgres ใน project เดียวกัน ตั้ง env ตามด้านบน build ด้วย `npm run build` start ด้วย `npm start` อย่าลืมรัน sql ก่อน
+
+## Creator username / post-date metadata
+
+- `sql/011_video_metadata.sql` adds only `report_video_metadata`; it does not change daily ad metrics or shared bot tables.
+- Railway runs `npm run migrate:video-metadata` before deploying this version. Deploy the API before the web app. For other hosts run this command after building and before starting the new API.
+- After each successful store sync, a separate bounded background job checks up to 50 distinct known video IDs. It covers historical known videos, not just the rolling three-day performance window. Jobs are queued; failures do not fail the ad-report sync.
+- Username comes from TikTok's public oEmbed `author_url`, accepted only when the returned video ID matches. A product card never receives a username. Names are not used as join keys.
+- Post time, when available, is the explicit `createTime` in the matching public TikTok post's structured page data. This is **not an Ads API contract**. Store UTC `posted_at` with source `tiktok_public_page`; page changes, private/deleted posts, challenges, redirects, or rate limits leave it unavailable. No ID-derived date or first-ad date is substituted.
+- Successful metadata is cached for seven days. Partial results retry after one day, unavailable results after six hours. A temporary failure preserves earlier verified values. Background jobs are serialized, two reads run concurrently within a store, and 403/429 stops that store's batch.
+- An active admin can enqueue a one-store refresh with `POST /analytics/video-metadata/refresh`, body `{ "storeId": "7495637369664014736", "limit": 200 }`. Limit is 1–500, with a bounded time budget; repeat only after the previous job has finished if more unknown videos remain. Runtime logs report counts, not secrets or response bodies.
+- `/analytics/creatives` adds nullable `tt_account_username`, `video_posted_at`, and `video_posted_at_source`. Old performance values are untouched. The frontend displays username after the existing display-name column, including exports.
+
+### Counting videos posted in a period
+
+Do not reuse `stat_date` or the current `total_videos` KPI: they describe ad-performance days, not publication. Deduplicate by `item_id` (one video can appear against several products or days), convert period boundaries from Asia/Bangkok to UTC, then apply `[from 00:00, day-after-to 00:00)` to `posted_at`. Always show known-date coverage and unknown counts. The current discovery universe contains only videos present in synced GMV Max reports; it cannot claim to count every shop-linked post, especially posts with no report activity. A complete shop-wide count needs a separate shop/affiliate video inventory and permission check.
+
+Rollback: deploy the prior API/web versions; leave the additive metadata table in place. Do not drop it or run destructive rollback SQL.

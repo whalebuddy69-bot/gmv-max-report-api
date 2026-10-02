@@ -1,0 +1,3 @@
+# Only the additive metadata table. Keep existing Railway build/start settings.
+[deploy]
+preDeployCommand = "npm run migrate:video-metadata"

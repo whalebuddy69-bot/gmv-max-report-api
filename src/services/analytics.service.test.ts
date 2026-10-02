@@ -8,6 +8,7 @@ vi.mock("../db/dataSource", () => ({
 import {
   campaigns,
   creators,
+  creatives,
   dailyAllMetrics,
   dailyContentStats,
   listCampaignOptions,
@@ -26,6 +27,25 @@ function paramsOf(callIndex = 0): unknown[] {
 }
 
 const baseFilter = { from: "2026-08-01", to: "2026-08-31" };
+
+describe("creative username enrichment", () => {
+  it("adds verified metadata after aggregation without changing totals or row count", async () => {
+    const id = "7683142323382832402";
+    queryMock.mockResolvedValueOnce([{ total: "2" }]);
+    queryMock.mockResolvedValueOnce([
+      { item_id: id, tt_account_name: "Su Pyae", cost: "123.45", orders: "4" },
+      { item_id: "-1", tt_account_name: null, cost: "10", orders: "1" },
+    ]);
+    queryMock.mockResolvedValueOnce([{ item_id: id, username: "khaingsupyae999", posted_at: null, posted_at_source: null }]);
+    const result = await creatives({ ...baseFilter, storeIds: ["7495637369664014736"] });
+    expect(result.total).toBe(2);
+    expect(result.rows).toEqual([
+      { item_id: id, tt_account_name: "Su Pyae", cost: 123.45, orders: 4, tt_account_username: "khaingsupyae999", video_posted_at: null, video_posted_at_source: null },
+      { item_id: "-1", tt_account_name: null, cost: 10, orders: 1, tt_account_username: null, video_posted_at: null, video_posted_at_source: null },
+    ]);
+    expect(queryMock.mock.calls[2][1]).toEqual([[id]]);
+  });
+});
 
 beforeEach(() => {
   queryMock.mockReset();
