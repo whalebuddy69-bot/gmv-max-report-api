@@ -94,6 +94,14 @@ const CREATIVE_COLUMNS: ColumnSpec<CreativeRow>[] = [
 
 // --- Live rooms (rows from analytics.liveRooms) ---
 
+/** Analytics supplies seconds; Excel elapsed durations are numeric fractions of a day. */
+function liveDurationSerial(row: Record<string, unknown>): number | null {
+  const seconds = row.duration_seconds;
+  return typeof seconds === "number" && Number.isFinite(seconds) && seconds >= 0
+    ? seconds / 86_400
+    : null;
+}
+
 const LIVE_ROOM_COLUMNS: ColumnSpec<Record<string, unknown>>[] = [
   { header: "Store ID", width: 20, value: (r) => (r.store_id as string) ?? null },
   { header: "Campaign ID", width: 20, value: (r) => (r.campaign_id as string) ?? null },
@@ -101,7 +109,7 @@ const LIVE_ROOM_COLUMNS: ColumnSpec<Record<string, unknown>>[] = [
   { header: "Live Name", width: 40, value: (r) => (r.live_name as string) ?? null },
   { header: "Status", width: 12, value: (r) => (r.live_status as string) ?? null },
   { header: "Launched Time", width: 20, value: (r) => (r.live_launched_time as string) ?? null },
-  { header: "Duration", width: 12, value: (r) => (r.live_duration as string) ?? null },
+  { header: "Duration", width: 14, value: liveDurationSerial, numFmt: "[h]:mm:ss" },
   { header: "Start Date", width: 13, value: (r) => (r.start_date as string) ?? null },
   { header: "Start Time", width: 12, value: (r) => (r.start_time as string) ?? null },
   { header: "End Time", width: 20, value: (r) => (r.end_time as string) ?? null },
