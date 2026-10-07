@@ -8,6 +8,7 @@ import { requireAuth, requireAdmin } from "../middleware/auth";
 import { startVideoMetadataRefresh } from "../services/videoMetadata.service";
 import { AppDataSource } from "../db/dataSource";
 import { parsePromotionType } from "./promotionType";
+import { parseDeliveryStatus } from "./deliveryStatus";
 import { ValidationError } from "../utils/errors";
 
 const XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -262,9 +263,10 @@ analyticsRouter.get("/creatives", async (req, res, next) => {
     const range = parseRange(req.query);
     const { sort, direction } = parseSort(req.query);
     const page = pageSchema.parse(req.query);
+    const deliveryStatus = parseDeliveryStatus(req.query);
 
     const result = await analytics.creatives(
-      { ...range, accountName: page.accountName, contentType: page.contentType },
+      { ...range, accountName: page.accountName, contentType: page.contentType, deliveryStatus },
       sort,
       direction,
       page.limit ?? 100,
@@ -274,6 +276,7 @@ analyticsRouter.get("/creatives", async (req, res, next) => {
     res.json({
       creatives: result.rows,
       total: result.total,
+      statusCounts: result.statusCounts,
       limit: page.limit ?? 100,
       offset: page.offset ?? 0,
     });

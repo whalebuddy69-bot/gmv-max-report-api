@@ -18,6 +18,7 @@ vi.mock("../db/dataSource", () => ({
 vi.mock("./videoMetadata.service", () => ({ attachVideoMetadata: async (rows: unknown[]) => rows }));
 
 import { creatives, creators, dailyContentStats, summary } from "./analytics.service";
+import { completeStatusCounts, CREATIVE_DELIVERY_STATUSES, CREATIVE_DELIVERY_STATUS_FILTERS } from "./creativeDeliveryStatus";
 
 const filter = { from: "2026-10-01", to: "2026-10-03", storeIds: ["store-a"] };
 type Row = Record<string, unknown>;
@@ -146,7 +147,7 @@ describe("creative inventory and latest status: executed PostgreSQL queries", ()
   it("does not fabricate a period row from status-only history outside that period", async () => {
     await insertCreative({ stat_date: "2026-09-30" });
     await insertCreative({ stat_date: "2026-10-06" });
-    expect(await creatives(filter)).toEqual({ rows: [], total: 0 });
+    expect(await creatives(filter)).toEqual({ rows: [], total: 0, statusCounts: completeStatusCounts() });
     expect(await dailyContentStats(filter)).toEqual([]);
     await expect(insertCreative({ stat_date: null })).rejects.toThrow();
   });
@@ -231,5 +232,117 @@ describe("creative inventory and latest status: executed PostgreSQL queries", ()
     expect(queryCalls[0].params).toEqual([filter.from, filter.to, [quoted, "not-selected"], quoted, quoted, quoted, "VIDEO"]);
     expect(queryCalls[1].params).toEqual([...queryCalls[0].params, 100, 0]);
     expect((await db.query("SELECT count(*) AS count FROM report_creative_daily")).rows).toEqual([{ count: 2 }]);
+  });
+});
+
+describe("latest delivery status filters and counts: executed PostgreSQL queries", () => {
+  it("exposes all nine states, unknown placeholders and unrecognized raw values with complete zero-filled counts", async () => {
+    for (const [index, status] of CREATIVE_DELIVERY_STATUSES.entries()) {
+      await insertCreative({ item_id: `known-${index}`, creative_delivery_status: status });
+    }
+    const missing = [null, "", " \t\n ", "-", "\t0\n", "-1"];
+    for (const [index, status] of missing.entries()) {
+      await insertCreative({ item_id: `unknown-${index}`, creative_delivery_status: status });
+    }
+    await insertCreative({ item_id: "future", creative_delivery_status: "FUTURE_API_STATUS" });
+    const all = await creatives(filter);
+    expect(all.total).toBe(16);
+    expect(all.statusCounts).toEqual({
+      ...Object.fromEntries(CREATIVE_DELIVERY_STATUSES.map((status) => [status, 1])), UNKNOWN: 6, OTHER: 1,
+    });
+    for (const status of CREATIVE_DELIVERY_STATUS_FILTERS) {
+      const result = await creatives({ ...filter, deliveryStatus: status });
+      expect(result.statusCounts).toEqual(all.statusCounts);
+      expect(result.total).toBe(all.statusCounts[status]);
+      expect(result.rows).toHaveLength(result.total);
+      if (status !== "UNKNOWN" && status !== "OTHER") {
+        expect(asRows(result).map((row) => row.creative_delivery_status)).toEqual([status]);
+      }
+    }
+    const future = await creatives({ ...filter, deliveryStatus: "OTHER" });
+    expect(asRows(future)[0].creative_delivery_status).toBe("FUTURE_API_STATUS");
+    expect((await creatives({ ...filter, storeIds: ["absent"] })).statusCounts).toEqual(completeStatusCounts());
+  });
+
+  it("filters the newest status, including observations outside the period, without dropping older performance", async () => {
+    await insertCreative({ creative_delivery_status: "LEARNING", cost: 10 });
+    await insertCreative({ stat_date: "2026-10-03", synced_at: "2026-10-10T02:00:00Z", creative_delivery_status: "IN_QUEUE", cost: 20 });
+    await insertCreative({ stat_date: "2026-10-07", synced_at: "2026-10-07T02:00:00Z", creative_delivery_status: "DELIVERING", cost: 999 });
+    const current = await creatives({ ...filter, deliveryStatus: "DELIVERING" });
+    expect(current.total).toBe(1);
+    expect(asRows(current)[0]).toMatchObject({ cost: 30, orders: 4, gross_revenue: 200, creative_delivery_status: "DELIVERING", creative_delivery_status_stat_date: "2026-10-07" });
+    expect(current.statusCounts).toEqual(completeStatusCounts({ DELIVERING: 1 }));
+    for (const deliveryStatus of ["LEARNING", "IN_QUEUE"] as const) {
+      const stale = await creatives({ ...filter, deliveryStatus });
+      expect(stale.total).toBe(0);
+      expect(stale.rows).toEqual([]);
+      expect(stale.statusCounts).toEqual(current.statusCounts);
+    }
+    await db.query("UPDATE report_creative_daily SET creative_delivery_status = NULL WHERE stat_date = '2026-10-07'");
+    const unknown = await creatives({ ...filter, deliveryStatus: "UNKNOWN" });
+    expect(unknown.total).toBe(1);
+    expect(asRows(unknown)[0]).toMatchObject({ cost: 30, creative_delivery_status: null });
+    expect((await creatives({ ...filter, deliveryStatus: "DELIVERING" })).total).toBe(0);
+  });
+
+  it("filters before pagination/export, counts beyond the current page and retains all-zero videos", async () => {
+    for (let index = 0; index < 8; index += 1) {
+      await insertCreative({ item_id: String(index), creative_delivery_status: index % 2 ? "LEARNING" : "IN_QUEUE", cost: 0, orders: 0, gross_revenue: 0, product_impressions: 0, product_clicks: 0 });
+    }
+    const matching = { ...filter, deliveryStatus: "IN_QUEUE" as const };
+    const exported = await creatives(matching, "cost", "DESC", 1000, 0);
+    expect(exported.total).toBe(4);
+    expect(exported.statusCounts).toEqual(completeStatusCounts({ IN_QUEUE: 4, LEARNING: 4 }));
+    const pageOne = await creatives(matching, "cost", "DESC", 2, 0);
+    const pageTwo = await creatives(matching, "cost", "DESC", 2, 2);
+    const beyond = await creatives(matching, "cost", "DESC", 2, 4);
+    expect([...pageOne.rows, ...pageTwo.rows]).toEqual(exported.rows);
+    expect(asRows(exported).map((row) => row.item_id)).toEqual(["0", "2", "4", "6"]);
+    for (const page of [pageOne, pageTwo, beyond]) {
+      expect(page.total).toBe(4);
+      expect(page.statusCounts).toEqual(exported.statusCounts);
+    }
+    expect(beyond.rows).toEqual([]);
+    expect(asRows(exported).every((row) => row.cost === 0 && row.orders === 0)).toBe(true);
+  });
+
+  it("counts exact contexts rather than unique videos and respects every non-status filter", async () => {
+    await insertCreative({ creative_delivery_status: "DELIVERING" });
+    await insertCreative({ item_group_id: "product-b", creative_delivery_status: "LEARNING" });
+    await insertCreative({ campaign_id: "campaign-b", creative_delivery_status: "REJECTED" });
+    await insertCreative({ store_id: "store-b", creative_delivery_status: "EXCLUDED" });
+    await insertCreative({ item_id: "200", tt_account_name: "Other creator", creative_delivery_status: "UNAVAILABLE" });
+    await insertCreative({ item_id: "-1", shop_content_type: "PRODUCT_CARD", creative_delivery_status: null });
+    await insertCreative({ item_id: "not-in-period", stat_date: "2026-10-07", creative_delivery_status: "DELIVERING" });
+    const all = await creatives({ ...filter, storeIds: [] });
+    expect(all.total).toBe(6);
+    expect(all.statusCounts).toEqual(completeStatusCounts({ DELIVERING: 1, LEARNING: 1, REJECTED: 1, EXCLUDED: 1, UNAVAILABLE: 1, UNKNOWN: 1 }));
+    const base = { ...filter, campaignId: "campaign-a", accountName: "Creator", contentType: "VIDEO" };
+    expect((await creatives(base)).statusCounts).toEqual(completeStatusCounts({ DELIVERING: 1, LEARNING: 1 }));
+    const scoped = await creatives({ ...base, itemGroupId: "product-a", deliveryStatus: "LEARNING" });
+    expect(scoped.total).toBe(0);
+    expect(scoped.statusCounts).toEqual(completeStatusCounts({ DELIVERING: 1 }));
+  });
+
+  it("partitions unchanged performance totals and binds the selected status separately from historical daily filters", async () => {
+    await insertCreative({ creative_delivery_status: "LEARNING", cost: 10, orders: 1, gross_revenue: 20 });
+    await insertCreative({ stat_date: "2026-10-03", creative_delivery_status: "DELIVERING", cost: 20, orders: 2, gross_revenue: 40 });
+    await insertCreative({ item_id: "200", creative_delivery_status: "REJECTED", cost: 7, orders: 3, gross_revenue: 90 });
+    await insertCreative({ item_id: "300", creative_delivery_status: null, cost: null, orders: null, gross_revenue: null });
+    const all = await creatives(filter);
+    const partition: Row[] = [];
+    for (const deliveryStatus of CREATIVE_DELIVERY_STATUS_FILTERS) {
+      partition.push(...asRows(await creatives({ ...filter, deliveryStatus })));
+    }
+    expect(partition).toHaveLength(all.total);
+    for (const field of ["cost", "orders", "gross_revenue", "product_impressions", "product_clicks"]) {
+      expect(partition.reduce((sum, row) => sum + Number(row[field] ?? 0), 0)).toBe(asRows(all).reduce((sum, row) => sum + Number(row[field] ?? 0), 0));
+    }
+    expect(partition.find((row) => row.item_id === "300")).toMatchObject({ cost: null, orders: null, gross_revenue: null });
+    queryCalls.length = 0;
+    await creatives({ ...filter, deliveryStatus: "DELIVERING" }, "cost", "DESC", 10, 0);
+    expect(queryCalls[0].params).toEqual([filter.from, filter.to, "store-a", "DELIVERING"]);
+    expect(queryCalls[1].params).toEqual([filter.from, filter.to, "store-a", "DELIVERING", 10, 0]);
+    expect(queryCalls[1].sql).toMatch(/FROM report_creative_daily\s+WHERE stat_date BETWEEN \$1 AND \$2 AND store_id = \$3\s+GROUP BY/);
   });
 });

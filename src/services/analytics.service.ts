@@ -1,5 +1,6 @@
 import { AppDataSource } from "../db/dataSource";
 import { attachVideoMetadata } from "./videoMetadata.service";
+import { completeStatusCounts, CreativeDeliveryStatusCounts, CreativeDeliveryStatusFilter, deliveryStatusBucketSql } from "./creativeDeliveryStatus";
 
 /**
  * Aggregation queries for the web dashboard.
@@ -360,12 +361,12 @@ const CREATIVE_SORTS = new Set([
 ]);
 
 export async function creatives(
-  filter: RangeFilter & { accountName?: string; contentType?: string },
+  filter: RangeFilter & { accountName?: string; contentType?: string; deliveryStatus?: CreativeDeliveryStatusFilter },
   sort = "cost",
   direction: "ASC" | "DESC" = "DESC",
   limit = 100,
   offset = 0
-): Promise<{ rows: unknown[]; total: number }> {
+): Promise<{ rows: unknown[]; total: number; statusCounts: CreativeDeliveryStatusCounts }> {
   const { clause, params } = scope(filter, { campaign: true, product: true });
   const extra: string[] = [];
 
@@ -382,11 +383,34 @@ export async function creatives(
   const orderBy = CREATIVE_SORTS.has(sort) ? sort : "cost";
   const dir = direction === "ASC" ? "ASC" : "DESC";
 
+  // This observation belongs to an exact creative context, across all stored days.
+  // A newer sync of an old report day must not override the newest source day.
+  const latestStatusJoin = `LEFT JOIN LATERAL (
+       SELECT creative_delivery_status, stat_date, synced_at
+       FROM report_creative_daily s
+       WHERE s.store_id = c.store_id AND s.campaign_id = c.campaign_id
+         AND s.item_group_id = c.item_group_id AND s.item_id = c.item_id
+       ORDER BY s.stat_date DESC, s.synced_at DESC
+       LIMIT 1
+     ) latest ON true`;
+  const statusBucket = deliveryStatusBucketSql("latest.creative_delivery_status");
+  const statusParam = filter.deliveryStatus ? `$${params.push(filter.deliveryStatus)}` : undefined;
+
   const [countRow] = await AppDataSource.query(
-    `SELECT count(*) AS total FROM (
-       SELECT 1 FROM report_creative_daily WHERE ${where}
+    `WITH candidates AS (
+       SELECT store_id, campaign_id, item_group_id, item_id
+       FROM report_creative_daily WHERE ${where}
        GROUP BY store_id, campaign_id, item_group_id, item_id
-     ) x`,
+     ), buckets AS (
+       SELECT ${statusBucket} AS status_bucket
+       FROM candidates c
+       ${latestStatusJoin}
+     ), counts AS (
+       SELECT status_bucket, count(*) AS count FROM buckets GROUP BY status_bucket
+     )
+     SELECT coalesce(sum(count)${statusParam ? ` FILTER (WHERE status_bucket = ${statusParam})` : ""}, 0) AS total,
+            coalesce(jsonb_object_agg(status_bucket, count), '{}'::jsonb) AS status_counts
+     FROM counts`,
     params
   );
 
@@ -409,36 +433,35 @@ export async function creatives(
        FROM report_creative_daily
        WHERE ${where}
        GROUP BY store_id, campaign_id, item_group_id, item_id
-       ORDER BY ${orderBy} ${dir} NULLS LAST, store_id, campaign_id, item_group_id, item_id
+     ), matching AS (
+       SELECT c.*, latest.creative_delivery_status,
+              latest.synced_at AS creative_delivery_status_checked_at,
+              to_char(latest.stat_date, 'YYYY-MM-DD') AS creative_delivery_status_stat_date
+       FROM performance c
+       ${latestStatusJoin}
+       ${statusParam ? `WHERE ${statusBucket} = ${statusParam}` : ""}
+       ORDER BY c.${orderBy} ${dir} NULLS LAST, c.store_id, c.campaign_id, c.item_group_id, c.item_id
        LIMIT $${params.length - 1} OFFSET $${params.length}
      )
-     SELECT c.*, campaign_name_ref.campaign_name,
-            latest.creative_delivery_status,
-            latest.synced_at AS creative_delivery_status_checked_at,
-            to_char(latest.stat_date, 'YYYY-MM-DD') AS creative_delivery_status_stat_date
-     FROM performance c
+     SELECT c.*, campaign_name_ref.campaign_name
+     FROM matching c
      LEFT JOIN LATERAL (
        SELECT campaign_name FROM report_campaign_daily
        WHERE campaign_id = c.campaign_id AND store_id = c.store_id
        ORDER BY stat_date DESC
        LIMIT 1
      ) campaign_name_ref ON true
-     LEFT JOIN LATERAL (
-       -- Status is latest KNOWN for this exact context, independently of the
-       -- performance window. A fresh backfill of an old day must not supersede
-       -- the newest report day. Keep a newest null status unknown, not stale.
-       SELECT creative_delivery_status, stat_date, synced_at
-       FROM report_creative_daily s
-       WHERE s.store_id = c.store_id AND s.campaign_id = c.campaign_id
-         AND s.item_group_id = c.item_group_id AND s.item_id = c.item_id
-       ORDER BY s.stat_date DESC, s.synced_at DESC
-       LIMIT 1
-     ) latest ON true
      ORDER BY c.${orderBy} ${dir} NULLS LAST, c.store_id, c.campaign_id, c.item_group_id, c.item_id`,
     params
   );
 
-  return { rows: await attachVideoMetadata(toNumbers(rows, MONEY_KEYS)), total: Number(countRow?.total ?? 0) };
+  return {
+    rows: await attachVideoMetadata(toNumbers(rows, MONEY_KEYS)),
+    total: Number(countRow?.total ?? 0),
+    // Context rows, not distinct videos. Counts ignore only deliveryStatus, and
+    // are independent of the requested page so every filter remains discoverable.
+    statusCounts: completeStatusCounts(countRow?.status_counts),
+  };
 }
 
 const LIVE_ROOM_MONEY_KEYS = [
