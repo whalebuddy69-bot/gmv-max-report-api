@@ -15,6 +15,7 @@ import { getAccessTokenForAdvertiser } from "./token.service";
 import { listStoresForAdvertiser, StoreSummary } from "./store.service";
 import { provisionCreatorForStore, ProvisionOutcome } from "./creatorProvisioning.service";
 import { startVideoMetadataRefresh } from "./videoMetadata.service";
+import { toCreativeRows } from "./creativeDailyRows";
 
 /**
  * Syncs GMV Max reports into the daily tables used by the analytics endpoints.
@@ -579,61 +580,6 @@ function buildLiveRoomRows(rows: ReportRow[], ctx: StoreContext, campaignId: str
       liveFollows: int(m.live_follows),
       syncedAt: new Date(),
     } as LiveRoomDaily);
-  }
-
-  return out;
-}
-
-function toCreativeRows(
-  rows: ReportRow[],
-  ctx: StoreContext,
-  pair: { campaignId: string; itemGroupId: string }
-): CreativeDaily[] {
-  const out: CreativeDaily[] = [];
-
-  for (const row of rows) {
-    const itemId = String(row.dimensions?.item_id ?? "");
-    const statDate = toDate(row.dimensions?.stat_time_day);
-    if (!itemId || !statDate) continue;
-
-    const m = row.metrics ?? {};
-    // skip creatives with no cost and no orders
-    const cost = num(m.cost);
-    const orders = int(m.orders);
-    const impressions = int(m.product_impressions);
-    if ((cost ?? 0) <= 0 && (orders ?? 0) <= 0 && (impressions ?? 0) <= 0) continue;
-
-    out.push({
-      storeId: ctx.storeId,
-      campaignId: pair.campaignId,
-      itemGroupId: pair.itemGroupId,
-      itemId,
-      statDate,
-      advertiserId: ctx.advertiserId,
-      title: attr(m.title),
-      ttAccountName: attr(m.tt_account_name),
-      ttAccountAuthorizationType: attr(m.tt_account_authorization_type),
-      ttAccountProfileImageUrl: attr(m.tt_account_profile_image_url),
-      shopContentType: attr(m.shop_content_type),
-      creativeDeliveryStatus: attr(m.creative_delivery_status),
-      cost,
-      orders,
-      costPerOrder: num(m.cost_per_order),
-      grossRevenue: num(m.gross_revenue),
-      roi: num(m.roi),
-      productImpressions: impressions,
-      productClicks: int(m.product_clicks),
-      productClickRate: num(m.product_click_rate),
-      adClickRate: num(m.ad_click_rate),
-      adConversionRate: num(m.ad_conversion_rate),
-      viewRate2s: num(m.ad_video_view_rate_2s),
-      viewRate6s: num(m.ad_video_view_rate_6s),
-      viewRateP25: num(m.ad_video_view_rate_p25),
-      viewRateP50: num(m.ad_video_view_rate_p50),
-      viewRateP75: num(m.ad_video_view_rate_p75),
-      viewRateP100: num(m.ad_video_view_rate_p100),
-      syncedAt: new Date(),
-    } as CreativeDaily);
   }
 
   return out;

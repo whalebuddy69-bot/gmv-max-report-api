@@ -93,6 +93,10 @@ const MONEY_KEYS = [
   "products",
 ];
 
+// Inventory can include unserved videos. Preserve the pre-inventory definition of
+// activity for delivery KPIs and creator rankings, not for the creative detail table.
+const CREATIVE_ACTIVITY = "(coalesce(cost,0) > 0 OR coalesce(orders,0) > 0 OR coalesce(product_impressions,0) > 0)";
+
 // --- dropdowns ---
 
 export async function listStoresWithData(): Promise<unknown[]> {
@@ -177,7 +181,7 @@ async function contentStatsFor(filter: RangeFilter): Promise<Record<string, unkn
     `WITH per_item AS (
        SELECT item_id, tt_account_name, sum(orders) AS orders
        FROM report_creative_daily
-       WHERE ${clause} AND shop_content_type = 'VIDEO'
+       WHERE ${clause} AND shop_content_type = 'VIDEO' AND ${CREATIVE_ACTIVITY}
        GROUP BY item_id, tt_account_name
      )
      SELECT coalesce(count(*), 0) AS total_videos,
@@ -196,7 +200,7 @@ export async function dailyContentStats(filter: RangeFilter): Promise<unknown[]>
     `WITH per_item_day AS (
        SELECT stat_date, item_id, tt_account_name, sum(orders) AS orders
        FROM report_creative_daily
-       WHERE ${clause} AND shop_content_type = 'VIDEO'
+       WHERE ${clause} AND shop_content_type = 'VIDEO' AND ${CREATIVE_ACTIVITY}
        GROUP BY stat_date, item_id, tt_account_name
      )
      SELECT to_char(stat_date, 'YYYY-MM-DD') AS stat_date,
@@ -337,7 +341,7 @@ export async function creators(filter: RangeFilter, minCost = 0): Promise<unknow
             CASE WHEN sum(product_impressions) > 0
                  THEN 100.0 * sum(product_clicks)/sum(product_impressions) END AS product_click_rate
      FROM report_creative_daily
-     WHERE ${clause} AND tt_account_name IS NOT NULL
+     WHERE ${clause} AND tt_account_name IS NOT NULL AND ${CREATIVE_ACTIVITY}
      GROUP BY tt_account_name
      HAVING coalesce(sum(cost),0) >= $${params.length}
      ORDER BY sum(cost) DESC NULLS LAST`,
@@ -388,31 +392,49 @@ export async function creatives(
 
   params.push(limit, offset);
   const rows = await AppDataSource.query(
-    `SELECT c.store_id,
+    `WITH performance AS (
+       SELECT store_id,
             campaign_id, item_group_id, item_id,
-            max(campaign_name_ref.campaign_name) AS campaign_name,
             max(title) AS title,
             max(tt_account_name) AS tt_account_name,
             max(tt_account_authorization_type) AS authorization_type,
             max(tt_account_profile_image_url) AS tt_account_profile_image_url,
             max(shop_content_type) AS shop_content_type,
-            max(creative_delivery_status) AS creative_delivery_status,
             sum(cost) AS cost, sum(orders) AS orders, sum(gross_revenue) AS gross_revenue,
             CASE WHEN sum(cost) > 0 THEN sum(gross_revenue)/sum(cost) END AS roi,
             sum(product_impressions) AS product_impressions,
             sum(product_clicks) AS product_clicks,
             CASE WHEN sum(product_impressions) > 0
                  THEN 100.0 * sum(product_clicks)/sum(product_impressions) END AS product_click_rate
-     FROM report_creative_daily c
+       FROM report_creative_daily
+       WHERE ${where}
+       GROUP BY store_id, campaign_id, item_group_id, item_id
+       ORDER BY ${orderBy} ${dir} NULLS LAST, store_id, campaign_id, item_group_id, item_id
+       LIMIT $${params.length - 1} OFFSET $${params.length}
+     )
+     SELECT c.*, campaign_name_ref.campaign_name,
+            latest.creative_delivery_status,
+            latest.synced_at AS creative_delivery_status_checked_at,
+            to_char(latest.stat_date, 'YYYY-MM-DD') AS creative_delivery_status_stat_date
+     FROM performance c
      LEFT JOIN LATERAL (
        SELECT campaign_name FROM report_campaign_daily
        WHERE campaign_id = c.campaign_id AND store_id = c.store_id
+       ORDER BY stat_date DESC
        LIMIT 1
      ) campaign_name_ref ON true
-     WHERE ${where}
-     GROUP BY c.store_id, campaign_id, item_group_id, item_id
-     ORDER BY ${orderBy} ${dir} NULLS LAST
-     LIMIT $${params.length - 1} OFFSET $${params.length}`,
+     LEFT JOIN LATERAL (
+       -- Status is latest KNOWN for this exact context, independently of the
+       -- performance window. A fresh backfill of an old day must not supersede
+       -- the newest report day. Keep a newest null status unknown, not stale.
+       SELECT creative_delivery_status, stat_date, synced_at
+       FROM report_creative_daily s
+       WHERE s.store_id = c.store_id AND s.campaign_id = c.campaign_id
+         AND s.item_group_id = c.item_group_id AND s.item_id = c.item_id
+       ORDER BY s.stat_date DESC, s.synced_at DESC
+       LIMIT 1
+     ) latest ON true
+     ORDER BY c.${orderBy} ${dir} NULLS LAST, c.store_id, c.campaign_id, c.item_group_id, c.item_id`,
     params
   );
 
