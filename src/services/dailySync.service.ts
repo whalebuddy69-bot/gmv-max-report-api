@@ -16,12 +16,16 @@ import { listStoresForAdvertiser, StoreSummary } from "./store.service";
 import { provisionCreatorForStore, ProvisionOutcome } from "./creatorProvisioning.service";
 import { startVideoMetadataRefresh } from "./videoMetadata.service";
 import { toCreativeRows } from "./creativeDailyRows";
+import { planSyncDateRange, splitSyncDateRange } from "./syncDatePolicy";
+import type { SyncDateRange } from "./syncDatePolicy";
+import { claimTargetSync, releaseTargetSync } from "../cron/syncState";
 
 /**
  * Syncs GMV Max reports into the daily tables used by the analytics endpoints.
  *
- * Data is pulled per day and upserted, and each run re-pulls the last
- * SYNC_LOOKBACK_DAYS days because TikTok updates recent numbers late.
+ * New stores first pull from the start of the previous calendar month. Later
+ * runs re-pull SYNC_LOOKBACK_DAYS because TikTok updates recent numbers late.
+ * Daily rows are upserted in nonoverlapping API windows of at most 30 days.
  * Product and creative rows exist for PRODUCT campaigns only; LIVE campaigns get
  * campaign and live room rows.
  */
@@ -244,7 +248,8 @@ export async function discoverSyncTargets(): Promise<DiscoverResult> {
 // --- sync ---
 
 export async function syncAllTargets(): Promise<SyncResult[]> {
-  const targets = await AppDataSource.getRepository(SyncTarget).find({
+  const targetRepository = AppDataSource.getRepository(SyncTarget);
+  const targets = await targetRepository.find({
     where: { enabled: true },
     order: { id: "ASC" },
   });
@@ -256,23 +261,48 @@ export async function syncAllTargets(): Promise<SyncResult[]> {
 
   const results: SyncResult[] = [];
   for (const target of targets) {
+    if (!claimTargetSync(target.advertiserId, target.storeId)) continue;
     try {
-      results.push(await syncTarget(target));
+      // A preceding store's initial history may take a while. Re-read after the
+      // reservation so a completed manual sync or a newly disabled store is seen.
+      const current = await targetRepository.findOne({ where: { id: target.id, enabled: true } });
+      if (!current) continue;
+      results.push(await syncTarget(current));
     } catch (err) {
       logger.error("Sync failed", {
         advertiserId: target.advertiserId,
         storeId: target.storeId,
         error: describeError(err),
       });
+    } finally {
+      releaseTargetSync(target.advertiserId, target.storeId);
     }
   }
   return results;
 }
 
-export async function syncTarget(target: SyncTarget, lookbackDays?: number): Promise<SyncResult> {
-  const days = lookbackDays ?? config.sync.lookbackDays;
-  const endDate = todayInAccountTz();
-  const startDate = shiftDays(endDate, -(days - 1));
+export function resolveSyncDateRange(
+  target: SyncTarget,
+  lookbackDays?: number,
+  initialHistory?: boolean,
+): SyncDateRange {
+  return planSyncDateRange({
+    today: todayInAccountTz(),
+    lastSyncedAt: target.lastSyncedAt,
+    lookbackDays,
+    defaultLookbackDays: config.sync.lookbackDays,
+    initialHistory,
+  });
+}
+
+export async function syncTarget(
+  target: SyncTarget,
+  lookbackDays?: number,
+  initialHistory?: boolean,
+): Promise<SyncResult> {
+  const range = resolveSyncDateRange(target, lookbackDays, initialHistory);
+  const { startDate, endDate } = range;
+  const windows = splitSyncDateRange(range);
 
   const runs = AppDataSource.getRepository(SyncRun);
   const run = runs.create({
@@ -288,6 +318,7 @@ export async function syncTarget(target: SyncTarget, lookbackDays?: number): Pro
 
   // Hoisted out of the try so the catch can report the spend that led to the failure.
   let apiCallsSoFar = 0;
+  const counts: SyncRowCounts = { campaigns: 0, liveCampaigns: 0, products: 0, creatives: 0, liveRooms: 0 };
 
   try {
     const accessToken = await getAccessTokenForAdvertiser(target.advertiserId);
@@ -306,9 +337,14 @@ export async function syncTarget(target: SyncTarget, lookbackDays?: number): Pro
       storeAuthorizedBcId: store.store_authorized_bc_id,
     };
 
-    const counts = await syncWindow(api, ctx, startDate, endDate, (n) => {
-      apiCallsSoFar += n;
-    });
+    for (const window of windows) {
+      const windowCounts = await syncWindow(api, ctx, window.startDate, window.endDate, (n) => {
+        apiCallsSoFar += n;
+      });
+      for (const key of Object.keys(counts) as (keyof SyncRowCounts)[]) {
+        counts[key] += windowCounts[key];
+      }
+    }
 
     run.status = "success";
     run.apiCalls = apiCallsSoFar;
@@ -316,9 +352,15 @@ export async function syncTarget(target: SyncTarget, lookbackDays?: number): Pro
     run.finishedAt = new Date();
     await runs.save(run);
 
-    target.lastSyncedAt = new Date();
+    const lastSyncedAt = new Date();
+    // Persist only sync-owned fields; a long initial sync must not overwrite
+    // enabled/storeName if an operator changes them while reports are loading.
+    await AppDataSource.getRepository(SyncTarget).update(
+      { id: target.id },
+      { lastSyncedAt, lastError: null },
+    );
+    target.lastSyncedAt = lastSyncedAt;
     target.lastError = null;
-    await AppDataSource.getRepository(SyncTarget).save(target);
 
     logger.info("Sync finished", {
       storeId: target.storeId,
@@ -344,11 +386,16 @@ export async function syncTarget(target: SyncTarget, lookbackDays?: number): Pro
     run.status = "failed";
     run.errorMessage = describeError(err);
     run.apiCalls = apiCallsSoFar;
+    // Completed windows only: a failed window may already have idempotent upserts.
+    // Keep lastSyncedAt unchanged so an unfinished initial history is retried.
+    run.rowCounts = counts;
     run.finishedAt = new Date();
     await runs.save(run).catch(() => undefined);
 
     target.lastError = describeError(err);
-    await AppDataSource.getRepository(SyncTarget).save(target).catch(() => undefined);
+    await AppDataSource.getRepository(SyncTarget)
+      .update({ id: target.id }, { lastError: target.lastError })
+      .catch(() => undefined);
     throw err;
   }
 }
@@ -634,10 +681,4 @@ function attr(value: MetricValue | undefined): string | null {
 /** Report dates follow the ad account's timezone, which for these accounts is Bangkok. */
 function todayInAccountTz(): string {
   return new Date(Date.now() + config.sync.tzOffsetMinutes * 60_000).toISOString().slice(0, 10);
-}
-
-function shiftDays(isoDate: string, delta: number): string {
-  const d = new Date(`${isoDate}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + delta);
-  return d.toISOString().slice(0, 10);
 }

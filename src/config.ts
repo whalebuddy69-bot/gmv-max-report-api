@@ -109,7 +109,7 @@ export const config = {
   sync: {
     enabled: (process.env.SYNC_ENABLED ?? "false").toLowerCase() === "true",
     cron: process.env.SYNC_CRON ?? "*/30 * * * *",
-    /** Days re-pulled on each run. TikTok updates recent days late. Max 30. */
+    /** Rolling days for previously synced shops; new shops start at the prior month's 1st. */
     lookbackDays: num("SYNC_LOOKBACK_DAYS", 3),
     /** Ad account timezone offset (Bangkok = 420). */
     tzOffsetMinutes: num("SYNC_TZ_OFFSET_MINUTES", 420),

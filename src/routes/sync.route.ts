@@ -4,7 +4,8 @@ import { AppDataSource } from "../db/dataSource";
 import { SyncRun } from "../entities/SyncRun";
 import { SyncTarget } from "../entities/SyncTarget";
 import { isSyncRunning, runningTargetKeys, runSyncOnce, startTargetSync } from "../cron/syncReports";
-import { discoverSyncTargets } from "../services/dailySync.service";
+import { discoverSyncTargets, resolveSyncDateRange } from "../services/dailySync.service";
+import { syncRunSchema } from "./syncRequest";
 import { NotFoundError, ValidationError } from "../utils/errors";
 import { config } from "../config";
 
@@ -24,7 +25,7 @@ syncRouter.get("/status", async (_req, res, next) => {
       cron: config.sync.cron,
       lookbackDays: config.sync.lookbackDays,
       running: isSyncRunning(),
-      // Individual stores with a manual sync in flight, as "advertiserId:storeId".
+      // Stores reserved by either manual or scheduled sync, as "advertiserId:storeId".
       runningTargets: runningTargetKeys(),
       targets,
       recentRuns: runs,
@@ -44,24 +45,17 @@ syncRouter.post("/discover", async (_req, res, next) => {
   }
 });
 
-const runSchema = z.object({
-  advertiserId: z.string().min(1).optional(),
-  storeId: z.string().min(1).optional(),
-  /** Override the window for a one-off backfill. Capped at 30 by the API. */
-  lookbackDays: z.number().int().min(1).max(30).optional(),
-});
-
 /**
  * POST /sync/run: start a sync in the background.
  * No body: all enabled targets. With advertiserId + storeId: that store only.
  */
 syncRouter.post("/run", async (req, res, next) => {
   try {
-    const parsed = runSchema.safeParse(req.body ?? {});
+    const parsed = syncRunSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       throw new ValidationError("request body ไม่ถูกต้อง", { issues: parsed.error.issues });
     }
-    const { advertiserId, storeId, lookbackDays } = parsed.data;
+    const { advertiserId, storeId, lookbackDays, initialHistory } = parsed.data;
 
     if (!advertiserId || !storeId) {
       if (isSyncRunning()) {
@@ -83,7 +77,8 @@ syncRouter.post("/run", async (req, res, next) => {
       );
     }
 
-    if (!startTargetSync(target, lookbackDays)) {
+    const range = resolveSyncDateRange(target, lookbackDays, initialHistory);
+    if (!startTargetSync(target, lookbackDays, initialHistory)) {
       res.status(409).json({
         error: { code: "SYNC_RUNNING", message: "ร้านนี้กำลัง sync อยู่แล้ว" },
       });
@@ -94,6 +89,7 @@ syncRouter.post("/run", async (req, res, next) => {
       started: true,
       advertiserId,
       storeId,
+      range,
       message: "เริ่ม sync แล้ว, ดูผลที่ GET /sync/status",
     });
   } catch (err) {

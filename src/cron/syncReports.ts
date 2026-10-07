@@ -6,32 +6,19 @@ import { discoverSyncTargets, syncAllTargets, syncTarget } from "../services/dai
 import { cleanupExpiredWebOAuthStates } from "../services/webOAuth.service";
 import { describeError } from "../utils/errors";
 import { logger } from "../utils/logger";
+import { claimTargetSync, releaseTargetSync, targetKey } from "./syncState";
+export { targetKey, isTargetRunning, runningTargetKeys } from "./syncState";
 
 let running = false;
-
-// Stores with a manual sync in progress, keyed "advertiserId:storeId".
-const runningTargets = new Set<string>();
-
-export function targetKey(advertiserId: string, storeId: string): string {
-  return `${advertiserId}:${storeId}`;
-}
-
-export function isTargetRunning(advertiserId: string, storeId: string): boolean {
-  return runningTargets.has(targetKey(advertiserId, storeId));
-}
-
-export function runningTargetKeys(): string[] {
-  return [...runningTargets];
-}
 
 /** Syncs one store in the background. Returns false if it is already running. */
 export function startTargetSync(
   target: { advertiserId: string; storeId: string },
-  lookbackDays?: number
+  lookbackDays?: number,
+  initialHistory?: boolean
 ): boolean {
   const key = targetKey(target.advertiserId, target.storeId);
-  if (runningTargets.has(key)) return false;
-  runningTargets.add(key);
+  if (!claimTargetSync(target.advertiserId, target.storeId)) return false;
 
   void (async () => {
     try {
@@ -39,12 +26,12 @@ export function startTargetSync(
         where: { advertiserId: target.advertiserId, storeId: target.storeId },
       });
       if (!full) throw new Error(`ไม่พบ sync target ${key}`);
-      await syncTarget(full, lookbackDays);
+      await syncTarget(full, lookbackDays, initialHistory);
     } catch (err) {
       // error is already saved on the target row
       logger.warn("Manual store sync failed", { target: key, error: describeError(err) });
     } finally {
-      runningTargets.delete(key);
+      releaseTargetSync(target.advertiserId, target.storeId);
     }
   })();
 
