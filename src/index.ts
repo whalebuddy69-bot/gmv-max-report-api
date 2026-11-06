@@ -15,6 +15,7 @@ import { requireInternalKey } from "./middleware/auth";
 import { startSyncCron } from "./cron/syncReports";
 import { AppError, describeError } from "./utils/errors";
 import { logger } from "./utils/logger";
+import { creatorReadRouter } from "./routes/creatorRead.route";
 
 const app = express();
 
@@ -37,6 +38,9 @@ app.use("/users", usersRouter);
 
 // TikTok OAuth redirect (no auth)
 app.use("/oauth", oauthRouter);
+
+// Dedicated server-to-server Creator read pilot. No existing Shop routes or tokens change.
+app.use("/internal/creator", creatorReadRouter);
 
 // internal (telegram bot)
 app.use("/stores", requireInternalKey, storesRouter);
