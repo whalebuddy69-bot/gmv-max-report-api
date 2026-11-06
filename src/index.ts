@@ -16,8 +16,10 @@ import { startSyncCron } from "./cron/syncReports";
 import { AppError, describeError } from "./utils/errors";
 import { logger } from "./utils/logger";
 import { creatorReadRouter } from "./routes/creatorRead.route";
+import { createCreatorBudgetTestRuntime } from "./services/creatorBudgetTest.runtime";
 
 const app = express();
+const creatorBudgetTest = createCreatorBudgetTestRuntime();
 
 app.use(
   cors({
@@ -41,6 +43,7 @@ app.use("/oauth", oauthRouter);
 
 // Dedicated server-to-server Creator read pilot. No existing Shop routes or tokens change.
 app.use("/internal/creator", creatorReadRouter);
+app.use("/internal/creator", creatorBudgetTest.router);
 
 // internal (telegram bot)
 app.use("/stores", requireInternalKey, storesRouter);
@@ -74,6 +77,8 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 
 async function main(): Promise<void> {
   await AppDataSource.initialize();
+  // Isolated additive ledger failure must not take down the Shop report service.
+  await creatorBudgetTest.initialize();
   await fs.mkdir(config.reportOutputDir, { recursive: true });
 
   app.listen(config.port, () => {
