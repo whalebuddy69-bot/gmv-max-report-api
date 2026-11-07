@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { bangkokDay, CREATOR_BINDING, createCreatorReader, createExtraCreatorReader, minor } from "./creatorRead.service";
 import type { AutomationVerifiedCreatorBinding } from "./creatorAutomationRegistry.service";
+import { configuredCreatorWebBudgetMode, creatorBudgetPolicyPath, isExtraCreatorBudgetScope, type CreatorBudgetScope } from "./creatorBudgetScope";
 import { WEB_BUDGET_MAX_MINOR, WebBudgetError, type WebBudgetAdapters } from "./creatorWebBudget.service";
 
 const POLICY_ORIGIN = "https://whale-buddy-ads-control-plane.onrender.com/internal/automation";
@@ -65,7 +66,7 @@ async function json(response: Response, max = MAX_BODY): Promise<Data> {
   } finally { reader.releaseLock(); }
 }
 
-type PolicyClient = "punpan_020" | "srihiw";
+type PolicyClient = CreatorBudgetScope;
 
 function policyView(value: Data, now: Date, clientId: PolicyClient = "punpan_020"): Policy {
   if (value.schemaVersion !== 1 || value.clientId !== clientId || !positive(value.revision) ||
@@ -79,7 +80,9 @@ function policyView(value: Data, now: Date, clientId: PolicyClient = "punpan_020
 }
 
 function createPolicyRequest({ fetchImpl, env, clientId }: { fetchImpl: typeof fetch; env: NodeJS.ProcessEnv; clientId: PolicyClient }) {
-  const url = POLICY_ORIGIN + (clientId === "punpan_020" ? "/ppan/policy" : "/srihiw/policy");
+  const fixedPath = creatorBudgetPolicyPath(clientId);
+  if (!fixedPath) unverified();
+  const url = POLICY_ORIGIN + fixedPath;
   return async function policyRequest(path: "" | "/lease" | "/finish" | "/cap", body?: Data) {
     const key = env.CREATOR_WEB_POLICY_BRIDGE_KEY;
     if (!key || !/^[A-Za-z0-9_-]{43,100}$/.test(key) ||
@@ -106,13 +109,13 @@ export function createCreatorWebCapAdapters({ fetchImpl = fetch, now = () => new
   { fetchImpl?: typeof fetch; now?: () => Date; env?: NodeJS.ProcessEnv } = {}) {
   async function status(clientId: PolicyClient) {
     const raw = await createPolicyRequest({ fetchImpl, env, clientId })("");
-    if (clientId === "srihiw" && raw.configured === false) {
+    if (clientId !== "punpan_020" && raw.configured === false) {
       if (raw.schemaVersion !== 1 || raw.clientId !== clientId || raw.locked !== false ||
         raw.revision !== undefined || raw.campaignCapMinor !== undefined || raw.clientDailyCapMinor !== undefined ||
         !fresh(raw.readAt, now().getTime(), 15_000)) unverified();
       return { cap: null, capEditAllowed: raw.capWriteEnabled === true };
     }
-    if (clientId === "srihiw" && raw.configured !== true) unverified();
+    if (clientId !== "punpan_020" && raw.configured !== true) unverified();
     const cap = policyView(raw, now(), clientId);
     return { cap, capEditAllowed: cap.capWriteEnabled === true && !cap.locked && cap.campaignCapMinor === cap.clientDailyCapMinor };
   }
@@ -133,7 +136,7 @@ export function createCreatorWebCapAdapters({ fetchImpl = fetch, now = () => new
         const raw = await createPolicyRequest({ fetchImpl, env, clientId })("/cap", { revision: expectedRevision, capMinor, actorUserId });
         const actual = policyView(raw, now(), clientId);
         if (actual.revision !== expectedRevision + 1 || actual.campaignCapMinor !== capMinor || actual.clientDailyCapMinor !== capMinor ||
-          (clientId === "srihiw" && raw.configured !== true)) unverified();
+          (clientId !== "punpan_020" && raw.configured !== true)) unverified();
         return { capMinor, revision: actual.revision };
       } catch (error) {
         if (error instanceof WebBudgetError) throw error;
@@ -147,9 +150,10 @@ export function createCreatorWebCapAdapters({ fetchImpl = fetch, now = () => new
 export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, now = () => new Date(),
   env = process.env, sleep, extraBinding }: {loadToken: () => Promise<string>; fetchImpl?: typeof fetch; now?: () => Date;
   env?: NodeJS.ProcessEnv; sleep?: (ms: number) => Promise<void>; extraBinding?: AutomationVerifiedCreatorBinding}): WebBudgetAdapters {
-  if (extraBinding && (extraBinding.clientId !== "srihiw" || extraBinding.advertiserId === CREATOR_BINDING.advertiserId ||
+  const extraClient = extraBinding?.clientId;
+  if (extraBinding && (!isExtraCreatorBudgetScope(extraClient) || extraBinding.advertiserId === CREATOR_BINDING.advertiserId ||
     extraBinding.identityId === CREATOR_BINDING.identityId || extraBinding.identityType !== "BC_AUTH_TT")) unverified();
-  const clientId: PolicyClient = extraBinding ? "srihiw" : "punpan_020";
+  const clientId: PolicyClient = isExtraCreatorBudgetScope(extraClient) ? extraClient : "punpan_020";
   const binding = extraBinding ?? CREATOR_BINDING;
   const policyRequest = createPolicyRequest({ fetchImpl, env, clientId });
   function checkedPolicy(raw: Data, at: Date) {
@@ -253,9 +257,7 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     async dispatch(input) {
       let attempted = false;
       try {
-        if (env.CREATOR_READ_ENABLED !== "true" || (extraBinding ? env.CREATOR_WEB_SRIHIW_BUDGET_MODE : env.CREATOR_WEB_BUDGET_MODE) !== "live" ||
-          env.CREATOR_WEB_BUDGET_LIVE_ENABLED !== "true" || env.CREATOR_BUDGET_TEST_ENABLED === "true" ||
-          (extraBinding && env.CREATOR_WEB_SRIHIW_BUDGET_LIVE_ENABLED !== "true") ||
+        if (configuredCreatorWebBudgetMode(env, clientId) !== "live" ||
           input.nativeAutoOff !== true || input.noConcurrentChanges !== true || !ID.test(input.campaignId) ||
           !positive(input.expectedBudgetMinor) || !positive(input.targetBudgetMinor) || input.expectedBudgetMinor === input.targetBudgetMinor ||
           !positive(input.campaignCapMinor) || !positive(input.clientDailyCapMinor) || input.targetBudgetMinor > input.campaignCapMinor ||

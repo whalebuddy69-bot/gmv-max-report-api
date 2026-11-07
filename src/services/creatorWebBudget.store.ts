@@ -3,18 +3,24 @@ import {
   WebBudgetError, WebBudgetRecord, WebBudgetStore,
 } from "./creatorWebBudget.service";
 
-export type CreatorWebBudgetLedgerClient = "punpan_020" | "srihiw";
+export type CreatorWebBudgetLedgerClient = "punpan_020" | "srihiw" | "nnshop5719" | "ashopbytheta";
 const PPAN_LEDGER = { clientId: "punpan_020", table: "creator_web_budget_operations", fence: "creator_web_budget_one_active_fence" } as const;
 const SRIHIW_LEDGER = { clientId: "srihiw", table: "creator_web_budget_srihiw_operations", fence: "creator_web_budget_srihiw_one_active_fence" } as const;
-type LedgerScope = typeof PPAN_LEDGER | typeof SRIHIW_LEDGER;
+const NNSHOP_LEDGER = { clientId: "nnshop5719", table: "creator_web_budget_nnshop5719_operations",
+  fence: "creator_web_budget_nnshop5719_one_active_fence" } as const;
+const ASHOP_LEDGER = { clientId: "ashopbytheta", table: "creator_web_budget_ashopbytheta_operations",
+  fence: "creator_web_budget_ashopbytheta_one_active_fence" } as const;
+type LedgerScope = typeof PPAN_LEDGER | typeof SRIHIW_LEDGER | typeof NNSHOP_LEDGER | typeof ASHOP_LEDGER;
 
 function ledgerScope(clientId: CreatorWebBudgetLedgerClient): LedgerScope {
   if (clientId === "punpan_020") return PPAN_LEDGER;
   if (clientId === "srihiw") return SRIHIW_LEDGER;
+  if (clientId === "nnshop5719") return NNSHOP_LEDGER;
+  if (clientId === "ashopbytheta") return ASHOP_LEDGER;
   throw new Error("Unconfigured Creator budget ledger");
 }
 
-// Additive, independently fenced ledgers. Identifiers only come from the two
+// Additive, independently fenced ledgers. Identifiers only come from the
 // code-owned scopes above; this does not alter the existing Ppan schema.
 function schemaSql({ clientId, table, fence }: LedgerScope) { return `
 CREATE TABLE IF NOT EXISTS ${table} (

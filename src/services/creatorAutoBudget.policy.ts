@@ -3,9 +3,9 @@ import {
   WEB_BUDGET_CAMPAIGN_ID, WEB_BUDGET_MAX_MINOR, WEB_BUDGET_OPERATION_ID,
   type WebBudgetContext, type WebBudgetPolicy,
 } from "./creatorWebBudget.service";
-import type { CreatorWebBudgetDatabase } from "./creatorWebBudget.store";
+import type { CreatorWebBudgetDatabase, CreatorWebBudgetLedgerClient } from "./creatorWebBudget.store";
 
-export type CreatorAutoBudgetClientId = "punpan_020" | "srihiw";
+export type CreatorAutoBudgetClientId = CreatorWebBudgetLedgerClient;
 export const CREATOR_AUTO_BUDGET_MAX_GRANT_MS = 2 * 60 * 60 * 1000;
 const MIN_REMAINING_MS = 15_000;
 const READ_FRESH_MS = 30_000;
@@ -75,7 +75,7 @@ function fresh(value: unknown, now: number, maxAge: number) {
   return age >= 0 && age <= maxAge;
 }
 function client(value: unknown): value is CreatorAutoBudgetClientId {
-  return value === "punpan_020" || value === "srihiw";
+  return value === "punpan_020" || value === "srihiw" || value === "nnshop5719" || value === "ashopbytheta";
 }
 function positive(value: unknown, max = Number.MAX_SAFE_INTEGER): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= max;
@@ -168,7 +168,8 @@ export function evaluateCreatorAutoBudget({ clientId, now, grant, context, polic
 export const CREATOR_AUTO_BUDGET_GRANT_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS creator_auto_budget_grants (
   grant_id uuid UNIQUE NOT NULL,
-  client_id text NOT NULL CHECK (client_id IN ('punpan_020','srihiw')),
+  client_id text NOT NULL CONSTRAINT creator_auto_budget_grants_creator_scope_v2
+    CHECK (client_id IN ('punpan_020','srihiw','nnshop5719','ashopbytheta')),
   owner_id bigint NOT NULL CHECK (owner_id > 0),
   campaign_id text NOT NULL CHECK (campaign_id ~ '^[1-9][0-9]{5,30}$'),
   reporting_date date NOT NULL,
@@ -193,7 +194,40 @@ CREATE TABLE IF NOT EXISTS creator_auto_budget_grants (
   CHECK (status <> 'COMPLETED' OR (operation_id IS NOT NULL AND reserved_at IS NOT NULL AND revoked_at IS NULL AND settled_at IS NOT NULL)),
   CHECK (settled_at IS NULL OR operation_id IS NOT NULL),
   CHECK (status <> 'REVOKED' OR revoked_at IS NOT NULL)
-)`;
+);
+
+-- Upgrade only the old exact two-Creator check. Keep the same table, primary
+-- key, UUID uniqueness and existing reserved/revoked records. Normal startup
+-- checks catalog metadata without locking an already migrated grant table.
+DO $creator_scope$
+DECLARE
+  old_check text;
+  current_check text;
+  expected_old constant text := '(client_id = ANY (ARRAY[''punpan_020''::text, ''srihiw''::text]))';
+  expected_current constant text := '(client_id = ANY (ARRAY[''punpan_020''::text, ''srihiw''::text, ''nnshop5719''::text, ''ashopbytheta''::text]))';
+BEGIN
+  SELECT pg_get_expr(conbin, conrelid) INTO old_check FROM pg_constraint
+    WHERE conrelid='creator_auto_budget_grants'::regclass AND conname='creator_auto_budget_grants_client_id_check';
+  SELECT pg_get_expr(conbin, conrelid) INTO current_check FROM pg_constraint
+    WHERE conrelid='creator_auto_budget_grants'::regclass AND conname='creator_auto_budget_grants_creator_scope_v2' AND convalidated;
+  IF old_check IS NULL AND current_check = expected_current THEN RETURN; END IF;
+
+  LOCK TABLE creator_auto_budget_grants IN ACCESS EXCLUSIVE MODE;
+  SELECT pg_get_expr(conbin, conrelid) INTO old_check FROM pg_constraint
+    WHERE conrelid='creator_auto_budget_grants'::regclass AND conname='creator_auto_budget_grants_client_id_check';
+  SELECT pg_get_expr(conbin, conrelid) INTO current_check FROM pg_constraint
+    WHERE conrelid='creator_auto_budget_grants'::regclass AND conname='creator_auto_budget_grants_creator_scope_v2' AND convalidated;
+  IF old_check IS NULL AND current_check = expected_current THEN RETURN; END IF;
+  IF old_check IS DISTINCT FROM expected_old OR (current_check IS NOT NULL AND current_check <> expected_current) THEN
+    RAISE EXCEPTION 'Unrecognized Creator auto grant scope';
+  END IF;
+  IF current_check IS NULL THEN
+    ALTER TABLE creator_auto_budget_grants ADD CONSTRAINT creator_auto_budget_grants_creator_scope_v2
+      CHECK (client_id IN ('punpan_020','srihiw','nnshop5719','ashopbytheta'));
+  END IF;
+  ALTER TABLE creator_auto_budget_grants DROP CONSTRAINT creator_auto_budget_grants_client_id_check;
+END
+$creator_scope$;`;
 
 type Runner = ReturnType<CreatorWebBudgetDatabase["createQueryRunner"]>;
 function rows(value: unknown): Record<string, unknown>[] {

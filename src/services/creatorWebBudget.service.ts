@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { bangkokDay } from "./creatorRead.service";
+import type { CreatorBudgetScope } from "./creatorBudgetScope";
 
 export const WEB_BUDGET_CLIENT_ID = "punpan_020";
 export const WEB_BUDGET_OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -120,7 +121,7 @@ function proposal(record: WebBudgetProposal) {
 }
 
 export function createCreatorWebBudgetService({ store, adapters, mode, clientId = WEB_BUDGET_CLIENT_ID, now = () => new Date() }: {
-  store: WebBudgetStore; adapters: WebBudgetAdapters; mode: () => WebBudgetMode; clientId?: "punpan_020" | "srihiw"; now?: () => Date;
+  store: WebBudgetStore; adapters: WebBudgetAdapters; mode: () => WebBudgetMode; clientId?: CreatorBudgetScope; now?: () => Date;
 }) {
   async function getPolicy() { return checkPolicy(await adapters.readPolicy(), now().getTime()); }
   async function validatedInputs(campaignId: string, current: number, target: number) {

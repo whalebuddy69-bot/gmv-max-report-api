@@ -3,7 +3,7 @@ import { PGlite } from "@electric-sql/pglite";
 import { afterEach, describe, expect, it } from "vitest";
 import { bangkokDay } from "./creatorRead.service";
 import {
-  createCreatorAutoBudgetGrantStore, evaluateCreatorAutoBudget, previewCreatorAutoBudget,
+  CREATOR_AUTO_BUDGET_GRANT_SCHEMA_SQL, createCreatorAutoBudgetGrantStore, evaluateCreatorAutoBudget, previewCreatorAutoBudget,
   type CreatorAutoBudgetContext, type CreatorAutoBudgetGrant, type CreatorAutoBudgetGrantRecord,
 } from "./creatorAutoBudget.policy";
 import type { WebBudgetPolicy } from "./creatorWebBudget.service";
@@ -98,6 +98,15 @@ describe("Creator Auto 80% → 20% policy", () => {
       { ...context, campaignId: "1234567890123457" }, { ...context, budgetMinor: 645_000 }, { ...context, fingerprint: "e".repeat(64) },
     ]) expect(evaluateCreatorAutoBudget({ ...args, context: snapshot })).toEqual({ status: "BASELINE_CHANGED" });
   });
+
+  it("isolates the two newly allowlisted Creators without giving other slugs auto authority", () => {
+    for (const clientId of ["nnshop5719", "ashopbytheta"] as const) {
+      expect(evaluateCreatorAutoBudget({ ...args, clientId, grant: { ...grant, clientId } })).toMatchObject({ status: "ELIGIBLE" });
+      expect(evaluateCreatorAutoBudget({ ...args, clientId, grant })).toEqual({ status: "NOT_ARMED" });
+    }
+    const unknown = "other" as CreatorAutoBudgetGrant["clientId"];
+    expect(evaluateCreatorAutoBudget({ ...args, clientId: unknown, grant: { ...grant, clientId: unknown } })).toEqual({ status: "NOT_ARMED" });
+  });
 });
 
 const dbs: PGlite[] = [];
@@ -189,5 +198,50 @@ describe("Creator Auto durable one-shot grant", () => {
       reportingDate: "2026-11-07", authorizedAt: "2026-11-07T16:59:00.000Z", expiresAt: "2026-11-07T17:01:00.000Z",
     });
     expect(await h.store.arm(almostMidnight)).toBeNull();
+  });
+
+  it("upgrades only the exact old CHECK in place, preserving reservations and enforcing all four scoped daily grants", async () => {
+    const h = setup(); await h.store.ensureSchema();
+    // Recreate the deployed two-Creator constraint, leaving the same grant table and data model.
+    await h.db.exec(`ALTER TABLE creator_auto_budget_grants DROP CONSTRAINT creator_auto_budget_grants_creator_scope_v2;
+      ALTER TABLE creator_auto_budget_grants ADD CHECK (client_id IN ('punpan_020','srihiw'));`);
+    const ppan = liveGrant(), srihiw = liveGrant({ clientId: "srihiw" }), op = randomUUID();
+    const nnshop = liveGrant({ clientId: "nnshop5719" }), ashop = liveGrant({ clientId: "ashopbytheta" });
+    await h.store.arm(ppan); await h.store.reserve(ppan, op);
+    await h.store.arm(srihiw); await h.store.cancel(srihiw.clientId, srihiw.reportingDate, srihiw.grantId, srihiw.ownerId);
+    await expect(h.store.arm(nnshop)).rejects.toThrow("AUTO_BUDGET_GRANT_STORE_UNAVAILABLE");
+
+    const upgraded = createCreatorAutoBudgetGrantStore(h.database);
+    await upgraded.ensureSchema(); await upgraded.ensureSchema();
+    expect(await upgraded.isReserved(ppan, op)).toBe(true);
+    expect(await upgraded.get(srihiw.clientId, srihiw.reportingDate)).toMatchObject({ ...srihiw, status: "REVOKED" });
+    expect(await upgraded.arm(nnshop)).toMatchObject({ ...nnshop, status: "ARMED" });
+    expect(await upgraded.arm(ashop)).toMatchObject({ ...ashop, status: "ARMED" });
+    expect(await upgraded.reserve({ ...nnshop, clientId: "ashopbytheta" }, randomUUID())).toBeNull();
+    // Operation UUIDs cannot be shared across Creators even if explicitly reused.
+    await expect(upgraded.reserve(ashop, op)).rejects.toThrow("AUTO_BUDGET_GRANT_STORE_UNAVAILABLE");
+    expect(await upgraded.get(ashop.clientId, ashop.reportingDate)).toMatchObject({ status: "ARMED", operationId: null });
+    expect(await upgraded.arm(liveGrant({ clientId: "nnshop5719" }))).toBeNull();
+    await expect(h.db.query("UPDATE creator_auto_budget_grants SET client_id='other' WHERE grant_id=$1", [ashop.grantId]))
+      .rejects.toMatchObject({ code: "23514" });
+
+    // Restart after the migration performs no exclusive table lock.
+    await h.db.exec("BEGIN");
+    try {
+      await h.db.exec(CREATOR_AUTO_BUDGET_GRANT_SCHEMA_SQL);
+      const locks = await h.db.query<{ mode: string }>(`SELECT mode FROM pg_locks
+        WHERE pid=pg_backend_pid() AND relation='creator_auto_budget_grants'::regclass`);
+      expect(locks.rows.map(row => row.mode)).not.toContain("AccessExclusiveLock");
+    } finally { await h.db.exec("ROLLBACK"); }
+  });
+
+  it("refuses to replace an unexpected legacy scope constraint and rolls the migration back", async () => {
+    const h = setup(); await h.store.ensureSchema();
+    await h.db.exec(`ALTER TABLE creator_auto_budget_grants DROP CONSTRAINT creator_auto_budget_grants_creator_scope_v2;
+      ALTER TABLE creator_auto_budget_grants ADD CONSTRAINT creator_auto_budget_grants_client_id_check CHECK (client_id = 'punpan_020');`);
+    const existing = liveGrant(); await h.store.arm(existing);
+    await expect(h.store.ensureSchema()).rejects.toThrow("AUTO_BUDGET_GRANT_STORE_UNAVAILABLE");
+    expect(await h.store.get(existing.clientId, existing.reportingDate)).toMatchObject({ ...existing, status: "ARMED" });
+    await expect(h.store.arm(liveGrant({ clientId: "nnshop5719" }))).rejects.toThrow("AUTO_BUDGET_GRANT_STORE_UNAVAILABLE");
   });
 });

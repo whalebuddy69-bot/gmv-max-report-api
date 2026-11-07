@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { CREATOR_BINDING } from "./creatorRead.service";
 import { createCreatorWebBudgetAdapters, createCreatorWebCapAdapters } from "./creatorWebBudget.adapters";
+import { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode, creatorBudgetPolicyPath, type CreatorBudgetScope } from "./creatorBudgetScope";
 
 const NOW = "2025-03-15T09:00:00.000Z", TODAY = "2025-03-15", CAMPAIGN = "1234567890123456";
 const OP = "5035df00-1801-4d02-8051-01affbbefdc9", KEY = "p".repeat(43), TOKEN = "synthetic-tiktok-adapter-key";
@@ -12,9 +13,12 @@ const SRIHIW = { clientId: "srihiw", advertiserId: "1234567890198765", tiktokAcc
 
 function harness(options: { mode?: string; competing?: boolean; legacy?: boolean; policyKey?: string;
   providerResult?: "unknown" | "reject" | "roi-drift" | "reject-with-drift"; readAt?: string;
-  extra?: boolean; extraLive?: boolean; wrongProviderScope?: boolean } = {}) {
+  extra?: boolean; extraLive?: boolean; extraClient?: "nnshop5719" | "ashopbytheta"; wrongProviderScope?: boolean } = {}) {
   const calls: { host: string; path: string; method: string }[] = [];
-  const binding = options.extra ? SRIHIW : CREATOR_BINDING;
+  const extra = options.extraClient ? { ...SRIHIW, clientId: options.extraClient,
+    advertiserId: options.extraClient === "nnshop5719" ? "1234567890198768" : "1234567890198769",
+    identityId: `synthetic-${options.extraClient}-identity` } : options.extra ? SRIHIW : undefined;
+  const binding = extra ?? CREATOR_BINDING;
   let budget = 2800, roi = 15, stamp = "2025-03-15 08:55:00", spend = "2100.09", otherSpend = "20.00";
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input));
@@ -25,8 +29,8 @@ function harness(options: { mode?: string; competing?: boolean; legacy?: boolean
     if (url.host === "whale-buddy-ads-control-plane.onrender.com") {
       expect(headers.get("x-creator-web-key")).toBe(KEY);
       expect(headers.get("access-token")).toBeNull();
-      expect(url.pathname).toContain(options.extra ? "/srihiw/policy" : "/ppan/policy");
-      const reply = { ...policy, ...(options.extra ? { clientId: "srihiw", configured: true } : {}), readAt: options.readAt ?? NOW };
+      expect(url.pathname).toContain(extra ? `/${extra.clientId}/policy` : "/ppan/policy");
+      const reply = { ...policy, ...(extra ? { clientId: extra.clientId, configured: true } : {}), readAt: options.readAt ?? NOW };
       if (url.pathname.endsWith("/lease")) {
         expect(JSON.parse(String(init?.body))).toEqual({ operationId: OP, revision: 4 });
         return Response.json({ ...reply, locked: true, operationId: OP, expiresAt: LEASE_END });
@@ -75,9 +79,11 @@ function harness(options: { mode?: string; competing?: boolean; legacy?: boolean
     ] } });
   }) as typeof fetch;
   const adapters = createCreatorWebBudgetAdapters({ loadToken: async () => TOKEN, fetchImpl, now: () => new Date(NOW), sleep: async () => {},
-    extraBinding: options.extra ? SRIHIW : undefined,
+    extraBinding: extra,
     env: { CREATOR_READ_ENABLED: "true", CREATOR_WEB_BUDGET_MODE: options.mode ?? "live", CREATOR_WEB_BUDGET_LIVE_ENABLED: "true",
       CREATOR_WEB_SRIHIW_BUDGET_MODE: options.mode ?? "live", CREATOR_WEB_SRIHIW_BUDGET_LIVE_ENABLED: options.extraLive ? "true" : "false",
+      ...(options.extraClient ? { [`CREATOR_WEB_${options.extraClient.toUpperCase()}_BUDGET_MODE`]: options.mode ?? "live",
+        [`CREATOR_WEB_${options.extraClient.toUpperCase()}_BUDGET_LIVE_ENABLED`]: options.extraLive ? "true" : "false" } : {}),
       CREATOR_BUDGET_TEST_ENABLED: options.legacy ? "true" : "false", CREATOR_WEB_POLICY_BRIDGE_KEY: options.policyKey ?? KEY } });
   return { adapters, calls, edit(value: number) { budget = value; stamp = "2025-03-15 08:59:30"; }, setSpend(value: string) { spend = value; },
     setOtherSpend(value: string) { otherSpend = value; }, async input(targetBudgetMinor = 310_000) {
@@ -154,6 +160,33 @@ describe("Srihiw exact budget writer boundary", () => {
     const cross = harness({ extra: true, extraLive: true, wrongProviderScope: true });
     await expect(cross.input()).rejects.toThrow();
     expect(cross.providerPosts()).toHaveLength(0);
+  });
+});
+
+describe("additional exact live budget scopes", () => {
+  it.each(["nnshop5719", "ashopbytheta"] as const)("%s uses its own lease, exact advertiser token and a single budget-only send", async extraClient => {
+    const blocked = harness({ extraClient });
+    expect(await blocked.adapters.dispatch(await blocked.input())).toEqual({ outcome: "NOT_SENT" });
+    expect(blocked.providerPosts()).toHaveLength(0);
+    const h = harness({ extraClient, extraLive: true });
+    expect(await h.adapters.acquireLease(OP, 4)).toMatchObject({ locked: true, operationId: OP });
+    expect(await h.adapters.dispatch(await h.input())).toEqual({ outcome: "APPLIED_VERIFIED", observedBudgetMinor: 310_000 });
+    expect(h.providerPosts()).toHaveLength(1);
+    const wrong = harness({ extraClient, extraLive: true, wrongProviderScope: true });
+    await expect(wrong.input()).rejects.toThrow();
+    expect(wrong.providerPosts()).toHaveLength(0);
+  });
+
+  it("keeps global and neighboring flags from granting unconfigured or other advertiser access", () => {
+    const env = { CREATOR_READ_ENABLED: "true", CREATOR_WEB_BUDGET_MODE: "live", CREATOR_WEB_BUDGET_LIVE_ENABLED: "true",
+      CREATOR_AUTO_BUDGET_MODE: "live", CREATOR_AUTO_BUDGET_LIVE_ENABLED: "true",
+      CREATOR_WEB_NNSHOP5719_BUDGET_MODE: "live", CREATOR_WEB_NNSHOP5719_BUDGET_LIVE_ENABLED: "true",
+      CREATOR_AUTO_BUDGET_NNSHOP5719_MODE: "live", CREATOR_AUTO_BUDGET_NNSHOP5719_LIVE_ENABLED: "true",
+      CREATOR_AUTO_BUDGET_ASHOPBYTHETA_MODE: "live", CREATOR_AUTO_BUDGET_ASHOPBYTHETA_LIVE_ENABLED: "true" };
+    expect(configuredCreatorAutoBudgetMode(env, "nnshop5719")).toBe("live");
+    expect(configuredCreatorAutoBudgetMode(env, "ashopbytheta")).toBe("disabled");
+    expect(configuredCreatorWebBudgetMode(env, "shop-other" as CreatorBudgetScope)).toBe("disabled");
+    expect(creatorBudgetPolicyPath("constructor" as CreatorBudgetScope)).toBeNull();
   });
 });
 

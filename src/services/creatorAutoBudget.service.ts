@@ -39,21 +39,48 @@ export function createCreatorAutoBudgetService({ clientId, mode, discover, adapt
     return reasons;
   }
 
-  async function status(operator: boolean) {
+  function draftGrant(facts: Awaited<ReturnType<typeof read>>, ownerId: number, at: Date, durationMinutes: number): CreatorAutoBudgetGrant {
+    const { context, policy } = facts, day = bangkokDay(at);
+    const endOfDay = Date.parse(`${day}T00:00:00+07:00`) + 86_400_000;
+    return { grantId: randomUUID(), clientId, ownerId, campaignId: context.campaignId,
+      reportingDate: day, policyRevision: policy.revision, expectedBudgetMinor: context.budgetMinor, fingerprint: context.fingerprint,
+      authorizedAt: at.toISOString(), expiresAt: new Date(Math.min(at.getTime() + durationMinutes * 60_000, endOfDay - 1000)).toISOString(),
+      nativeAutoOffAttested: true, noConcurrentChangesAttested: true };
+  }
+
+  function canArmGrant(facts: Awaited<ReturnType<typeof read>>, grant: CreatorAutoBudgetGrant, at: Date) {
+    const { context, policy } = facts;
+    if (blockers(facts).length) return false;
+    const verdict = evaluateCreatorAutoBudget({ clientId, now: at, grant: { ...grant, status: "ARMED", operationId: null },
+      ...facts, notificationReady: policy.autoLineReady === true });
+    if (verdict.status === "ELIGIBLE") return true;
+    if (verdict.status !== "BELOW_THRESHOLD") return false;
+    const scaled = BigInt(context.budgetMinor) * 6n;
+    const target = scaled / 5n;
+    return scaled % 5n === 0n && target <= BigInt(policy.campaignCapMinor) &&
+      target + BigInt(context.aggregateSpendMinor - context.spendMinor) <= BigInt(policy.clientDailyCapMinor);
+  }
+
+  async function status(operator: boolean, ownerId?: number) {
     const currentMode = mode(), day = bangkokDay(now());
-    if (currentMode === "disabled") return { clientId, mode: currentMode, grant: null, preview: null, blockers: [] };
-    const row = await grants.get(clientId, day).catch(() => null);
-    const grant = row && operator ? { grantId: row.grantId, status: row.status, expiresAt: row.expiresAt } : null;
+    const grantRead = operator ? await grants.get(clientId, day).then(row => ({ row, ok: true })).catch(() => ({ row: null, ok: false })) : { row: null, ok: false };
+    const { row } = grantRead;
+    const ownRow = row && row.ownerId === ownerId ? row : null;
+    const grant = ownRow ? { grantId: ownRow.grantId, status: ownRow.status, expiresAt: ownRow.expiresAt } : null;
+    const canStop = ownRow?.status === "ARMED" || ownRow?.status === "RESERVED";
+    if (currentMode === "disabled") return { clientId, mode: currentMode, grant, canArm: false, canStop, preview: null, blockers: [] };
     try {
       const facts = await read();
-      const preview = previewCreatorAutoBudget({ now: now(), context: facts.context, policy: facts.policy });
-      return { clientId, mode: currentMode, grant, preview: { status: preview.status, campaignId: facts.context.campaignId,
+      const at = now(), preview = previewCreatorAutoBudget({ now: at, context: facts.context, policy: facts.policy });
+      const canArm = currentMode === "live" && operator && grantRead.ok && !row && typeof ownerId === "number" &&
+        bangkokDay(at) === day && canArmGrant(facts, draftGrant(facts, ownerId, at, 10), at);
+      return { clientId, mode: currentMode, grant, canArm, canStop, preview: { status: preview.status, campaignId: facts.context.campaignId,
         currentBudgetMinor: facts.context.budgetMinor, spendMinor: facts.context.spendMinor, policyRevision: facts.policy.revision,
         thresholdMinor: Number((BigInt(facts.context.budgetMinor) * 8n + 9n) / 10n),
         targetBudgetMinor: preview.status === "WOULD_INCREASE" ? preview.targetBudgetMinor : null,
         projectedClientSpendMinor: preview.status === "WOULD_INCREASE" ? preview.projectedClientSpendMinor : null,
         observedAt: facts.context.observedAt }, blockers: blockers(facts) };
-    } catch { return { clientId, mode: currentMode, grant, preview: null, blockers: ["CONTEXT_UNAVAILABLE"] }; }
+    } catch { return { clientId, mode: currentMode, grant, canArm: false, canStop, preview: null, blockers: ["CONTEXT_UNAVAILABLE"] }; }
   }
 
   async function arm(ownerId: number, input: Input, recheckOperator: () => Promise<boolean>) {
@@ -61,22 +88,15 @@ export function createCreatorAutoBudgetService({ clientId, mode, discover, adapt
       input.noConcurrentChanges !== true || !Number.isSafeInteger(input.durationMinutes) || input.durationMinutes < 10 || input.durationMinutes > 120) throw unavailable();
     const facts = await read(input.expectedCampaignId), at = now();
     const { context, policy } = facts;
-    if (context.budgetMinor !== input.expectedBudgetMinor || policy.revision !== input.expectedPolicyRevision || blockers(facts).length) throw unavailable();
-    const day = bangkokDay(at);
-    const endOfDay = Date.parse(`${day}T00:00:00+07:00`) + 86_400_000;
-    const grant: CreatorAutoBudgetGrant = { grantId: randomUUID(), clientId, ownerId, campaignId: context.campaignId,
-      reportingDate: day, policyRevision: policy.revision, expectedBudgetMinor: context.budgetMinor, fingerprint: context.fingerprint,
-      authorizedAt: at.toISOString(), expiresAt: new Date(Math.min(at.getTime() + input.durationMinutes * 60_000, endOfDay - 1000)).toISOString(),
-      nativeAutoOffAttested: true, noConcurrentChangesAttested: true };
-    const check = evaluateCreatorAutoBudget({ clientId, now: at, grant: { ...grant, status: "ARMED", operationId: null },
-      ...facts, notificationReady: policy.autoLineReady === true });
-    if (!["ELIGIBLE", "BELOW_THRESHOLD"].includes(check.status) || !await recheckOperator() || mode() !== "live") throw unavailable();
+    if (context.budgetMinor !== input.expectedBudgetMinor || policy.revision !== input.expectedPolicyRevision) throw unavailable();
+    const grant = draftGrant(facts, ownerId, at, input.durationMinutes);
+    if (!canArmGrant(facts, grant, at) || !await recheckOperator() || mode() !== "live") throw unavailable();
     if (!await grants.arm(grant)) throw new WebBudgetError("AUTO_BUDGET_DAILY_LIMIT", 409, "วันนี้มีรายการ Auto แล้ว ระบบจะไม่เปิดซ้ำ");
     return { grantId: grant.grantId, expiresAt: grant.expiresAt };
   }
 
   async function stop(ownerId: number, grantId: string) {
-    return { stopped: await grants.cancel(clientId, bangkokDay(now()), grantId, ownerId) };
+    return { stopped: !!await grants.cancel(clientId, bangkokDay(now()), grantId, ownerId) };
   }
 
   let busy = false;

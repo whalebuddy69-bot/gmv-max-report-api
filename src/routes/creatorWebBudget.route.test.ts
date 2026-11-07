@@ -9,6 +9,7 @@ vi.mock("../services/auth.service", async importOriginal => ({
 }));
 import { AuthError } from "../services/auth.service";
 import { createCreatorWebBudgetService } from "../services/creatorWebBudget.service";
+import type { CreatorBudgetScope } from "../services/creatorBudgetScope";
 import { CREATOR_WEB_BUDGET_ORIGIN, createCreatorWebBudgetRouter } from "./creatorWebBudget.route";
 
 const PRIVATE_ERROR = "test-secret-that-must-not-leak";
@@ -43,8 +44,8 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
     operation: vi.fn(async (_id, operationId) => ({ operationId, status: "NOT_SENT", observedBudgetMinor: null })),
   };
   const capEditor = {
-    status: vi.fn(async (_client: "punpan_020" | "srihiw") => ({ cap: null, capEditAllowed: true })),
-    update: vi.fn(async (_client: "punpan_020" | "srihiw", _id: number, revision: number, capMinor: number, recheck: () => Promise<boolean>) => {
+    status: vi.fn(async (_client: CreatorBudgetScope) => ({ cap: null, capEditAllowed: true })),
+    update: vi.fn(async (_client: CreatorBudgetScope, _id: number, revision: number, capMinor: number, recheck: () => Promise<boolean>) => {
       if (!await recheck()) throw new AuthError(PRIVATE_ERROR);
       return { revision: revision + 1, capMinor };
     }),
@@ -55,7 +56,8 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
     operation: vi.fn(async (_id, operationId) => ({ operationId, status: "NOT_SENT", observedBudgetMinor: null })),
   };
   const autoService = {
-    status: vi.fn(async (_operator: boolean) => ({ clientId: "punpan_020" as const, mode: "shadow" as const, grant: null, preview: null, blockers: ["CONTEXT_UNAVAILABLE"] })),
+    status: vi.fn(async (_operator: boolean, _ownerId?: number) => ({ clientId: "punpan_020" as CreatorBudgetScope, mode: "shadow" as const,
+      grant: null, canArm: false, canStop: false, preview: null, blockers: ["CONTEXT_UNAVAILABLE"] })),
     arm: vi.fn(async (_owner: number, _input: unknown, recheck: () => Promise<boolean>) => {
       if (!await recheck()) throw new AuthError(PRIVATE_ERROR);
       return { grantId: ID, expiresAt: "2026-06-09T04:02:00.000Z" };
@@ -63,16 +65,26 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
     stop: vi.fn(async (_owner: number, _grantId: string) => ({ stopped: true })),
     tick: vi.fn(async () => {}),
   };
+  const mockScoped = (clientId: "nnshop5719" | "ashopbytheta") => ({
+    service: { ...srihiwService,
+      status: vi.fn(async () => ({ clientId, mode: "disabled" as const, cap: null, canPrepare: false, capEditAllowed: false })),
+      confirm: vi.fn(vi.mocked(service.confirm).getMockImplementation()),
+    },
+    autoService: { ...autoService, status: vi.fn(async () => ({ clientId, mode: "shadow" as const, grant: null,
+      canArm: false, canStop: false, preview: null, blockers: ["CONTEXT_UNAVAILABLE"] })) },
+  });
+  const nn = mockScoped("nnshop5719"), ashop = mockScoped("ashopbytheta");
   const app = express();
   app.use("/automation/budget", createCreatorWebBudgetRouter({ viewerIds: () => viewerIds, operatorIds: () => operatorIds, service,
-    srihiwService, autoService, capEditor, extraCapConfigured: () => extraCapConfigured }));
+    autoService, capEditor, extraConfigured: () => extraCapConfigured,
+    extraScopes: { srihiw: { service: srihiwService }, nnshop5719: nn, ashopbytheta: ashop } }));
   // Prove this route does not run the general application parser first.
   app.use(express.json());
   server = await new Promise<Server>(resolve => { const instance = app.listen(0, "127.0.0.1", () => resolve(instance)); });
   const { port } = server.address() as { port: number };
   const base = `http://127.0.0.1:${port}/automation/budget`;
   const post = (route: string, body = JSON.stringify(PREPARE), headers = HEADERS) => fetch(base + route, { method: "POST", headers, body });
-  return { service, srihiwService, autoService, base, post, capEditor };
+  return { service, srihiwService, autoService, base, post, capEditor, nn, ashop };
 }
 
 describe("Automation web budget HTTP boundary", () => {
@@ -152,7 +164,7 @@ describe("Automation web budget HTTP boundary", () => {
     const shadow = await fetch(h.base + "/auto/status", { headers: { Authorization: "Bearer report-admin" } });
     expect(shadow.headers.get("cache-control")).toBe("no-store");
     expect(await shadow.json()).toMatchObject({ clientId: "punpan_020", mode: "shadow" });
-    expect(h.autoService.status).toHaveBeenCalledWith(false);
+    expect(h.autoService.status).toHaveBeenCalledWith(false, 42);
     expect((await h.post("/auto/arm", JSON.stringify(payload), { ...HEADERS, Authorization: "Bearer report-admin" })).status).toBe(403);
     expect((await h.post("/auto/arm", JSON.stringify(payload), { ...HEADERS, Origin: "https://evil.example" })).status).toBe(403);
     expect((await h.post("/auto/arm", JSON.stringify({ ...payload, ownerId: 42 }))).status).toBe(400);
@@ -163,6 +175,19 @@ describe("Automation web budget HTTP boundary", () => {
     expect((await h.post("/auto/stop", JSON.stringify({ grantId: ID }))).status).toBe(200);
     expect(h.autoService.stop).toHaveBeenCalledWith(27, ID);
     expect(h.service.confirm).not.toHaveBeenCalled();
+  });
+
+  it("never falls back to Ppan or another account for new cap, auto status or confirmation routes", async () => {
+    const h = await start();
+    expect(await (await fetch(h.base + "/nnshop5719/auto/status", { headers: HEADERS })).json()).toMatchObject({ clientId: "nnshop5719" });
+    expect(await (await fetch(h.base + "/ashopbytheta/status", { headers: HEADERS })).json()).toMatchObject({ clientId: "ashopbytheta" });
+    expect(await (await h.post("/cap/ashopbytheta", JSON.stringify({ expectedRevision: 0, capMinor: 450000 }))).json()).toEqual({ revision: 1, capMinor: 450000 });
+    expect(h.capEditor.update).toHaveBeenCalledWith("ashopbytheta", 27, 0, 450000, expect.any(Function));
+    expect((await h.post("/nnshop5719/confirm", JSON.stringify(CONFIRM))).status).toBe(200);
+    expect(h.nn.service.confirm).toHaveBeenCalledWith(27, CONFIRM, expect.any(Function));
+    expect(h.ashop.service.confirm).not.toHaveBeenCalled();
+    expect(h.service.confirm).not.toHaveBeenCalled();
+    expect((await h.post("/NNSHOP5719/confirm", JSON.stringify(CONFIRM))).status).toBe(404);
   });
 
   it("rejects malformed, non-JSON, oversized, unknown fields and caller-controlled query", async () => {

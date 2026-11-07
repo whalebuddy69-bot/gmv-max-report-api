@@ -103,4 +103,32 @@ describe("Postgres budget operation ledger", () => {
     await expect(h.db.query("UPDATE creator_web_budget_srihiw_operations SET client_id = 'punpan_020' WHERE operation_id=$1", [second.operationId]))
       .rejects.toMatchObject({ code: "23514" });
   });
+
+  it("adds two exact manual ledgers without changing or sharing the existing scopes' durable fences", async () => {
+    const h = setup();
+    const ppan = h.store, srihiw = createCreatorWebBudgetStore(h.database, "srihiw");
+    const nnshop = createCreatorWebBudgetStore(h.database, "nnshop5719"), ashop = createCreatorWebBudgetStore(h.database, "ashopbytheta");
+    await ppan.ensureSchema(); await srihiw.ensureSchema();
+    const ppanRow = proposal(), srihiwRow = proposal(), nnRow = proposal(), ashopRow = proposal();
+    await ppan.create(ppanRow); await srihiw.create(srihiwRow);
+    await srihiw.reserve(srihiwRow.ownerId, srihiwRow.operationId, "live");
+    await srihiw.finish(srihiwRow.ownerId, srihiwRow.operationId, { status: "OUTCOME_UNKNOWN", observedBudgetMinor: null, reason: "READBACK_UNVERIFIED" });
+
+    await nnshop.ensureSchema(); await ashop.ensureSchema(); await ashop.ensureSchema();
+    await nnshop.create(nnRow); await ashop.create(ashopRow);
+    expect(await ppan.get(ppanRow.ownerId, ppanRow.operationId)).toMatchObject({ status: "PREPARED", source: "manual" });
+    expect(await srihiw.get(srihiwRow.ownerId, srihiwRow.operationId)).toMatchObject({ status: "OUTCOME_UNKNOWN" });
+    expect(await srihiw.hasFence()).toBe(true);
+    expect(await nnshop.reserve(ashopRow.ownerId, ashopRow.operationId, "live")).toBeNull();
+    expect(await ashop.get(nnRow.ownerId, nnRow.operationId)).toBeNull();
+    expect(await ppan.get(nnRow.ownerId, nnRow.operationId)).toBeNull();
+    expect(await srihiw.get(ashopRow.ownerId, ashopRow.operationId)).toBeNull();
+    expect(await nnshop.reserve(nnRow.ownerId, nnRow.operationId, "live")).toMatchObject({ status: "PROCESSING" });
+    await nnshop.finish(nnRow.ownerId, nnRow.operationId, { status: "OUTCOME_UNKNOWN", observedBudgetMinor: null, reason: "READBACK_UNVERIFIED" });
+    expect(await ashop.reserve(ashopRow.ownerId, ashopRow.operationId, "live")).toMatchObject({ status: "PROCESSING" });
+    await expect(h.db.query("UPDATE creator_web_budget_ashopbytheta_operations SET client_id='nnshop5719' WHERE operation_id=$1", [ashopRow.operationId]))
+      .rejects.toMatchObject({ code: "23514" });
+    await expect(h.db.query("UPDATE creator_web_budget_nnshop5719_operations SET client_id='ashopbytheta' WHERE operation_id=$1", [nnRow.operationId]))
+      .rejects.toMatchObject({ code: "23514" });
+  });
 });
