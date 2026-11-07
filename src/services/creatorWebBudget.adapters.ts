@@ -74,7 +74,8 @@ function policyView(value: Data, now: Date, clientId: PolicyClient = "punpan_020
     !fresh(value.readAt, now.getTime(), 15_000) || typeof value.locked !== "boolean") unverified();
   return { revision: value.revision, campaignCapMinor: value.campaignCapMinor,
     clientDailyCapMinor: value.clientDailyCapMinor, readAt: value.readAt, locked: value.locked,
-    ...(value.capWriteEnabled === true ? { capWriteEnabled: true } : {}) };
+    ...(value.capWriteEnabled === true ? { capWriteEnabled: true } : {}),
+    ...(value.autoLineReady === true ? { autoLineReady: true } : {}) };
 }
 
 function createPolicyRequest({ fetchImpl, env, clientId }: { fetchImpl: typeof fetch; env: NodeJS.ProcessEnv; clientId: PolicyClient }) {
@@ -217,16 +218,21 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     if (raw.reportingDate !== bangkokDay(at) || !fresh(raw.observedAt, at.getTime(), 25_000) ||
       c.campaignId !== expectedCampaignId || c.dailyBudgetMinor !== live.budgetMinor || quality.aggregateSpendComplete !== true ||
       !nonnegative(c.spendMinor) || !nonnegative(quality.aggregateSpendMinor) || quality.aggregateSpendMinor < c.spendMinor) unverified();
+    // The currently verified Creator report has no provider timestamp for
+    // today's spend and ENABLE is not proof that a LIVE is delivering. Do
+    // not substitute fetch time, campaign modification time or a default.
     return { campaignId: expectedCampaignId, reportingDate: raw.reportingDate as string, observedAt: raw.observedAt,
       budgetMinor: live.budgetMinor, spendMinor: c.spendMinor, aggregateSpendMinor: quality.aggregateSpendMinor,
-      fingerprint: live.fingerprint, nativeAutoState: live.native, sample: live };
+      fingerprint: live.fingerprint, nativeAutoState: live.native, providerSpendObservedAt: null, deliveryVerified: false, sample: live };
   }
 
   return {
     async readPolicy() { return checkedPolicy(await policyRequest(""), now()); },
-    async acquireLease(operationId, revision) {
+    async acquireLease(operationId, revision, autoBudget) {
       if (!UUID.test(operationId) || !positive(revision)) unverified();
-      const raw = await policyRequest("/lease", { operationId, revision });
+      if (autoBudget && (!positive(autoBudget.previousBudgetMinor) || !positive(autoBudget.targetBudgetMinor) ||
+        BigInt(autoBudget.previousBudgetMinor) * 6n !== BigInt(autoBudget.targetBudgetMinor) * 5n)) unverified();
+      const raw = await policyRequest("/lease", { operationId, revision, ...(autoBudget ? { autoBudget } : {}) });
       const at = now();
       const view = checkedPolicy(raw, at);
       if (!view.locked || view.revision !== revision || raw.operationId !== operationId || !validIso(raw.expiresAt) ||
@@ -257,7 +263,7 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
         const accessToken = await token();
         const latest = await context(input.campaignId, accessToken);
         const before = latest.sample;
-        if (await input.canSend() !== true) unverified();
+        if (await input.canSend(latest) !== true) unverified();
         const at = now();
         if (bangkokDay(at) !== input.reportingDate || latest.reportingDate !== input.reportingDate ||
           Date.parse(input.notAfter) - at.getTime() < 10_000 || !fresh(latest.observedAt, at.getTime(), 25_000) ||

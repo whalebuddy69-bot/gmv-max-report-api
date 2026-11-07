@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS ${table} (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ${fence}
   ON ${table} (client_id) WHERE status IN ('PROCESSING','OUTCOME_UNKNOWN');
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'manual' CHECK (source IN ('manual','auto'));
 `; }
 export const CREATOR_WEB_BUDGET_SCHEMA_SQL = schemaSql(PPAN_LEDGER);
 
@@ -73,11 +74,12 @@ function timestamp(value: unknown): string {
 function operation(row: Record<string, unknown>, expectedClientId: CreatorWebBudgetLedgerClient): WebBudgetRecord {
   if (typeof row.operation_id !== "string" || !WEB_BUDGET_OPERATION_ID.test(row.operation_id)
     || (row.mode !== "dry-run" && row.mode !== "live") || row.client_id !== expectedClientId
+    || (row.source !== "manual" && row.source !== "auto") || (row.source === "auto" && row.mode !== "live")
     || typeof row.campaign_id !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(row.campaign_id)
     || typeof row.reporting_date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(row.reporting_date)
     || typeof row.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(row.fingerprint)
     || typeof row.status !== "string" || !statusValues.has(row.status)) throw new Error("Unexpected ledger record");
-  return { operationId: row.operation_id, ownerId: safeInteger(row.owner_id), mode: row.mode, campaignId: row.campaign_id,
+  return { operationId: row.operation_id, ownerId: safeInteger(row.owner_id), mode: row.mode, source: row.source, campaignId: row.campaign_id,
     reportingDate: row.reporting_date, currentBudgetMinor: safeInteger(row.current_budget_minor, WEB_BUDGET_MAX_MINOR),
     targetBudgetMinor: safeInteger(row.target_budget_minor, WEB_BUDGET_MAX_MINOR),
     projectedClientSpendMinor: safeInteger(row.projected_client_spend_minor, WEB_BUDGET_MAX_MINOR),
@@ -116,11 +118,11 @@ export function createCreatorWebBudgetStore(database: CreatorWebBudgetDatabase, 
       await run(async runner => {
         await runner.query(`INSERT INTO ${table}
           (operation_id,owner_id,mode,campaign_id,reporting_date,current_budget_minor,target_budget_minor,
-            projected_client_spend_minor,policy_revision,campaign_cap_minor,client_daily_cap_minor,cap_read_at,fingerprint,expires_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+            projected_client_spend_minor,policy_revision,campaign_cap_minor,client_daily_cap_minor,cap_read_at,fingerprint,expires_at,source)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
         [value.operationId, value.ownerId, value.mode, value.campaignId, value.reportingDate,
           value.currentBudgetMinor, value.targetBudgetMinor, value.projectedClientSpendMinor,
-          value.cap.revision, value.cap.campaignCapMinor, value.cap.clientDailyCapMinor, value.cap.readAt, value.fingerprint, value.expiresAt]);
+          value.cap.revision, value.cap.campaignCapMinor, value.cap.clientDailyCapMinor, value.cap.readAt, value.fingerprint, value.expiresAt, value.source ?? "manual"]);
       });
     },
     async get(ownerId, operationId) {

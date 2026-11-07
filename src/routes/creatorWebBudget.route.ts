@@ -7,6 +7,7 @@ import {
 import { AppError } from "../utils/errors";
 import { parseAutomationViewerIds } from "./automation.route";
 import type { createCreatorWebCapAdapters } from "../services/creatorWebBudget.adapters";
+import type { createCreatorAutoBudgetService } from "../services/creatorAutoBudget.service";
 
 export const CREATOR_WEB_BUDGET_ORIGIN = "https://report.whalebuddy69.com";
 const JSON_TYPE = /^application\/json(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i;
@@ -18,10 +19,12 @@ function fields(value: unknown, keys: string[]): value is Record<string, unknown
 }
 function badInput(): never { throw new WebBudgetError("BUDGET_INPUT_INVALID", 400, "ข้อมูลคำสั่งไม่ถูกต้อง"); }
 
-export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, srihiwService, capEditor, extraCapConfigured = () => false, now = Date.now }: {
+export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, srihiwService, capEditor, autoService, srihiwAutoService, extraCapConfigured = () => false, now = Date.now }: {
   viewerIds: () => string | undefined; operatorIds: () => string | undefined;
   capEditor?: ReturnType<typeof createCreatorWebCapAdapters>; extraCapConfigured?: () => boolean;
   srihiwService?: ReturnType<typeof createCreatorWebBudgetService>;
+  autoService?: ReturnType<typeof createCreatorAutoBudgetService>;
+  srihiwAutoService?: ReturnType<typeof createCreatorAutoBudgetService>;
   service: ReturnType<typeof createCreatorWebBudgetService>; now?: () => number;
 }) {
   const router = Router({ caseSensitive: true, strict: true });
@@ -110,6 +113,28 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
       || value.nativeAutoOff !== true || value.noConcurrentChanges !== true) badInput();
     return serviceFor(req).confirm(id, { operationId: value.operationId, nativeAutoOff: true, noConcurrentChanges: true }, () => recheck(req, id));
   }));
+  function autoFor(req: Request) {
+    const scoped = req.path.startsWith("/srihiw/") ? (extraCapConfigured() ? srihiwAutoService : undefined) : autoService;
+    if (!scoped) throw new WebBudgetError("AUTO_BUDGET_NOT_CONFIGURED", 404, "ยังไม่ได้ตั้งค่า Auto สำหรับ Creator นี้");
+    return scoped;
+  }
+  router.get(dual("/auto/status"), get, handle((req, id) => autoFor(req).status(canOperate(id))));
+  router.post(dual("/auto/arm"), onlyOperator, onlyJson, json, handle((req, id) => {
+    const value: unknown = req.body;
+    if (!fields(value, ["expectedCampaignId", "expectedBudgetMinor", "expectedPolicyRevision", "durationMinutes", "nativeAutoOff", "noConcurrentChanges"])
+      || typeof value.expectedCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedCampaignId)
+      || !safeAmount(value.expectedBudgetMinor) || !safeAmount(value.expectedPolicyRevision) || !safeAmount(value.durationMinutes)
+      || value.nativeAutoOff !== true || value.noConcurrentChanges !== true) badInput();
+    return autoFor(req).arm(id, { expectedCampaignId: value.expectedCampaignId, expectedBudgetMinor: value.expectedBudgetMinor,
+      expectedPolicyRevision: value.expectedPolicyRevision, durationMinutes: value.durationMinutes,
+      nativeAutoOff: true, noConcurrentChanges: true }, () => recheck(req, id));
+  }));
+  router.post(dual("/auto/stop"), onlyOperator, onlyJson, json, handle(async (req, id) => {
+    const value: unknown = req.body;
+    if (!fields(value, ["grantId"]) || typeof value.grantId !== "string" || !WEB_BUDGET_OPERATION_ID.test(value.grantId)) badInput();
+    if (!await recheck(req, id)) throw new WebBudgetError("BUDGET_OPERATOR_DENIED", 403, "บัญชีนี้ยังไม่ได้รับสิทธิ์สั่งงบ");
+    return autoFor(req).stop(id, value.grantId);
+  }));
   const srihiwCap = "/cap/srihiw";
   router.get(srihiwCap, get, handle(async (_req, id) => {
     if (!capEditor || !extraCapConfigured()) throw new WebBudgetError("CAP_NOT_CONFIGURED", 404, "ไม่พบการตั้งเพดานของ Creator นี้");
@@ -129,8 +154,8 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
     res.set("Allow", req.path === srihiwCap ? "GET, POST" : "POST")
       .status(405).json({ error: { code: "BUDGET_METHOD_DENIED", message: "ไม่รองรับวิธีเรียกนี้" } });
   });
-  router.all(["/status", "/operations/:operationId", "/prepare", "/confirm"].flatMap(dual), (req, res) => {
-    res.set("Allow", req.path.endsWith("/prepare") || req.path.endsWith("/confirm") ? "POST" : "GET")
+  router.all(["/status", "/operations/:operationId", "/prepare", "/confirm", "/auto/status", "/auto/arm", "/auto/stop"].flatMap(dual), (req, res) => {
+    res.set("Allow", /\/(?:prepare|confirm|arm|stop)$/.test(req.path) ? "POST" : "GET")
       .status(405).json({ error: { code: "BUDGET_METHOD_DENIED", message: "ไม่รองรับวิธีเรียกนี้" } });
   });
   router.use((_req, res) => res.status(404).json({ error: { code: "BUDGET_ROUTE_NOT_FOUND", message: "ไม่พบหน้าคำสั่งนี้" } }));

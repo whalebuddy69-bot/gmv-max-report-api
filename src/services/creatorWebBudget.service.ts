@@ -12,32 +12,37 @@ const PROPOSAL_TTL_MS = 120_000;
 const MIN_SEND_WINDOW_MS = 15_000;
 
 export type WebBudgetMode = "disabled" | "dry-run" | "live";
+export type WebBudgetSource = "manual" | "auto";
 export type WebBudgetOutcome = "NOT_SENT" | "PROVIDER_REJECTED" | "APPLIED_VERIFIED" | "OUTCOME_UNKNOWN";
 export type WebBudgetStatus = WebBudgetOutcome | "PREPARED" | "PROCESSING" | "SIMULATED";
 export interface WebBudgetPolicy {
   revision: number; campaignCapMinor: number; clientDailyCapMinor: number; readAt: string; locked: boolean;
   capWriteEnabled?: boolean;
+  autoLineReady?: boolean;
 }
 export interface WebBudgetContext {
   campaignId: string; reportingDate: string; observedAt: string;
   budgetMinor: number; spendMinor: number; aggregateSpendMinor: number; fingerprint: string;
   nativeAutoState: "DISABLED" | "UNKNOWN" | "ENABLED" | "CONFLICT";
+  providerSpendObservedAt?: string | null;
+  deliveryVerified?: boolean;
 }
 export interface WebBudgetDispatch {
   campaignId: string; reportingDate: string; expectedBudgetMinor: number; targetBudgetMinor: number;
   campaignCapMinor: number; clientDailyCapMinor: number;
   fingerprint: string; notAfter: string; nativeAutoOff: true; noConcurrentChanges: true;
-  canSend: () => Promise<boolean>;
+  canSend: (latest: WebBudgetContext) => Promise<boolean>;
 }
 export interface WebBudgetAdapters {
   readPolicy(): Promise<WebBudgetPolicy>;
-  acquireLease(operationId: string, revision: number): Promise<WebBudgetPolicy & { operationId: string; expiresAt: string }>;
+  acquireLease(operationId: string, revision: number, autoBudget?: { previousBudgetMinor: number; targetBudgetMinor: number }): Promise<WebBudgetPolicy & { operationId: string; expiresAt: string }>;
   finishLease(operationId: string, outcome: WebBudgetOutcome): Promise<void>;
   readContext(expectedCampaignId: string): Promise<WebBudgetContext>;
   dispatch(input: WebBudgetDispatch): Promise<{ outcome: WebBudgetOutcome; observedBudgetMinor?: number }>;
 }
 export interface WebBudgetProposal {
   operationId: string; ownerId: number; mode: Exclude<WebBudgetMode, "disabled">;
+  source?: WebBudgetSource;
   campaignId: string; reportingDate: string; currentBudgetMinor: number; targetBudgetMinor: number;
   projectedClientSpendMinor: number; cap: WebBudgetPolicy; fingerprint: string; expiresAt: string;
 }
@@ -76,7 +81,8 @@ function checkPolicy(raw: WebBudgetPolicy, now: number): WebBudgetPolicy {
     reject("BUDGET_CAP_UNAVAILABLE", 503, "ยังยืนยันเพดานงบจากระบบเดิมไม่ได้");
   }
   return { revision: raw.revision, campaignCapMinor: raw.campaignCapMinor, clientDailyCapMinor: raw.clientDailyCapMinor,
-    readAt: raw.readAt, locked: raw.locked, ...(raw.capWriteEnabled === true ? { capWriteEnabled: true } : {}) };
+    readAt: raw.readAt, locked: raw.locked, ...(raw.capWriteEnabled === true ? { capWriteEnabled: true } : {}),
+    ...(raw.autoLineReady === true ? { autoLineReady: true } : {}) };
 }
 function checkContext(raw: WebBudgetContext, expectedCampaignId: string, expectedBudgetMinor: number, now: number) {
   if (!raw || !isFresh(raw.observedAt, now, CONTEXT_FRESH_MS) || raw.reportingDate !== bangkokDay(new Date(now))
@@ -142,9 +148,10 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
       }
       return result(row);
     },
-    async prepare(ownerId: number, input: { expectedCampaignId: string; expectedBudgetMinor: number; targetBudgetMinor: number }) {
+    async prepare(ownerId: number, input: { expectedCampaignId: string; expectedBudgetMinor: number; targetBudgetMinor: number }, source: WebBudgetSource = "manual") {
       const activeMode = mode();
       if (activeMode === "disabled") reject("BUDGET_MODE_DISABLED", 403, "ยังไม่ได้เปิดการเตรียมปรับงบจากเว็บ");
+      if (source === "auto" && activeMode !== "live") reject("BUDGET_MODE_DISABLED", 403, "ยังไม่เปิด Auto แบบจริง");
       if (!WEB_BUDGET_CAMPAIGN_ID.test(input.expectedCampaignId) || !amount(input.expectedBudgetMinor) || !amount(input.targetBudgetMinor)) {
         reject("BUDGET_INPUT_INVALID", 400, "แคมเปญหรืองบไม่ถูกต้อง");
       }
@@ -153,15 +160,16 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
       const endOfDay = Date.parse(`${context.reportingDate}T00:00:00+07:00`) + 86_400_000;
       const expiresAt = Math.min(timestamp + PROPOSAL_TTL_MS, endOfDay);
       if (expiresAt - timestamp < MIN_SEND_WINDOW_MS || mode() !== activeMode) reject("BUDGET_MODE_CHANGED", 409, "กรุณาเปิดรายการใหม่อีกครั้ง");
-      const row: WebBudgetProposal = { operationId: randomUUID(), ownerId, mode: activeMode, campaignId: context.campaignId,
+      const row: WebBudgetProposal = { operationId: randomUUID(), ownerId, mode: activeMode, source, campaignId: context.campaignId,
         reportingDate: context.reportingDate, currentBudgetMinor: context.budgetMinor, targetBudgetMinor: input.targetBudgetMinor,
         projectedClientSpendMinor: projected, cap, fingerprint: context.fingerprint, expiresAt: new Date(expiresAt).toISOString() };
       await store.create(row);
       return proposal(row);
     },
-    async confirm(ownerId: number, input: { operationId: string; nativeAutoOff: true; noConcurrentChanges: true }, recheckOperator: () => Promise<boolean>) {
+    async confirm(ownerId: number, input: { operationId: string; nativeAutoOff: true; noConcurrentChanges: true }, recheckOperator: () => Promise<boolean>,
+      autoGuard?: (context: WebBudgetContext, policy: WebBudgetPolicy) => Promise<boolean>) {
       const initial = await store.get(ownerId, input.operationId);
-      if (!initial) reject("BUDGET_OPERATION_NOT_FOUND", 404, "ไม่พบรายการนี้");
+      if (!initial || (initial.source === "auto") !== (typeof autoGuard === "function")) reject("BUDGET_OPERATION_NOT_FOUND", 404, "ไม่พบรายการนี้");
       if (initial.status !== "PREPARED") return result(initial);
       const activeMode = mode();
       if (activeMode === "disabled" || activeMode !== initial.mode) reject("BUDGET_MODE_CHANGED", 409, "โหมดเปลี่ยนแล้ว กรุณาเปิดรายการใหม่");
@@ -181,6 +189,9 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
         if (!sameCap(reserved.cap, cap) || context.reportingDate !== reserved.reportingDate || context.fingerprint !== reserved.fingerprint) {
           reject("BUDGET_PRECONDITION_CHANGED", 409, "งบหรือเพดานเปลี่ยน กรุณาเปิดรายการใหม่");
         }
+        if (autoGuard && (context.nativeAutoState !== "DISABLED" || cap.autoLineReady !== true || !await autoGuard(context, cap))) {
+          reject("BUDGET_AUTO_PREFLIGHT", 409, "ข้อมูลสำหรับ Auto ยังไม่พร้อม");
+        }
         if (mode() !== activeMode || !await recheckOperator() || timeMs(reserved.expiresAt) <= now().getTime()) {
           reject("BUDGET_AUTHORITY_CHANGED", 409, "สิทธิ์หรือเวลายืนยันเปลี่ยน กรุณาเปิดรายการใหม่");
         }
@@ -188,7 +199,9 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
           status = "SIMULATED"; reason = "CHECKED_WITHOUT_PROVIDER_WRITE";
         } else {
           leaseAttempted = true;
-          const rawLease = await adapters.acquireLease(reserved.operationId, reserved.cap.revision);
+          const rawLease = autoGuard ? await adapters.acquireLease(reserved.operationId, reserved.cap.revision,
+            { previousBudgetMinor: reserved.currentBudgetMinor, targetBudgetMinor: reserved.targetBudgetMinor })
+            : await adapters.acquireLease(reserved.operationId, reserved.cap.revision);
           const lease = checkPolicy(rawLease, now().getTime());
           const deadline = Math.min(timeMs(rawLease.expiresAt), timeMs(reserved.expiresAt));
           if (rawLease.operationId !== reserved.operationId || !lease.locked || !sameCap(reserved.cap, lease)
@@ -200,7 +213,8 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
             expectedBudgetMinor: reserved.currentBudgetMinor, targetBudgetMinor: reserved.targetBudgetMinor, fingerprint: reserved.fingerprint,
             campaignCapMinor: lease.campaignCapMinor, clientDailyCapMinor: lease.clientDailyCapMinor,
             notAfter: new Date(deadline).toISOString(), nativeAutoOff: true, noConcurrentChanges: true,
-            canSend: async () => mode() === "live" && await recheckOperator() && mode() === "live" });
+            canSend: async latest => mode() === "live" && await recheckOperator() &&
+              (!autoGuard || (latest.nativeAutoState === "DISABLED" && await autoGuard(latest, cap))) && mode() === "live" });
           if (sent?.outcome === "APPLIED_VERIFIED" && sent.observedBudgetMinor === reserved.targetBudgetMinor) {
             status = "APPLIED_VERIFIED"; reason = "EXACT_PROVIDER_READBACK"; observedBudgetMinor = sent.observedBudgetMinor;
           } else if (sent?.outcome === "NOT_SENT" || sent?.outcome === "PROVIDER_REJECTED") {

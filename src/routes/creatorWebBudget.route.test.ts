@@ -54,16 +54,25 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
     prepare: vi.fn(vi.mocked(service.prepare).getMockImplementation()), confirm: vi.fn(vi.mocked(service.confirm).getMockImplementation()),
     operation: vi.fn(async (_id, operationId) => ({ operationId, status: "NOT_SENT", observedBudgetMinor: null })),
   };
+  const autoService = {
+    status: vi.fn(async (_operator: boolean) => ({ clientId: "punpan_020" as const, mode: "shadow" as const, grant: null, preview: null, blockers: ["CONTEXT_UNAVAILABLE"] })),
+    arm: vi.fn(async (_owner: number, _input: unknown, recheck: () => Promise<boolean>) => {
+      if (!await recheck()) throw new AuthError(PRIVATE_ERROR);
+      return { grantId: ID, expiresAt: "2026-06-09T04:02:00.000Z" };
+    }),
+    stop: vi.fn(async (_owner: number, _grantId: string) => ({ stopped: true })),
+    tick: vi.fn(async () => {}),
+  };
   const app = express();
   app.use("/automation/budget", createCreatorWebBudgetRouter({ viewerIds: () => viewerIds, operatorIds: () => operatorIds, service,
-    srihiwService, capEditor, extraCapConfigured: () => extraCapConfigured }));
+    srihiwService, autoService, capEditor, extraCapConfigured: () => extraCapConfigured }));
   // Prove this route does not run the general application parser first.
   app.use(express.json());
   server = await new Promise<Server>(resolve => { const instance = app.listen(0, "127.0.0.1", () => resolve(instance)); });
   const { port } = server.address() as { port: number };
   const base = `http://127.0.0.1:${port}/automation/budget`;
   const post = (route: string, body = JSON.stringify(PREPARE), headers = HEADERS) => fetch(base + route, { method: "POST", headers, body });
-  return { service, srihiwService, base, post, capEditor };
+  return { service, srihiwService, autoService, base, post, capEditor };
 }
 
 describe("Automation web budget HTTP boundary", () => {
@@ -133,6 +142,27 @@ describe("Automation web budget HTTP boundary", () => {
     }
     expect(h.service.status).not.toHaveBeenCalled(); expect(h.service.operation).not.toHaveBeenCalled();
     expect(h.service.prepare).not.toHaveBeenCalled(); expect(h.service.confirm).not.toHaveBeenCalled();
+  });
+
+  it("keeps shadow read and future pilot controls in the exact authorized Creator scope", async () => {
+    const h = await start();
+    const payload = { expectedCampaignId: PREPARE.expectedCampaignId, expectedBudgetMinor: PREPARE.expectedBudgetMinor,
+      expectedPolicyRevision: 2, durationMinutes: 60, nativeAutoOff: true, noConcurrentChanges: true };
+    expect((await fetch(h.base + "/auto/status")).status).toBe(401);
+    const shadow = await fetch(h.base + "/auto/status", { headers: { Authorization: "Bearer report-admin" } });
+    expect(shadow.headers.get("cache-control")).toBe("no-store");
+    expect(await shadow.json()).toMatchObject({ clientId: "punpan_020", mode: "shadow" });
+    expect(h.autoService.status).toHaveBeenCalledWith(false);
+    expect((await h.post("/auto/arm", JSON.stringify(payload), { ...HEADERS, Authorization: "Bearer report-admin" })).status).toBe(403);
+    expect((await h.post("/auto/arm", JSON.stringify(payload), { ...HEADERS, Origin: "https://evil.example" })).status).toBe(403);
+    expect((await h.post("/auto/arm", JSON.stringify({ ...payload, ownerId: 42 }))).status).toBe(400);
+    expect((await h.post("/srihiw/auto/arm", JSON.stringify(payload))).status).toBe(404);
+    expect((await h.post("/auto/arm", JSON.stringify(payload))).status).toBe(200);
+    expect(h.autoService.arm).toHaveBeenCalledTimes(1);
+    expect(h.autoService.arm).toHaveBeenCalledWith(27, payload, expect.any(Function));
+    expect((await h.post("/auto/stop", JSON.stringify({ grantId: ID }))).status).toBe(200);
+    expect(h.autoService.stop).toHaveBeenCalledWith(27, ID);
+    expect(h.service.confirm).not.toHaveBeenCalled();
   });
 
   it("rejects malformed, non-JSON, oversized, unknown fields and caller-controlled query", async () => {
