@@ -16,6 +16,7 @@ export type WebBudgetOutcome = "NOT_SENT" | "PROVIDER_REJECTED" | "APPLIED_VERIF
 export type WebBudgetStatus = WebBudgetOutcome | "PREPARED" | "PROCESSING" | "SIMULATED";
 export interface WebBudgetPolicy {
   revision: number; campaignCapMinor: number; clientDailyCapMinor: number; readAt: string; locked: boolean;
+  capWriteEnabled?: boolean;
 }
 export interface WebBudgetContext {
   campaignId: string; reportingDate: string; observedAt: string;
@@ -75,7 +76,7 @@ function checkPolicy(raw: WebBudgetPolicy, now: number): WebBudgetPolicy {
     reject("BUDGET_CAP_UNAVAILABLE", 503, "ยังยืนยันเพดานงบจากระบบเดิมไม่ได้");
   }
   return { revision: raw.revision, campaignCapMinor: raw.campaignCapMinor, clientDailyCapMinor: raw.clientDailyCapMinor,
-    readAt: raw.readAt, locked: raw.locked };
+    readAt: raw.readAt, locked: raw.locked, ...(raw.capWriteEnabled === true ? { capWriteEnabled: true } : {}) };
 }
 function checkContext(raw: WebBudgetContext, expectedCampaignId: string, expectedBudgetMinor: number, now: number) {
   if (!raw || !isFresh(raw.observedAt, now, CONTEXT_FRESH_MS) || raw.reportingDate !== bangkokDay(new Date(now))
@@ -112,8 +113,8 @@ function proposal(record: WebBudgetProposal) {
   return { operationId, mode, campaignId, currentBudgetMinor, targetBudgetMinor, projectedClientSpendMinor, cap, expiresAt };
 }
 
-export function createCreatorWebBudgetService({ store, adapters, mode, now = () => new Date() }: {
-  store: WebBudgetStore; adapters: WebBudgetAdapters; mode: () => WebBudgetMode; now?: () => Date;
+export function createCreatorWebBudgetService({ store, adapters, mode, clientId = WEB_BUDGET_CLIENT_ID, now = () => new Date() }: {
+  store: WebBudgetStore; adapters: WebBudgetAdapters; mode: () => WebBudgetMode; clientId?: "punpan_020" | "srihiw"; now?: () => Date;
 }) {
   async function getPolicy() { return checkPolicy(await adapters.readPolicy(), now().getTime()); }
   async function validatedInputs(campaignId: string, current: number, target: number) {
@@ -128,7 +129,9 @@ export function createCreatorWebBudgetService({ store, adapters, mode, now = () 
       const activeMode = operator ? mode() : "disabled";
       const cap = await getPolicy().catch(() => null);
       const fenced = activeMode !== "disabled" && await store.hasFence().catch(() => true);
-      return { clientId: WEB_BUDGET_CLIENT_ID, mode: activeMode, cap, canPrepare: activeMode !== "disabled" && !!cap && !cap.locked && !fenced };
+      return { clientId, mode: activeMode, cap,
+        capEditAllowed: operator && cap?.capWriteEnabled === true && !cap.locked && cap.campaignCapMinor === cap.clientDailyCapMinor,
+        canPrepare: activeMode !== "disabled" && !!cap && !cap.locked && !fenced };
     },
     async operation(ownerId: number, operationId: string) {
       const row = await store.get(ownerId, operationId);

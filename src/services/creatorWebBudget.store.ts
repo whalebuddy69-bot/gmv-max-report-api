@@ -3,11 +3,23 @@ import {
   WebBudgetError, WebBudgetRecord, WebBudgetStore,
 } from "./creatorWebBudget.service";
 
-// Isolated additive schema; never read or alter report or credential tables here.
-export const CREATOR_WEB_BUDGET_SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS creator_web_budget_operations (
+export type CreatorWebBudgetLedgerClient = "punpan_020" | "srihiw";
+const PPAN_LEDGER = { clientId: "punpan_020", table: "creator_web_budget_operations", fence: "creator_web_budget_one_active_fence" } as const;
+const SRIHIW_LEDGER = { clientId: "srihiw", table: "creator_web_budget_srihiw_operations", fence: "creator_web_budget_srihiw_one_active_fence" } as const;
+type LedgerScope = typeof PPAN_LEDGER | typeof SRIHIW_LEDGER;
+
+function ledgerScope(clientId: CreatorWebBudgetLedgerClient): LedgerScope {
+  if (clientId === "punpan_020") return PPAN_LEDGER;
+  if (clientId === "srihiw") return SRIHIW_LEDGER;
+  throw new Error("Unconfigured Creator budget ledger");
+}
+
+// Additive, independently fenced ledgers. Identifiers only come from the two
+// code-owned scopes above; this does not alter the existing Ppan schema.
+function schemaSql({ clientId, table, fence }: LedgerScope) { return `
+CREATE TABLE IF NOT EXISTS ${table} (
   operation_id uuid PRIMARY KEY,
-  client_id text NOT NULL DEFAULT 'punpan_020' CHECK (client_id = 'punpan_020'),
+  client_id text NOT NULL DEFAULT '${clientId}' CHECK (client_id = '${clientId}'),
   owner_id bigint NOT NULL CHECK (owner_id > 0),
   mode text NOT NULL CHECK (mode IN ('dry-run','live')),
   campaign_id text NOT NULL CHECK (campaign_id ~ '^[1-9][0-9]{5,30}$'),
@@ -32,9 +44,10 @@ CREATE TABLE IF NOT EXISTS creator_web_budget_operations (
   CHECK (CASE WHEN status = 'APPLIED_VERIFIED' THEN observed_budget_minor IS NOT NULL AND observed_budget_minor = target_budget_minor
     ELSE observed_budget_minor IS NULL END)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS creator_web_budget_one_active_fence
-  ON creator_web_budget_operations (client_id) WHERE status IN ('PROCESSING','OUTCOME_UNKNOWN');
-`;
+CREATE UNIQUE INDEX IF NOT EXISTS ${fence}
+  ON ${table} (client_id) WHERE status IN ('PROCESSING','OUTCOME_UNKNOWN');
+`; }
+export const CREATOR_WEB_BUDGET_SCHEMA_SQL = schemaSql(PPAN_LEDGER);
 
 interface QueryRunner {
   connect(): Promise<unknown>;
@@ -57,9 +70,9 @@ function timestamp(value: unknown): string {
   if (typeof value !== "string" && !(value instanceof Date)) throw new Error("Unexpected ledger timestamp");
   return new Date(value).toISOString();
 }
-function operation(row: Record<string, unknown>): WebBudgetRecord {
+function operation(row: Record<string, unknown>, expectedClientId: CreatorWebBudgetLedgerClient): WebBudgetRecord {
   if (typeof row.operation_id !== "string" || !WEB_BUDGET_OPERATION_ID.test(row.operation_id)
-    || (row.mode !== "dry-run" && row.mode !== "live") || row.client_id !== "punpan_020"
+    || (row.mode !== "dry-run" && row.mode !== "live") || row.client_id !== expectedClientId
     || typeof row.campaign_id !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(row.campaign_id)
     || typeof row.reporting_date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(row.reporting_date)
     || typeof row.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(row.fingerprint)
@@ -73,11 +86,12 @@ function operation(row: Record<string, unknown>): WebBudgetRecord {
     fingerprint: row.fingerprint, expiresAt: timestamp(row.expires_at), status: row.status as WebBudgetRecord["status"],
     observedBudgetMinor: row.observed_budget_minor === null ? null : safeInteger(row.observed_budget_minor, WEB_BUDGET_MAX_MINOR) };
 }
-function selectOwned(runner: QueryRunner, ownerId: number, operationId: string) {
-  return runner.query(`SELECT * FROM creator_web_budget_operations WHERE client_id='punpan_020' AND owner_id=$1 AND operation_id=$2`, [ownerId, operationId]);
-}
-
-export function createCreatorWebBudgetStore(database: CreatorWebBudgetDatabase): WebBudgetStore & { ensureSchema(): Promise<void> } {
+export function createCreatorWebBudgetStore(database: CreatorWebBudgetDatabase, clientId: CreatorWebBudgetLedgerClient = "punpan_020"): WebBudgetStore & { ensureSchema(): Promise<void> } {
+  const scope = ledgerScope(clientId);
+  const { table } = scope;
+  function selectOwned(runner: QueryRunner, ownerId: number, operationId: string) {
+    return runner.query(`SELECT * FROM ${table} WHERE client_id=$3 AND owner_id=$1 AND operation_id=$2`, [ownerId, operationId, clientId]);
+  }
   async function run<T>(work: (runner: QueryRunner) => Promise<T>, allowCollision = false): Promise<T | null> {
     const runner = database.createQueryRunner();
     let begun = false;
@@ -97,10 +111,10 @@ export function createCreatorWebBudgetStore(database: CreatorWebBudgetDatabase):
     } finally { try { await runner.release(); } catch { /* No connection metadata in responses. */ } }
   }
   return {
-    async ensureSchema() { await run(async runner => { await runner.query(CREATOR_WEB_BUDGET_SCHEMA_SQL); }); },
+    async ensureSchema() { await run(async runner => { await runner.query(schemaSql(scope)); }); },
     async create(value) {
       await run(async runner => {
-        await runner.query(`INSERT INTO creator_web_budget_operations
+        await runner.query(`INSERT INTO ${table}
           (operation_id,owner_id,mode,campaign_id,reporting_date,current_budget_minor,target_budget_minor,
             projected_client_spend_minor,policy_revision,campaign_cap_minor,client_daily_cap_minor,cap_read_at,fingerprint,expires_at)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
@@ -112,37 +126,37 @@ export function createCreatorWebBudgetStore(database: CreatorWebBudgetDatabase):
     async get(ownerId, operationId) {
       return run(async runner => {
         const found = rows(await selectOwned(runner, ownerId, operationId));
-        return found.length === 1 ? operation(found[0]) : null;
+        return found.length === 1 ? operation(found[0], clientId) : null;
       });
     },
     async hasFence() {
-      return await run(async runner => rows(await runner.query(`SELECT 1 FROM creator_web_budget_operations
-        WHERE client_id='punpan_020' AND (status='OUTCOME_UNKNOWN' OR
-          (status='PROCESSING' AND (mode='live' OR expires_at > clock_timestamp()))) LIMIT 1`)).length > 0) !== false;
+      return await run(async runner => rows(await runner.query(`SELECT 1 FROM ${table}
+        WHERE client_id=$1 AND (status='OUTCOME_UNKNOWN' OR
+          (status='PROCESSING' AND (mode='live' OR expires_at > clock_timestamp()))) LIMIT 1`, [clientId])).length > 0) !== false;
     },
     async reserve(ownerId, operationId, mode) {
       return run(async runner => {
         // Expired simulations provably cannot have sent. NEVER recycle a live fence here.
-        await runner.query(`UPDATE creator_web_budget_operations SET status='NOT_SENT', reason='SIMULATION_EXPIRED_NO_PROVIDER_WRITE', updated_at=clock_timestamp()
-          WHERE client_id='punpan_020' AND status='PROCESSING' AND mode='dry-run' AND expires_at <= clock_timestamp()`);
-        const matched = rows(await runner.query(`UPDATE creator_web_budget_operations
+        await runner.query(`UPDATE ${table} SET status='NOT_SENT', reason='SIMULATION_EXPIRED_NO_PROVIDER_WRITE', updated_at=clock_timestamp()
+          WHERE client_id=$1 AND status='PROCESSING' AND mode='dry-run' AND expires_at <= clock_timestamp()`, [clientId]);
+        const matched = rows(await runner.query(`UPDATE ${table}
           SET status='PROCESSING', reason='SEND_FENCE_COMMITTED', reserved_at=clock_timestamp(), updated_at=clock_timestamp()
-          WHERE client_id='punpan_020' AND owner_id=$1 AND operation_id=$2 AND mode=$3 AND status='PREPARED'
+          WHERE client_id=$4 AND owner_id=$1 AND operation_id=$2 AND mode=$3 AND status='PREPARED'
             AND expires_at > clock_timestamp()
-          RETURNING *`, [ownerId, operationId, mode]));
-        return matched.length === 1 ? operation(matched[0]) : null;
+          RETURNING *`, [ownerId, operationId, mode, clientId]));
+        return matched.length === 1 ? operation(matched[0], clientId) : null;
       }, true);
     },
     async finish(ownerId, operationId, value) {
       const completed = await run(async runner => {
-        const matched = rows(await runner.query(`UPDATE creator_web_budget_operations
+        const matched = rows(await runner.query(`UPDATE ${table}
           SET status=$3, observed_budget_minor=$4, reason=$5, updated_at=clock_timestamp()
-          WHERE client_id='punpan_020' AND owner_id=$1 AND operation_id=$2 AND status='PROCESSING' RETURNING *`,
-        [ownerId, operationId, value.status, value.observedBudgetMinor, value.reason]));
-        if (matched.length === 1) return operation(matched[0]);
+          WHERE client_id=$6 AND owner_id=$1 AND operation_id=$2 AND status='PROCESSING' RETURNING *`,
+        [ownerId, operationId, value.status, value.observedBudgetMinor, value.reason, clientId]));
+        if (matched.length === 1) return operation(matched[0], clientId);
         const found = rows(await selectOwned(runner, ownerId, operationId));
         if (found.length !== 1 || found[0].status === "PROCESSING" || found[0].status === "PREPARED") throw new Error("Ledger record not terminal");
-        return operation(found[0]);
+        return operation(found[0], clientId);
       });
       if (!completed) throw new WebBudgetError("BUDGET_LEDGER_UNAVAILABLE", 503, "ยังยืนยันสถานะรายการไม่ได้ ห้ามส่งซ้ำจนกว่าจะตรวจสอบผล");
       return completed;

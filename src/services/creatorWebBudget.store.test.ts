@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { PGlite } from "@electric-sql/pglite";
 import { randomUUID } from "node:crypto";
-import { createCreatorWebBudgetStore } from "./creatorWebBudget.store";
+import { createCreatorWebBudgetStore, type CreatorWebBudgetLedgerClient } from "./creatorWebBudget.store";
 import { WebBudgetProposal } from "./creatorWebBudget.service";
 
 const dbs: PGlite[] = [];
@@ -69,5 +69,38 @@ describe("Postgres budget operation ledger", () => {
     expect(await h.store.reserve(sim.ownerId, sim.operationId, "dry-run")).toBeNull();
     expect(await h.store.reserve(newOp.ownerId, newOp.operationId, "dry-run")).toMatchObject({ status: "PROCESSING" });
     expect(await h.store.get(sim.ownerId, sim.operationId)).toMatchObject({ status: "NOT_SENT", observedBudgetMinor: null });
+  });
+
+  it("never maps an unconfigured Creator to a table or falls back to Ppan", () => {
+    const h = setup();
+    expect(() => createCreatorWebBudgetStore(h.database, "srihiw; DROP TABLE other" as CreatorWebBudgetLedgerClient))
+      .toThrow("Unconfigured Creator budget ledger");
+    expect(h.events).toEqual([]);
+  });
+
+  it("keeps Srihiw rows, owner checks, and unresolved fences isolated from Ppan across store instances", async () => {
+    const h = setup(), ppan = h.store, srihiw = createCreatorWebBudgetStore(h.database, "srihiw");
+    await ppan.ensureSchema();
+    const first = proposal(), second = proposal(), anotherSrihiw = proposal("live", 42), anotherPpan = proposal("live", 42);
+    await expect(srihiw.get(second.ownerId, second.operationId)).rejects.toMatchObject({ code: "BUDGET_LEDGER_UNAVAILABLE" });
+    await srihiw.ensureSchema(); await srihiw.ensureSchema();
+    await ppan.create(first); await ppan.create(anotherPpan); await srihiw.create(second); await srihiw.create(anotherSrihiw);
+    expect(await ppan.get(second.ownerId, second.operationId)).toBeNull();
+    expect(await srihiw.get(first.ownerId, first.operationId)).toBeNull();
+    expect(await srihiw.reserve(second.ownerId + 1, second.operationId, "live")).toBeNull();
+    expect(await srihiw.reserve(second.ownerId, second.operationId, "dry-run")).toBeNull();
+    expect(await srihiw.reserve(second.ownerId, second.operationId, "live")).toMatchObject({ ...second, status: "PROCESSING" });
+    expect(await ppan.hasFence()).toBe(false);
+    expect(await ppan.reserve(first.ownerId, first.operationId, "live")).toMatchObject({ ...first, status: "PROCESSING" });
+    await srihiw.finish(second.ownerId, second.operationId, { status: "OUTCOME_UNKNOWN", observedBudgetMinor: null, reason: "READBACK_UNVERIFIED" });
+    await h.db.query("UPDATE creator_web_budget_srihiw_operations SET expires_at = clock_timestamp() - interval '1 day' WHERE operation_id=$1", [second.operationId]);
+    const srihiwRestored = createCreatorWebBudgetStore(h.database, "srihiw");
+    expect(await srihiwRestored.hasFence()).toBe(true);
+    expect(await srihiwRestored.reserve(anotherSrihiw.ownerId, anotherSrihiw.operationId, "live")).toBeNull();
+    expect(await ppan.finish(first.ownerId, first.operationId, { status: "APPLIED_VERIFIED", observedBudgetMinor: first.targetBudgetMinor, reason: "VERIFIED" }))
+      .toMatchObject({ status: "APPLIED_VERIFIED" });
+    expect(await ppan.reserve(anotherPpan.ownerId, anotherPpan.operationId, "live")).toMatchObject({ status: "PROCESSING" });
+    await expect(h.db.query("UPDATE creator_web_budget_srihiw_operations SET client_id = 'punpan_020' WHERE operation_id=$1", [second.operationId]))
+      .rejects.toMatchObject({ code: "23514" });
   });
 });

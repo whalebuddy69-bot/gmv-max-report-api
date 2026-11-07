@@ -6,6 +6,7 @@ import {
 } from "../services/creatorWebBudget.service";
 import { AppError } from "../utils/errors";
 import { parseAutomationViewerIds } from "./automation.route";
+import type { createCreatorWebCapAdapters } from "../services/creatorWebBudget.adapters";
 
 export const CREATOR_WEB_BUDGET_ORIGIN = "https://report.whalebuddy69.com";
 const JSON_TYPE = /^application\/json(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i;
@@ -17,8 +18,10 @@ function fields(value: unknown, keys: string[]): value is Record<string, unknown
 }
 function badInput(): never { throw new WebBudgetError("BUDGET_INPUT_INVALID", 400, "ข้อมูลคำสั่งไม่ถูกต้อง"); }
 
-export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, now = Date.now }: {
+export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, srihiwService, capEditor, extraCapConfigured = () => false, now = Date.now }: {
   viewerIds: () => string | undefined; operatorIds: () => string | undefined;
+  capEditor?: ReturnType<typeof createCreatorWebCapAdapters>; extraCapConfigured?: () => boolean;
+  srihiwService?: ReturnType<typeof createCreatorWebBudgetService>;
   service: ReturnType<typeof createCreatorWebBudgetService>; now?: () => number;
 }) {
   const router = Router({ caseSensitive: true, strict: true });
@@ -81,28 +84,53 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
     if (req.method === "GET") { next(); return; }
     res.set("Allow", "GET").status(405).json({ error: { code: "BUDGET_METHOD_DENIED", message: "ไม่รองรับวิธีเรียกนี้" } });
   };
-  router.get("/status", get, handle((_req, id) => service.status(canOperate(id))));
-  router.get("/operations/:operationId", get, onlyOperator, handle((req, id) => {
+  const dual = (path: string) => [path, `/srihiw${path}`];
+  function serviceFor(req: Request) {
+    if (!req.path.startsWith("/srihiw/")) return service;
+    if (!srihiwService || !extraCapConfigured()) throw new WebBudgetError("BUDGET_ROUTE_NOT_FOUND", 404, "ไม่พบหน้าคำสั่งนี้");
+    return srihiwService;
+  }
+  router.get(dual("/status"), get, handle((req, id) => serviceFor(req).status(canOperate(id))));
+  router.get(dual("/operations/:operationId"), get, onlyOperator, handle((req, id) => {
     if (typeof req.params.operationId !== "string" || !WEB_BUDGET_OPERATION_ID.test(req.params.operationId)) badInput();
-    return service.operation(id, req.params.operationId);
+    return serviceFor(req).operation(id, req.params.operationId);
   }));
-  router.post("/prepare", onlyOperator, onlyJson, json, handle((req, id) => {
+  router.post(dual("/prepare"), onlyOperator, onlyJson, json, handle((req, id) => {
     const value: unknown = req.body;
     if (!fields(value, ["expectedCampaignId", "expectedBudgetMinor", "targetBudgetMinor"])
       || typeof value.expectedCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedCampaignId)
       || !safeAmount(value.expectedBudgetMinor) || !safeAmount(value.targetBudgetMinor)) badInput();
-    return service.prepare(id, { expectedCampaignId: value.expectedCampaignId, expectedBudgetMinor: value.expectedBudgetMinor,
+    return serviceFor(req).prepare(id, { expectedCampaignId: value.expectedCampaignId, expectedBudgetMinor: value.expectedBudgetMinor,
       targetBudgetMinor: value.targetBudgetMinor });
   }));
-  router.post("/confirm", onlyOperator, onlyJson, json, handle((req, id) => {
+  router.post(dual("/confirm"), onlyOperator, onlyJson, json, handle((req, id) => {
     const value: unknown = req.body;
     if (!fields(value, ["operationId", "nativeAutoOff", "noConcurrentChanges"])
       || typeof value.operationId !== "string" || !WEB_BUDGET_OPERATION_ID.test(value.operationId)
       || value.nativeAutoOff !== true || value.noConcurrentChanges !== true) badInput();
-    return service.confirm(id, { operationId: value.operationId, nativeAutoOff: true, noConcurrentChanges: true }, () => recheck(req, id));
+    return serviceFor(req).confirm(id, { operationId: value.operationId, nativeAutoOff: true, noConcurrentChanges: true }, () => recheck(req, id));
   }));
-  router.all(["/status", "/operations/:operationId", "/prepare", "/confirm"], (req, res) => {
-    res.set("Allow", req.path === "/prepare" || req.path === "/confirm" ? "POST" : "GET")
+  const srihiwCap = "/cap/srihiw";
+  router.get(srihiwCap, get, handle(async (_req, id) => {
+    if (!capEditor || !extraCapConfigured()) throw new WebBudgetError("CAP_NOT_CONFIGURED", 404, "ไม่พบการตั้งเพดานของ Creator นี้");
+    const state = await capEditor.status("srihiw");
+    return { clientId: "srihiw", cap: state.cap, capEditAllowed: canOperate(id) && state.capEditAllowed };
+  }));
+  router.post(["/cap", srihiwCap], onlyOperator, onlyJson, json, handle((req, id) => {
+    const clientId = req.path === srihiwCap ? "srihiw" : "punpan_020";
+    if (!capEditor || (clientId === "srihiw" && !extraCapConfigured())) throw new WebBudgetError("CAP_NOT_CONFIGURED", 404, "ไม่พบการตั้งเพดานของ Creator นี้");
+    const value: unknown = req.body;
+    if (!fields(value, ["expectedRevision", "capMinor"]) || typeof value.expectedRevision !== "number" ||
+      !Number.isSafeInteger(value.expectedRevision) || value.expectedRevision < (clientId === "srihiw" ? 0 : 1) ||
+      !safeAmount(value.capMinor)) badInput();
+    return capEditor.update(clientId, id, value.expectedRevision, value.capMinor, () => recheck(req, id));
+  }));
+  router.all(["/cap", srihiwCap], (req, res) => {
+    res.set("Allow", req.path === srihiwCap ? "GET, POST" : "POST")
+      .status(405).json({ error: { code: "BUDGET_METHOD_DENIED", message: "ไม่รองรับวิธีเรียกนี้" } });
+  });
+  router.all(["/status", "/operations/:operationId", "/prepare", "/confirm"].flatMap(dual), (req, res) => {
+    res.set("Allow", req.path.endsWith("/prepare") || req.path.endsWith("/confirm") ? "POST" : "GET")
       .status(405).json({ error: { code: "BUDGET_METHOD_DENIED", message: "ไม่รองรับวิธีเรียกนี้" } });
   });
   router.use((_req, res) => res.status(404).json({ error: { code: "BUDGET_ROUTE_NOT_FOUND", message: "ไม่พบหน้าคำสั่งนี้" } }));
