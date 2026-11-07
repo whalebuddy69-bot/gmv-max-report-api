@@ -18,9 +18,11 @@ import { AppError, describeError } from "./utils/errors";
 import { logger } from "./utils/logger";
 import { creatorReadRouter } from "./routes/creatorRead.route";
 import { createCreatorBudgetTestRuntime } from "./services/creatorBudgetTest.runtime";
+import { createCreatorWebBudgetRuntime } from "./services/creatorWebBudget.runtime";
 
 const app = express();
 const creatorBudgetTest = createCreatorBudgetTestRuntime();
+const creatorWebBudget = createCreatorWebBudgetRuntime();
 
 app.use(
   cors({
@@ -28,6 +30,8 @@ app.use(
     credentials: true,
   })
 );
+// Dedicated auth/origin and a bounded request parser, before the general JSON parser.
+app.use("/automation/budget", creatorWebBudget.router);
 app.use(express.json());
 
 app.get("/health", (_req, res) => {
@@ -81,6 +85,7 @@ async function main(): Promise<void> {
   await AppDataSource.initialize();
   // Isolated additive ledger failure must not take down the Shop report service.
   await creatorBudgetTest.initialize();
+  await creatorWebBudget.initialize();
   await fs.mkdir(config.reportOutputDir, { recursive: true });
 
   app.listen(config.port, () => {
