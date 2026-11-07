@@ -5,6 +5,7 @@ import fs from "fs/promises";
 import { config } from "./config";
 import { AppDataSource } from "./db/dataSource";
 import { analyticsRouter } from "./routes/analytics.route";
+import { automationRouter } from "./routes/automation.route";
 import { authRouter } from "./routes/auth.route";
 import { oauthRouter } from "./routes/oauth.route";
 import { usersRouter } from "./routes/users.route";
@@ -36,6 +37,7 @@ app.get("/health", (_req, res) => {
 // web app (JWT)
 app.use("/auth", authRouter);
 app.use("/analytics", analyticsRouter);
+app.use("/automation", automationRouter);
 app.use("/users", usersRouter);
 
 // TikTok OAuth redirect (no auth)
