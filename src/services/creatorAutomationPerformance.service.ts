@@ -94,11 +94,11 @@ function isActivity(row: CreatorAutomationHour): boolean {
   return [row.spendMinor, row.gmvMinor, row.orders, row.roi, row.liveViews].some(value => value !== null && value > 0);
 }
 
-function readSeries(payload: unknown, { campaignId, reportingDate }: CreatorAutomationScope): CreatorAutomationHour[] {
+function readSeries(payload: unknown, { campaignId, reportingDate }: CreatorAutomationScope, advertiserId: string): CreatorAutomationHour[] {
   if (!object(payload) || payload.code !== 0 || !object(payload.data)) invalid();
   const { list, page_info: page, advertiser_id: advertiser } = payload.data;
   if (!Array.isArray(list) || list.length > MAX_HOURS || !object(page) ||
-    (advertiser !== undefined && advertiser !== CREATOR_BINDING.advertiserId) ||
+    (advertiser !== undefined && advertiser !== advertiserId) ||
     page.page !== 1 || page.total_number !== list.length ||
     (page.total_page !== 1 && !(list.length === 0 && page.total_page === 0)) ||
     (page.page_size !== undefined && page.page_size !== PAGE_SIZE)) invalid();
@@ -110,8 +110,8 @@ function readSeries(payload: unknown, { campaignId, reportingDate }: CreatorAuto
     const { dimensions, metrics } = value;
     const hour = typeof dimensions.stat_time_hour === "string" ? HOUR.exec(dimensions.stat_time_hour) : null;
     if (dimensions.campaign_id !== campaignId || !hour || hour[1] !== reportingDate || seen.has(hour[2]) ||
-      (dimensions.advertiser_id !== undefined && dimensions.advertiser_id !== CREATOR_BINDING.advertiserId) ||
-      (value.advertiser_id !== undefined && value.advertiser_id !== CREATOR_BINDING.advertiserId) ||
+      (dimensions.advertiser_id !== undefined && dimensions.advertiser_id !== advertiserId) ||
+      (value.advertiser_id !== undefined && value.advertiser_id !== advertiserId) ||
       (dimensions.store_id !== undefined && dimensions.store_id !== "0")) invalid();
     seen.add(hour[2]);
     const spendMinor = optionalMoney(metrics.cost);
@@ -135,11 +135,21 @@ function readSeries(payload: unknown, { campaignId, reportingDate }: CreatorAuto
 }
 
 /** GET-only, verified no-Shop Creator reporting for the server's active Ppan campaign. */
-export function createCreatorAutomationPerformance({
+export function createCreatorAutomationPerformance(dependencies: Dependencies) {
+  return createPerformanceReader(dependencies, CREATOR_BINDING.advertiserId);
+}
+
+/** Only a verified extra source adapter can select this exact advertiser. */
+export function createExtraCreatorAutomationPerformance(dependencies: Dependencies, advertiserId: string) {
+  if (typeof advertiserId !== "string" || !CAMPAIGN_ID.test(advertiserId) || advertiserId === CREATOR_BINDING.advertiserId) invalid();
+  return createPerformanceReader(dependencies, advertiserId);
+}
+
+function createPerformanceReader({
   loadToken,
   fetchImpl = fetch,
   now = () => new Date(),
-}: Dependencies) {
+}: Dependencies, advertiserId: string) {
   let cached: { key: string; at: number; value: CreatorAutomationPerformance } | undefined;
   let inFlight: { key: string; promise: Promise<CreatorAutomationPerformance> } | undefined;
 
@@ -148,7 +158,7 @@ export function createCreatorAutomationPerformance({
     if (typeof accessToken !== "string" || !/^[^\x00-\x20\x7f]{16,4096}$/.test(accessToken)) invalid();
     const url = new URL(REPORT_URL);
     const params = {
-      advertiser_id: CREATOR_BINDING.advertiserId,
+      advertiser_id: advertiserId,
       store_ids: ["0"],
       start_date: scope.reportingDate,
       end_date: scope.reportingDate,
@@ -171,7 +181,7 @@ export function createCreatorAutomationPerformance({
       headers: { "Access-Token": accessToken, Accept: "application/json", "Cache-Control": "no-cache" },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
-    const series = readSeries(await readJson(response), scope);
+    const series = readSeries(await readJson(response), scope, advertiserId);
     const observed = now();
     if (bangkokDay(observed) !== scope.reportingDate) invalid();
     return { state: "available", observedAt: observed.toISOString(), series };

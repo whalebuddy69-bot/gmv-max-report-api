@@ -1,4 +1,4 @@
-/** Ppan-only Creator pilot. No Shop IDs, OAuth, database writes, or ad mutations. */
+/** Default Ppan Creator binding used by the existing pilot and its writer. */
 export const CREATOR_BINDING = Object.freeze({
   advertiserId: "7666005333864644624", tiktokAccountId: "7285935731820920833",
   identityId: "9acd400c-e18e-5ad2-aed9-d3bac2e41d6a", identityType: "BC_AUTH_TT",
@@ -53,8 +53,35 @@ export interface CreatorReadDependencies {
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
 }
-/** Cache is per-process, bounded to this one client and never persisted as financial truth. */
-export function createCreatorReader({ loadToken, fetchImpl = fetch, now = () => new Date(), sleep = ms => new Promise(r => setTimeout(r, ms)) }: CreatorReadDependencies) {
+export interface CreatorReadBinding {
+  readonly advertiserId: string;
+  readonly tiktokAccountId: string;
+  readonly identityId: string;
+  readonly identityType: string;
+  readonly identityAuthorizedBcId: string;
+}
+
+/** Existing Ppan bridge and budget callers cannot supply an alternate binding. */
+export function createCreatorReader(dependencies: CreatorReadDependencies) {
+  return createReader(dependencies, "punpan_020", CREATOR_BINDING, false);
+}
+
+/** Used only by the server's verified, separately configured extra read adapters. */
+export function createExtraCreatorReader(dependencies: CreatorReadDependencies, clientId: string, configured: CreatorReadBinding) {
+  if (typeof clientId !== "string" || !/^[a-z][a-z0-9_-]{1,39}$/.test(clientId) || clientId === "punpan_020" ||
+    !accountId(configured.advertiserId) || !accountId(configured.tiktokAccountId) || !accountId(configured.identityAuthorizedBcId) ||
+    configured.advertiserId === CREATOR_BINDING.advertiserId || configured.tiktokAccountId === CREATOR_BINDING.tiktokAccountId ||
+    typeof configured.identityId !== "string" || !/^[A-Za-z0-9_-]{6,100}$/.test(configured.identityId) ||
+    configured.identityId === CREATOR_BINDING.identityId || configured.identityType !== "BC_AUTH_TT") {
+    throw new CreatorReadError("CREATOR_EXTRA_BINDING_UNVERIFIED");
+  }
+  const { advertiserId, tiktokAccountId, identityId, identityType, identityAuthorizedBcId } = configured;
+  return createReader(dependencies, clientId, Object.freeze({ advertiserId, tiktokAccountId, identityId, identityType, identityAuthorizedBcId }), true);
+}
+
+/** Cache belongs to this one immutable client binding and is never financial truth. */
+function createReader({ loadToken, fetchImpl = fetch, now = () => new Date(), sleep = ms => new Promise(r => setTimeout(r, ms)) }: CreatorReadDependencies,
+  clientId: string, binding: CreatorReadBinding, verifyAdvertiser: boolean) {
   let cached: { at: number; value: Row } | undefined;
   let inFlight: Promise<Row> | undefined;
   async function read(): Promise<Row> {
@@ -64,7 +91,7 @@ export function createCreatorReader({ loadToken, fetchImpl = fetch, now = () => 
     const deadline = Date.now() + 18_000;
     let calls = 0, lastStart = 0;
     async function get(endpoint: string, params: Row): Promise<Row> {
-      if (!ENDPOINTS.has(endpoint) || ++calls > 10 || Date.now() >= deadline) throw new CreatorReadError("REQUEST_BOUNDARY");
+      if (!(ENDPOINTS.has(endpoint) || (verifyAdvertiser && endpoint === "/advertiser/info/")) || ++calls > 10 || Date.now() >= deadline) throw new CreatorReadError("REQUEST_BOUNDARY");
       if (lastStart) await sleep(Math.max(0, 500 - (Date.now() - lastStart)));
       lastStart = Date.now();
       const url = new URL(BASE + endpoint);
@@ -80,17 +107,29 @@ export function createCreatorReader({ loadToken, fetchImpl = fetch, now = () => 
       }
     }
     const capabilities = { read: true, budgetWrite: false, create: false, pause: false, autoOptimization: false };
-    const base: Row = { schemaVersion: 1, clientId: "punpan_020", source: "tiktok-creator-api", readOnly: true,
-      reportingDate: date, timezone: "Asia/Bangkok", binding: CREATOR_BINDING, campaign: null, capabilities,
+    const base: Row = { schemaVersion: 1, clientId, source: "tiktok-creator-api", readOnly: true,
+      reportingDate: date, timezone: "Asia/Bangkok", binding, campaign: null, capabilities,
       nativeAutoBudgetState: "UNKNOWN", quality: { spendEstimated: true, spendSource: "TT_SHOP", reportLagSeconds: null,
         aggregateSpendComplete: false, aggregateSpendMinor: null, gmvAvailable: false, roiAvailable: false, liveViewsAvailable: false } };
+    // The existing pilot has already bound its currency and timezone. Prove
+    // both explicitly for every added advertiser before interpreting money/day.
+    if (verifyAdvertiser) {
+      const metadata = await get("/advertiser/info/", { advertiser_ids: [binding.advertiserId], fields: ["advertiser_id", "currency", "timezone"] });
+      if (!Array.isArray(metadata.list) || metadata.list.length !== 1 || metadata.list[0]?.advertiser_id !== binding.advertiserId ||
+        metadata.list[0]?.currency !== "THB" || metadata.list[0]?.timezone !== "Asia/Bangkok") {
+        throw new CreatorReadError("CREATOR_ADVERTISER_SCOPE_UNVERIFIED");
+      }
+    }
     const campaigns: Row[] = [], seen = new Set<string>();
     let totalPages: number | undefined, expectedCount: number | undefined;
     for (let page = 1; page <= 5; page++) {
-      const data = await get("/gmv_max/campaign/get/", { advertiser_id: CREATOR_BINDING.advertiserId,
+      const data = await get("/gmv_max/campaign/get/", { advertiser_id: binding.advertiserId,
         filtering: { gmv_max_promotion_types: ["LIVE_GMV_MAX"] },
         fields: ["advertiser_id", "campaign_id", "campaign_name", "operation_status"], page, page_size: 100 });
       const info = data.page_info;
+      if (verifyAdvertiser && data.advertiser_id !== undefined && data.advertiser_id !== binding.advertiserId) {
+        throw new CreatorReadError("CAMPAIGN_SCOPE_UNVERIFIED");
+      }
       if (!Array.isArray(data.list) || data.list.length > 100 || info?.page !== page || !Number.isSafeInteger(info?.total_page)
         || info.total_page < 0 || (info.total_page === 0 && data.list.length > 0) || (info.total_page > 0 && info.total_page < page)
         || !Number.isSafeInteger(info.total_number) || info.total_number < 0
@@ -98,7 +137,7 @@ export function createCreatorReader({ loadToken, fetchImpl = fetch, now = () => 
       totalPages = info.total_page; expectedCount = info.total_number;
       for (const row of data.list) {
         if (!accountId(row?.campaign_id) || !["ENABLE", "DISABLE", "DELETE"].includes(row.operation_status)
-          || (row.advertiser_id !== undefined && row.advertiser_id !== CREATOR_BINDING.advertiserId) || seen.has(row.campaign_id)) throw new CreatorReadError("CAMPAIGN_SCOPE_UNVERIFIED");
+          || ((verifyAdvertiser || row.advertiser_id !== undefined) && row.advertiser_id !== binding.advertiserId) || seen.has(row.campaign_id)) throw new CreatorReadError("CAMPAIGN_SCOPE_UNVERIFIED");
         seen.add(row.campaign_id); campaigns.push(row);
       }
       if (page >= totalPages!) break;
@@ -112,12 +151,14 @@ export function createCreatorReader({ loadToken, fetchImpl = fetch, now = () => 
       return { ...base, observedAt: now().toISOString() };
     }
     const campaignId = enabled[0].campaign_id;
-    const info = await get("/campaign/gmv_max/info/", { advertiser_id: CREATOR_BINDING.advertiserId, campaign_id: campaignId });
-    if (info.campaign_id !== campaignId || info.advertiser_id !== CREATOR_BINDING.advertiserId || info.shopping_ads_type !== "LIVE" || info.operation_status !== "ENABLE"
+    const info = await get("/campaign/gmv_max/info/", { advertiser_id: binding.advertiserId, campaign_id: campaignId });
+    // The supplied TikTok account number is display metadata. The advertiser
+    // and exact BC-authorized identity, not that number, scope the provider read.
+    if (info.campaign_id !== campaignId || info.advertiser_id !== binding.advertiserId || info.shopping_ads_type !== "LIVE" || info.operation_status !== "ENABLE"
       || !noShop(info.store_id) || !noShop(info.store_authorized_bc_id)
       || !Array.isArray(info.identity_list) || info.identity_list.length !== 1
-      || info.identity_list[0].identity_id !== CREATOR_BINDING.identityId || info.identity_list[0].identity_type !== CREATOR_BINDING.identityType
-      || info.identity_list[0].identity_authorized_bc_id !== CREATOR_BINDING.identityAuthorizedBcId
+      || info.identity_list[0]?.identity_id !== binding.identityId || info.identity_list[0].identity_type !== binding.identityType
+      || info.identity_list[0].identity_authorized_bc_id !== binding.identityAuthorizedBcId
       || !noShop(info.identity_list[0].store_id) || !noShop(info.identity_list[0].identity_authorized_shop_id)) throw new CreatorReadError("CREATOR_IDENTITY_BINDING_UNVERIFIED");
     if (typeof info.roas_bid !== "number" || !Number.isFinite(info.roas_bid) || info.roas_bid <= 0) throw new CreatorReadError("ROI_TARGET_UNVERIFIED");
     const budget = minor(info.budget);
@@ -130,9 +171,12 @@ export function createCreatorReader({ loadToken, fetchImpl = fetch, now = () => 
       let aggregate = 0, target = 0, rowCount = 0, expectedRows: number | undefined, reportPages: number | undefined;
       const dimensions = new Set<string>();
       for (let page = 1; page <= 3; page++) {
-        const data = await get("/report/integrated/get/", { advertiser_id: CREATOR_BINDING.advertiserId, service_type: "AUCTION", report_type: "TT_SHOP", data_level: "AUCTION_CAMPAIGN",
+        const data = await get("/report/integrated/get/", { advertiser_id: binding.advertiserId, service_type: "AUCTION", report_type: "TT_SHOP", data_level: "AUCTION_CAMPAIGN",
           dimensions: ["campaign_id", "country_code", "stat_time_day"], metrics: ["spend"], start_date: date, end_date: date, page, page_size: 1000 });
         const pagination = data.page_info;
+        if (verifyAdvertiser && data.advertiser_id !== undefined && data.advertiser_id !== binding.advertiserId) {
+          throw new CreatorReadError("SPEND_SCOPE_UNVERIFIED");
+        }
         if (!Array.isArray(data.list) || data.list.length > 1000 || pagination?.page !== page || !Number.isSafeInteger(pagination.total_page)
           || !Number.isSafeInteger(pagination.total_number) || pagination.total_page < 0 || pagination.total_number < 0
           || (pagination.total_page === 0 && data.list.length > 0) || (pagination.total_page > 0 && pagination.total_page < page)
@@ -140,7 +184,9 @@ export function createCreatorReader({ loadToken, fetchImpl = fetch, now = () => 
         reportPages = pagination.total_page; expectedRows = pagination.total_number;
         for (const row of data.list) {
           const dim = row?.dimensions;
-          if (!accountId(dim?.campaign_id) || typeof dim.stat_time_day !== "string" || dim.stat_time_day.slice(0, 10) !== date
+          if ((verifyAdvertiser && ((row?.advertiser_id !== undefined && row.advertiser_id !== binding.advertiserId) ||
+              (dim?.advertiser_id !== undefined && dim.advertiser_id !== binding.advertiserId))) ||
+            !accountId(dim?.campaign_id) || typeof dim.stat_time_day !== "string" || dim.stat_time_day.slice(0, 10) !== date
             || typeof dim.country_code !== "string") throw new CreatorReadError("SPEND_SCOPE_UNVERIFIED");
           const key = JSON.stringify([dim.campaign_id, dim.country_code, dim.stat_time_day]);
           if (dimensions.has(key)) throw new CreatorReadError("SPEND_DUPLICATE_ROW");

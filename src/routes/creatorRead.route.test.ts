@@ -6,7 +6,7 @@ const mocks = vi.hoisted(() => ({ runner: { connect: vi.fn(), query: vi.fn(), re
 vi.mock("../db/dataSource", () => ({ AppDataSource: { createQueryRunner: () => mocks.runner } }));
 vi.mock("../utils/crypto", () => ({ decryptSecret: mocks.decrypt }));
 vi.mock("../config", () => ({ config: { tiktokOAuth: { appId: "7667234745498992657" } } }));
-import { createCreatorReadRouter, creatorReadAuthorized, loadCreatorToken } from "./creatorRead.route";
+import { createCreatorReadRouter, createExtraCreatorTokenLoader, creatorReadAuthorized, loadCreatorToken } from "./creatorRead.route";
 
 const KEY = "bridge-key-canary-01234567890123456789";
 let server: Server | undefined;
@@ -55,5 +55,22 @@ describe("dedicated Creator read endpoint", () => {
     expect(await loadCreatorToken()).toBe("runtime-token-private");
     expect(events[0]).toBe("BEGIN READ ONLY"); expect(events).toContain("ROLLBACK");
     expect(events.some(x => /INSERT|UPDATE|DELETE/.test(x))).toBe(false);
+  });
+
+  it("only reads the server-configured extra advertiser row and fails on ambiguous authorization", async () => {
+    const advertiser = "9123456789012345678";
+    expect(() => createExtraCreatorTokenLoader("bad/advertiser")).toThrow();
+    expect(() => createExtraCreatorTokenLoader("7666005333864644624")).toThrow();
+    mocks.runner.query.mockImplementation(async (sql: string, params?: string[]) => {
+      if (sql === "SHOW transaction_read_only") return [{ transaction_read_only: "on" }];
+      if (sql.startsWith("SELECT")) {
+        expect(params).toEqual([advertiser]);
+        return [{ access_token: "ciphertext-a", authorized_at_db: "2026-11-07" }, { access_token: "ciphertext-b", authorized_at_db: "2026-11-07" }];
+      }
+      return [];
+    });
+    await expect(createExtraCreatorTokenLoader(advertiser)()).rejects.toMatchObject({ code: "CREATOR_CREDENTIAL_UNAVAILABLE" });
+    expect(mocks.decrypt).not.toHaveBeenCalled();
+    expect(mocks.runner.query).toHaveBeenCalledWith("ROLLBACK");
   });
 });

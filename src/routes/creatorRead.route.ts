@@ -10,7 +10,19 @@ export function creatorReadAuthorized(supplied: unknown, expected: string): bool
   if (expected.length < 32 || typeof supplied !== "string") return false;
   return crypto.timingSafeEqual(crypto.createHash("sha256").update(supplied).digest(), crypto.createHash("sha256").update(expected).digest());
 }
-export async function loadCreatorToken(): Promise<string> {
+export function loadCreatorToken(): Promise<string> {
+  return loadCreatorTokenForExactAdvertiser(CREATOR_BINDING.advertiserId);
+}
+
+/** Only called with an immutable server-configured advertiser, never a request input. */
+export function createExtraCreatorTokenLoader(advertiserId: string): () => Promise<string> {
+  if (typeof advertiserId !== "string" || !/^[1-9]\d{5,30}$/.test(advertiserId) || advertiserId === CREATOR_BINDING.advertiserId) {
+    throw new CreatorReadError("CREATOR_EXTRA_ADVERTISER_UNVERIFIED");
+  }
+  return () => loadCreatorTokenForExactAdvertiser(advertiserId);
+}
+
+async function loadCreatorTokenForExactAdvertiser(advertiserId: string): Promise<string> {
   if (config.tiktokOAuth.appId !== CREATOR_APP_ID) throw new CreatorReadError("APP_BINDING_UNVERIFIED");
   const runner = AppDataSource.createQueryRunner();
   let encrypted: string | undefined, failure = false;
@@ -20,7 +32,7 @@ export async function loadCreatorToken(): Promise<string> {
     await runner.query("SET LOCAL statement_timeout = '5s'");
     const readOnly = await runner.query("SHOW transaction_read_only");
     if (readOnly[0]?.transaction_read_only !== "on") throw new CreatorReadError("DATABASE_READ_ONLY_UNVERIFIED");
-    const rows = await runner.query("SELECT access_token, authorized_at::text AS authorized_at_db FROM oauth_tokens WHERE advertiser_id = $1 AND revoked_at IS NULL ORDER BY authorized_at DESC NULLS LAST, id DESC LIMIT 2", [CREATOR_BINDING.advertiserId]);
+    const rows = await runner.query("SELECT access_token, authorized_at::text AS authorized_at_db FROM oauth_tokens WHERE advertiser_id = $1 AND revoked_at IS NULL ORDER BY authorized_at DESC NULLS LAST, id DESC LIMIT 2", [advertiserId]);
     if (!rows.length || typeof rows[0].access_token !== "string" || !rows[0].authorized_at_db
       || (rows.length > 1 && rows[0].authorized_at_db === rows[1].authorized_at_db)) throw new CreatorReadError("CREDENTIAL_SELECTION_UNVERIFIED");
     encrypted = rows[0].access_token;

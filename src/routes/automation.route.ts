@@ -1,32 +1,37 @@
 import { Router } from "express";
 import type { ErrorRequestHandler, Request, Response } from "express";
 import { requireAuth } from "../middleware/auth";
-import { bangkokDay, CREATOR_BINDING, createCreatorReader } from "../services/creatorRead.service";
+import { bangkokDay, CreatorReadError, createCreatorReader } from "../services/creatorRead.service";
 import { createCreatorAutomationPerformance } from "../services/creatorAutomationPerformance.service";
+import { createAutomationReadRegistry, parseExtraAutomationClients, parseVerifiedAutomationBindings,
+  PPAN_AUTOMATION_CREATOR, validAutomationClientId } from "../services/creatorAutomationRegistry.service";
+import type { AutomationAccessReason, AutomationCreator, AutomationCreatorReadAdapter, AutomationCreatorReadEntry,
+  AutomationPerformanceScope } from "../services/creatorAutomationRegistry.service";
+import { createVerifiedExtraCreatorReadAdapter } from "../services/creatorAutomationExtraRead.service";
 import { AppError } from "../utils/errors";
 import { loadCreatorToken } from "./creatorRead.route";
 
-const CLIENT_ID = "punpan_020";
 const MAX_SNAPSHOT_AGE_MS = 30_000;
 const MAX_PERFORMANCE_AGE_MS = 190_000; // 3m server cache plus bounded provider fetch allowance.
 const MAX_VIEWERS = 100;
 const VIEWER_WINDOW_MS = 60_000;
 const VIEWER_REQUEST_LIMIT = 24;
 const ACTIONS = Object.freeze({ start: false, pause: false, increaseBudget: false, decreaseBudget: false, auto: false });
-const CONFIGURED_CLIENT = Object.freeze({ clientId: CLIENT_ID, displayName: "Ppan", advertiserId: CREATOR_BINDING.advertiserId,
-  tiktokAccountId: CREATOR_BINDING.tiktokAccountId });
 
 type UnknownRecord = Record<string, unknown>;
-type PerformanceScope = { campaignId: string; reportingDate: string };
 type AutomationRouteDependencies = {
   viewerIds: () => string | undefined;
   readSnapshot: () => Promise<unknown>;
-  readPerformance: (scope: PerformanceScope) => Promise<unknown>;
+  readPerformance: (scope: AutomationPerformanceScope) => Promise<unknown>;
+  configuredExtraClients?: () => string | undefined;
+  verifiedExtras?: () => readonly AutomationCreatorReadAdapter[];
+  pendingReason?: (creator: AutomationCreator) => AutomationAccessReason | undefined;
   now?: () => Date;
 };
 type Campaign = { campaignId: string; campaignName: string; campaignStatus: "ACTIVE"; dailyBudgetMinor: number;
   spendMinor: number | null; targetRoi: number | null; currency: "THB" };
 type Observation = { observedAt: string; reportingDate: string; campaign: Campaign | null };
+type ObservationResult = { view: Observation; accessReason?: never } | { view: null; accessReason: AutomationAccessReason };
 type PerformancePoint = { hour: string; spendMinor: number | null; gmvMinor: number | null;
   orders: number | null; roi: number | null; liveViews: number | null };
 type PerformanceObservation = { observedAt: string; series: PerformancePoint[] };
@@ -58,11 +63,9 @@ function freshObservationTime(value: unknown, reportingDate: string, now: Date, 
     && reportingDate === bangkokDay(now) && reportingDate === bangkokDay(observed);
 }
 
-function verifyObservation(raw: unknown, now: Date): Observation | null {
-  if (!record(raw) || raw.schemaVersion !== 1 || raw.clientId !== CLIENT_ID || raw.readOnly !== true
-    || raw.source !== "tiktok-creator-api" || raw.timezone !== "Asia/Bangkok" || !record(raw.binding)) return null;
-  const binding = raw.binding;
-  if (!Object.entries(CREATOR_BINDING).every(([key, expected]) => binding[key] === expected)) return null;
+function verifyObservation(raw: UnknownRecord, now: Date, adapter: AutomationCreatorReadAdapter): Observation | null {
+  if (raw.schemaVersion !== 1 || raw.clientId !== adapter.clientId || raw.readOnly !== true
+    || raw.source !== "tiktok-creator-api" || raw.timezone !== "Asia/Bangkok") return null;
   if (typeof raw.reportingDate !== "string" || !freshObservationTime(raw.observedAt, raw.reportingDate, now, MAX_SNAPSHOT_AGE_MS)) return null;
   const { observedAt, reportingDate } = raw;
   const campaign = raw.campaign;
@@ -93,10 +96,13 @@ function verifyPerformance(raw: unknown, reportingDate: string, now: Date): Perf
   return { observedAt: raw.observedAt, series: points.sort((a, b) => a.hour.localeCompare(b.hour)) };
 }
 
-export function createAutomationRouter({ viewerIds, readSnapshot, readPerformance, now = () => new Date() }: AutomationRouteDependencies) {
+export function createAutomationRouter({ viewerIds, readSnapshot, readPerformance, configuredExtraClients, verifiedExtras,
+  pendingReason, now = () => new Date() }: AutomationRouteDependencies) {
   const router = Router();
   let windowStart = -Infinity;
   const viewerRequests = new Map<number, number>();
+  const registry = () => createAutomationReadRegistry({ extraConfig: configuredExtraClients?.(),
+    ppan: { readSnapshot, readPerformance }, verifiedExtras: verifiedExtras?.(), pendingReason });
 
   router.use((_req, res, next) => {
     res.set("Cache-Control", "no-store").vary("Authorization");
@@ -134,34 +140,61 @@ export function createAutomationRouter({ viewerIds, readSnapshot, readPerformanc
     return true;
   }
 
-  async function observe(): Promise<Observation | null> {
-    try { return verifyObservation(await readSnapshot(), now()); }
-    catch { return null; }
+  async function observe(entry: AutomationCreatorReadEntry): Promise<ObservationResult> {
+    if (!entry.adapter) return { view: null, accessReason: entry.accessReason };
+    try {
+      const raw = await entry.adapter.readSnapshot();
+      if (!record(raw)) return { view: null, accessReason: "upstream-unavailable" };
+      const binding = raw.binding;
+      if (!record(binding) || !Object.entries(entry.adapter.binding).every(([key, expected]) => binding[key] === expected)) {
+        return { view: null, accessReason: "identity-unverified" };
+      }
+      const view = verifyObservation(raw, now(), entry.adapter);
+      return view ? { view } : { view: null, accessReason: "upstream-unavailable" };
+    } catch (error) {
+      if (error instanceof CreatorReadError && error.code === "CREATOR_PERMISSION_DENIED") {
+        return { view: null, accessReason: "needs-authorization" };
+      }
+      if (error instanceof CreatorReadError && error.code === "CREATOR_IDENTITY_BINDING_UNVERIFIED") {
+        return { view: null, accessReason: "identity-unverified" };
+      }
+      return { view: null, accessReason: "upstream-unavailable" };
+    }
   }
 
   router.all("/overview", async (req, res, next) => {
     try {
       if (!fixedGet(req, res)) return;
-      const view = await observe();
-      res.json({ schemaVersion: 1, checkedAt: now().toISOString(), coverage: "configured-creators-only", clients: [{
-        ...CONFIGURED_CLIENT, access: view ? "verified" : "unavailable", observedAt: view?.observedAt ?? null,
-        reportingDate: view?.reportingDate ?? null, campaign: view?.campaign ?? null, capMinor: null, actions: ACTIONS,
-      }] });
+      const clients = await Promise.all(registry().map(async entry => {
+        const { view, accessReason } = await observe(entry);
+        return { ...entry.creator, tiktokAccountIdVerified: entry.creator.clientId === PPAN_AUTOMATION_CREATOR.clientId,
+          access: view ? "verified" : "unavailable", ...(accessReason ? { accessReason } : {}),
+          observedAt: view?.observedAt ?? null, reportingDate: view?.reportingDate ?? null,
+          campaign: view?.campaign ?? null, capMinor: null, actions: ACTIONS };
+      }));
+      res.json({ schemaVersion: 1, checkedAt: now().toISOString(), coverage: "configured-creators-only", clients });
     } catch (error) { next(error); }
   });
 
-  router.all("/performance", async (req, res, next) => {
+  router.all(["/performance", "/performance/:clientId"], async (req, res, next) => {
     try {
       if (!fixedGet(req, res)) return;
-      const view = await observe(), campaignId = view?.campaign?.campaignId ?? null;
+      const clientId = req.params.clientId ?? PPAN_AUTOMATION_CREATOR.clientId;
+      const entry = validAutomationClientId(clientId) ? registry().find(candidate => candidate.creator.clientId === clientId) : undefined;
+      if (!entry) {
+        res.status(404).json({ error: { code: "CREATOR_NOT_CONFIGURED", message: "ไม่พบ Creator ในรายการ Automation" } });
+        return;
+      }
+      const { view } = await observe(entry);
+      const campaignId = view?.campaign?.campaignId ?? null;
       const reportingDate = view?.reportingDate ?? null;
       let performance: PerformanceObservation | null = null;
-      if (campaignId && reportingDate) {
+      if (campaignId && reportingDate && entry.adapter) {
         try {
-          performance = verifyPerformance(await readPerformance({ campaignId, reportingDate }), reportingDate, now());
+          performance = verifyPerformance(await entry.adapter.readPerformance({ campaignId, reportingDate }), reportingDate, now());
         } catch { /* Provider data is optional; do not expose errors or tokens to the browser. */ }
       }
-      res.json({ schemaVersion: 1, checkedAt: now().toISOString(), clientId: CLIENT_ID, campaignId, reportingDate,
+      res.json({ schemaVersion: 1, checkedAt: now().toISOString(), clientId, campaignId, reportingDate,
         granularity: "hour", state: performance ? "available" : view && !campaignId ? "no-active-campaign" : "unavailable",
         observedAt: performance?.observedAt ?? null, series: performance?.series ?? [] });
     } catch (error) { next(error); }
@@ -183,8 +216,25 @@ export function createAutomationRouter({ viewerIds, readSnapshot, readPerformanc
 const creatorSnapshot = createCreatorReader({ loadToken: loadCreatorToken });
 const creatorPerformance = createCreatorAutomationPerformance({ loadToken: loadCreatorToken });
 const creatorReadEnabled = () => process.env.CREATOR_READ_ENABLED === "true";
+const configuredExtraClients = () => process.env.CREATOR_AUTOMATION_EXTRA_READ_CLIENTS;
+const configuredVerifiedBindings = () => process.env.CREATOR_AUTOMATION_VERIFIED_READ_BINDINGS;
+let cachedExtraAdapters: { metadata?: string; verified?: string; adapters: readonly AutomationCreatorReadAdapter[] } | undefined;
+function verifiedExtraAdapters(): readonly AutomationCreatorReadAdapter[] {
+  if (!creatorReadEnabled()) return [];
+  const metadata = configuredExtraClients();
+  const verified = configuredVerifiedBindings();
+  if (!cachedExtraAdapters || cachedExtraAdapters.metadata !== metadata || cachedExtraAdapters.verified !== verified) {
+    const bindings = parseVerifiedAutomationBindings(verified, parseExtraAutomationClients(metadata));
+    cachedExtraAdapters = { metadata, verified, adapters: bindings.map(binding => createVerifiedExtraCreatorReadAdapter(binding)) };
+  }
+  return cachedExtraAdapters.adapters;
+}
 export const automationRouter = createAutomationRouter({
   viewerIds: () => process.env.CREATOR_AUTOMATION_VIEWER_USER_IDS,
+  configuredExtraClients,
+  verifiedExtras: verifiedExtraAdapters,
+  pendingReason: () => !creatorReadEnabled() ? "upstream-unavailable"
+    : configuredVerifiedBindings() ? "identity-unverified" : "needs-authorization",
   readSnapshot: () => creatorReadEnabled() ? creatorSnapshot() : Promise.resolve(null),
   readPerformance: scope => creatorReadEnabled() ? creatorPerformance(scope) : Promise.resolve(null),
 });
