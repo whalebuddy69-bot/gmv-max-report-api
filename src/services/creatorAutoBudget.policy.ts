@@ -98,8 +98,8 @@ function validGrant(value: unknown): value is CreatorAutoBudgetGrant {
 }
 
 /** Pure advisory calculation. This result carries no authorization or provider freshness proof. */
-export function previewCreatorAutoBudget({ now, context, policy }: {
-  now: Date; context: WebBudgetContext | null; policy: WebBudgetPolicy | null;
+export function previewCreatorAutoBudget({ now, context, policy, rounding }: {
+  now: Date; context: WebBudgetContext | null; policy: WebBudgetPolicy | null; rounding?: "floor-satang";
 }): CreatorAutoBudgetPreview {
   const at = now.getTime();
   if (!context || !fresh(context.observedAt, at, READ_FRESH_MS) ||
@@ -113,13 +113,13 @@ export function previewCreatorAutoBudget({ now, context, policy }: {
     typeof policy.locked !== "boolean") return { status: "POLICY_UNAVAILABLE" };
   if (policy.locked) return { status: "POLICY_LOCKED" };
 
-  // Compare the 80% threshold and calculate 120% in exact satang; no clamping or hidden rounding.
+  // One-shot scopes still require exact satang. Continuous Ppan may round down by less than one satang.
   const baseline = BigInt(context.budgetMinor);
   const threshold = (baseline * 8n + 9n) / 10n;
   if (BigInt(context.spendMinor) < threshold) return { status: "BELOW_THRESHOLD" };
   const scaled = baseline * 12n;
   const target = scaled / 10n;
-  if (scaled % 10n !== 0n || target > MAX_MONEY) return { status: "TARGET_NOT_EXACT" };
+  if ((rounding !== "floor-satang" && scaled % 10n !== 0n) || target <= baseline || target > MAX_MONEY) return { status: "TARGET_NOT_EXACT" };
   if (target <= BigInt(context.spendMinor)) return { status: "TARGET_BELOW_SPEND" };
   if (target > BigInt(policy.campaignCapMinor)) return { status: "CAMPAIGN_CAP_EXCEEDED" };
   const projected = target + BigInt(context.aggregateSpendMinor - context.spendMinor);

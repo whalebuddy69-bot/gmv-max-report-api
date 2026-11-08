@@ -21,7 +21,7 @@ function ledgerScope(clientId: CreatorWebBudgetLedgerClient): LedgerScope {
 }
 
 // Additive, independently fenced ledgers. Identifiers only come from the
-// code-owned scopes above; this does not alter the existing Ppan schema.
+// code-owned scopes above. The readback fingerprint is added without changing existing rows.
 function schemaSql({ clientId, table, fence }: LedgerScope) { return `
 CREATE TABLE IF NOT EXISTS ${table} (
   operation_id uuid PRIMARY KEY,
@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS ${table} (
 CREATE UNIQUE INDEX IF NOT EXISTS ${fence}
   ON ${table} (client_id) WHERE status IN ('PROCESSING','OUTCOME_UNKNOWN');
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'manual' CHECK (source IN ('manual','auto'));
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS observed_fingerprint text
+  CHECK (observed_fingerprint IS NULL OR (status = 'APPLIED_VERIFIED' AND observed_fingerprint ~ '^[a-f0-9]{64}$' AND observed_fingerprint <> fingerprint));
 `; }
 export const CREATOR_WEB_BUDGET_SCHEMA_SQL = schemaSql(PPAN_LEDGER);
 
@@ -84,7 +86,9 @@ function operation(row: Record<string, unknown>, expectedClientId: CreatorWebBud
     || typeof row.campaign_id !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(row.campaign_id)
     || typeof row.reporting_date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(row.reporting_date)
     || typeof row.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(row.fingerprint)
-    || typeof row.status !== "string" || !statusValues.has(row.status)) throw new Error("Unexpected ledger record");
+    || typeof row.status !== "string" || !statusValues.has(row.status)
+    || (row.observed_fingerprint != null && (typeof row.observed_fingerprint !== "string" ||
+      !/^[a-f0-9]{64}$/.test(row.observed_fingerprint) || row.observed_fingerprint === row.fingerprint || row.status !== "APPLIED_VERIFIED"))) throw new Error("Unexpected ledger record");
   return { operationId: row.operation_id, ownerId: safeInteger(row.owner_id), mode: row.mode, source: row.source, campaignId: row.campaign_id,
     reportingDate: row.reporting_date, currentBudgetMinor: safeInteger(row.current_budget_minor, WEB_BUDGET_MAX_MINOR),
     targetBudgetMinor: safeInteger(row.target_budget_minor, WEB_BUDGET_MAX_MINOR),
@@ -92,7 +96,8 @@ function operation(row: Record<string, unknown>, expectedClientId: CreatorWebBud
     cap: { revision: safeInteger(row.policy_revision), campaignCapMinor: safeInteger(row.campaign_cap_minor, WEB_BUDGET_MAX_MINOR),
       clientDailyCapMinor: safeInteger(row.client_daily_cap_minor, WEB_BUDGET_MAX_MINOR), readAt: timestamp(row.cap_read_at), locked: false },
     fingerprint: row.fingerprint, expiresAt: timestamp(row.expires_at), status: row.status as WebBudgetRecord["status"],
-    observedBudgetMinor: row.observed_budget_minor === null ? null : safeInteger(row.observed_budget_minor, WEB_BUDGET_MAX_MINOR) };
+    observedBudgetMinor: row.observed_budget_minor === null ? null : safeInteger(row.observed_budget_minor, WEB_BUDGET_MAX_MINOR),
+    ...(typeof row.observed_fingerprint === "string" ? { observedFingerprint: row.observed_fingerprint } : {}) };
 }
 export function createCreatorWebBudgetStore(database: CreatorWebBudgetDatabase, clientId: CreatorWebBudgetLedgerClient = "punpan_020"): WebBudgetStore & { ensureSchema(): Promise<void> } {
   const scope = ledgerScope(clientId);
@@ -158,9 +163,9 @@ export function createCreatorWebBudgetStore(database: CreatorWebBudgetDatabase, 
     async finish(ownerId, operationId, value) {
       const completed = await run(async runner => {
         const matched = rows(await runner.query(`UPDATE ${table}
-          SET status=$3, observed_budget_minor=$4, reason=$5, updated_at=clock_timestamp()
+          SET status=$3, observed_budget_minor=$4, reason=$5, observed_fingerprint=$7, updated_at=clock_timestamp()
           WHERE client_id=$6 AND owner_id=$1 AND operation_id=$2 AND status='PROCESSING' RETURNING *`,
-        [ownerId, operationId, value.status, value.observedBudgetMinor, value.reason, clientId]));
+        [ownerId, operationId, value.status, value.observedBudgetMinor, value.reason, clientId, value.observedFingerprint ?? null]));
         if (matched.length === 1) return operation(matched[0], clientId);
         const found = rows(await selectOwned(runner, ownerId, operationId));
         if (found.length !== 1 || found[0].status === "PROCESSING" || found[0].status === "PREPARED") throw new Error("Ledger record not terminal");

@@ -27,7 +27,10 @@ export interface WebBudgetContext {
   nativeAutoState: "DISABLED" | "UNKNOWN" | "ENABLED" | "CONFLICT";
   providerSpendObservedAt?: string | null;
   deliveryVerified?: boolean;
+  liveDeliveryState?: "LIVE" | "NOT_LIVE" | "UNKNOWN";
+  liveSessionId?: string | null;
 }
+export type WebAutoBudgetProof = { previousBudgetMinor: number; targetBudgetMinor: number; rounding?: "floor-satang" };
 export interface WebBudgetDispatch {
   campaignId: string; reportingDate: string; expectedBudgetMinor: number; targetBudgetMinor: number;
   campaignCapMinor: number; clientDailyCapMinor: number;
@@ -36,10 +39,10 @@ export interface WebBudgetDispatch {
 }
 export interface WebBudgetAdapters {
   readPolicy(): Promise<WebBudgetPolicy>;
-  acquireLease(operationId: string, revision: number, autoBudget?: { previousBudgetMinor: number; targetBudgetMinor: number }): Promise<WebBudgetPolicy & { operationId: string; expiresAt: string }>;
+  acquireLease(operationId: string, revision: number, autoBudget?: WebAutoBudgetProof): Promise<WebBudgetPolicy & { operationId: string; expiresAt: string }>;
   finishLease(operationId: string, outcome: WebBudgetOutcome): Promise<void>;
   readContext(expectedCampaignId: string): Promise<WebBudgetContext>;
-  dispatch(input: WebBudgetDispatch): Promise<{ outcome: WebBudgetOutcome; observedBudgetMinor?: number }>;
+  dispatch(input: WebBudgetDispatch): Promise<{ outcome: WebBudgetOutcome; observedBudgetMinor?: number; observedFingerprint?: string }>;
 }
 export interface WebBudgetProposal {
   operationId: string; ownerId: number; mode: Exclude<WebBudgetMode, "disabled">;
@@ -48,7 +51,7 @@ export interface WebBudgetProposal {
   projectedClientSpendMinor: number; cap: WebBudgetPolicy; fingerprint: string; expiresAt: string;
 }
 export interface WebBudgetRecord extends WebBudgetProposal {
-  status: WebBudgetStatus; observedBudgetMinor: number | null;
+  status: WebBudgetStatus; observedBudgetMinor: number | null; observedFingerprint?: string;
 }
 export interface WebBudgetStore {
   create(value: WebBudgetProposal): Promise<void>;
@@ -56,7 +59,7 @@ export interface WebBudgetStore {
   hasFence(): Promise<boolean>;
   reserve(ownerId: number, operationId: string, mode: Exclude<WebBudgetMode, "disabled">): Promise<WebBudgetRecord | null>;
   finish(ownerId: number, operationId: string, value: {
-    status: Exclude<WebBudgetStatus, "PROCESSING" | "PREPARED">; observedBudgetMinor: number | null; reason: string;
+    status: Exclude<WebBudgetStatus, "PROCESSING" | "PREPARED">; observedBudgetMinor: number | null; reason: string; observedFingerprint?: string;
   }): Promise<WebBudgetRecord>;
 }
 
@@ -168,9 +171,12 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
       return proposal(row);
     },
     async confirm(ownerId: number, input: { operationId: string; nativeAutoOff: true; noConcurrentChanges: true }, recheckOperator: () => Promise<boolean>,
-      autoGuard?: (context: WebBudgetContext, policy: WebBudgetPolicy) => Promise<boolean>) {
+      autoGuard?: (context: WebBudgetContext, policy: WebBudgetPolicy) => Promise<boolean>, autoRounding?: "floor-satang") {
       const initial = await store.get(ownerId, input.operationId);
       if (!initial || (initial.source === "auto") !== (typeof autoGuard === "function")) reject("BUDGET_OPERATION_NOT_FOUND", 404, "ไม่พบรายการนี้");
+      if (autoRounding !== undefined && (autoRounding !== "floor-satang" || !autoGuard || clientId !== WEB_BUDGET_CLIENT_ID)) {
+        reject("BUDGET_INPUT_INVALID", 400, "ไม่รองรับกติกาปัดเศษงบนี้");
+      }
       if (initial.status !== "PREPARED") return result(initial);
       const activeMode = mode();
       if (activeMode === "disabled" || activeMode !== initial.mode) reject("BUDGET_MODE_CHANGED", 409, "โหมดเปลี่ยนแล้ว กรุณาเปิดรายการใหม่");
@@ -183,7 +189,7 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
         reject("BUDGET_RESERVATION_UNAVAILABLE", 409, "รายการหมดอายุหรือมีรายการอื่นกำลังทำงาน กรุณาตรวจสถานะก่อน");
       }
       let status: Exclude<WebBudgetStatus, "PROCESSING" | "PREPARED"> = "NOT_SENT";
-      let reason = "PREFLIGHT_BLOCKED", observedBudgetMinor: number | null = null;
+      let reason = "PREFLIGHT_BLOCKED", observedBudgetMinor: number | null = null, observedFingerprint: string | undefined;
       let leaseAttempted = false, dispatchInvoked = false;
       try {
         const { cap, context } = await validatedInputs(reserved.campaignId, reserved.currentBudgetMinor, reserved.targetBudgetMinor);
@@ -201,7 +207,8 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
         } else {
           leaseAttempted = true;
           const rawLease = autoGuard ? await adapters.acquireLease(reserved.operationId, reserved.cap.revision,
-            { previousBudgetMinor: reserved.currentBudgetMinor, targetBudgetMinor: reserved.targetBudgetMinor })
+            { previousBudgetMinor: reserved.currentBudgetMinor, targetBudgetMinor: reserved.targetBudgetMinor,
+              ...(autoRounding ? { rounding: autoRounding } : {}) })
             : await adapters.acquireLease(reserved.operationId, reserved.cap.revision);
           const lease = checkPolicy(rawLease, now().getTime());
           const deadline = Math.min(timeMs(rawLease.expiresAt), timeMs(reserved.expiresAt));
@@ -216,8 +223,11 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
             notAfter: new Date(deadline).toISOString(), nativeAutoOff: true, noConcurrentChanges: true,
             canSend: async latest => mode() === "live" && await recheckOperator() &&
               (!autoGuard || (latest.nativeAutoState === "DISABLED" && await autoGuard(latest, cap))) && mode() === "live" });
-          if (sent?.outcome === "APPLIED_VERIFIED" && sent.observedBudgetMinor === reserved.targetBudgetMinor) {
+          const readbackProof = typeof sent?.observedFingerprint === "string" && FINGERPRINT.test(sent.observedFingerprint) &&
+            sent.observedFingerprint !== reserved.fingerprint ? sent.observedFingerprint : undefined;
+          if (sent?.outcome === "APPLIED_VERIFIED" && sent.observedBudgetMinor === reserved.targetBudgetMinor && (!autoRounding || readbackProof)) {
             status = "APPLIED_VERIFIED"; reason = "EXACT_PROVIDER_READBACK"; observedBudgetMinor = sent.observedBudgetMinor;
+            observedFingerprint = readbackProof;
           } else if (sent?.outcome === "NOT_SENT" || sent?.outcome === "PROVIDER_REJECTED") {
             status = sent.outcome; reason = status;
           } else {
@@ -229,7 +239,8 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
         reason = dispatchInvoked ? "DISPATCH_RESULT_UNAVAILABLE" : error instanceof WebBudgetError ? error.code : "PREFLIGHT_UNAVAILABLE";
       }
       // Persist the terminal record BEFORE informing the cap owner; never clear an uncertain send fence.
-      const terminal = await store.finish(ownerId, reserved.operationId, { status, reason, observedBudgetMinor });
+      const terminal = await store.finish(ownerId, reserved.operationId, { status, reason, observedBudgetMinor,
+        ...(observedFingerprint ? { observedFingerprint } : {}) });
       if (leaseAttempted && terminal.status === status && status !== "SIMULATED") {
         try { await adapters.finishLease(reserved.operationId, status); } catch { /* The policy lease remains locked on ambiguous delivery. */ }
       }

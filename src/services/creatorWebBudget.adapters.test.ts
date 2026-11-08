@@ -110,7 +110,8 @@ describe("Ppan web budget boundary", () => {
     const h = harness();
     const input = await h.input();
     const before = h.calls.length;
-    expect(await h.adapters.dispatch(input)).toEqual({ outcome: "APPLIED_VERIFIED", observedBudgetMinor: 310_000 });
+    expect(await h.adapters.dispatch(input)).toEqual({ outcome: "APPLIED_VERIFIED", observedBudgetMinor: 310_000,
+      observedFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/) });
     expect(h.providerPosts()).toHaveLength(1);
     const after = h.calls.slice(before);
     expect(after.slice(after.findIndex(x => x.method === "POST") + 1).filter(x => x.path.endsWith("/info/"))).toHaveLength(2);
@@ -150,7 +151,7 @@ describe("Srihiw exact budget writer boundary", () => {
   it("uses the separately verified scope, policy lease and budget-only provider mutation", async () => {
     const h = harness({ extra: true, extraLive: true });
     expect(await h.adapters.acquireLease(OP, 4)).toMatchObject({ locked: true, operationId: OP });
-    expect(await h.adapters.dispatch(await h.input())).toEqual({ outcome: "APPLIED_VERIFIED", observedBudgetMinor: 310_000 });
+    expect(await h.adapters.dispatch(await h.input())).toMatchObject({ outcome: "APPLIED_VERIFIED", observedBudgetMinor: 310_000 });
     expect(h.providerPosts()).toHaveLength(1);
   });
   it("keeps a Ppan live flag from enabling Srihiw and fails closed on a foreign row", async () => {
@@ -170,7 +171,7 @@ describe("additional exact live budget scopes", () => {
     expect(blocked.providerPosts()).toHaveLength(0);
     const h = harness({ extraClient, extraLive: true });
     expect(await h.adapters.acquireLease(OP, 4)).toMatchObject({ locked: true, operationId: OP });
-    expect(await h.adapters.dispatch(await h.input())).toEqual({ outcome: "APPLIED_VERIFIED", observedBudgetMinor: 310_000 });
+    expect(await h.adapters.dispatch(await h.input())).toMatchObject({ outcome: "APPLIED_VERIFIED", observedBudgetMinor: 310_000 });
     expect(h.providerPosts()).toHaveLength(1);
     const wrong = harness({ extraClient, extraLive: true, wrongProviderScope: true });
     await expect(wrong.input()).rejects.toThrow();

@@ -8,6 +8,7 @@ import { AppError } from "../utils/errors";
 import { parseAutomationViewerIds } from "./automation.route";
 import type { createCreatorWebCapAdapters } from "../services/creatorWebBudget.adapters";
 import type { createCreatorAutoBudgetService } from "../services/creatorAutoBudget.service";
+import type { createCreatorContinuousAutoBudgetService } from "../services/creatorContinuousAutoBudget.service";
 import { EXTRA_CREATOR_BUDGET_SCOPE_IDS, isExtraCreatorBudgetScope, type ExtraCreatorBudgetScope } from "../services/creatorBudgetScope";
 
 export const CREATOR_WEB_BUDGET_ORIGIN = "https://report.whalebuddy69.com";
@@ -24,10 +25,11 @@ type BudgetService = ReturnType<typeof createCreatorWebBudgetService>;
 type AutoService = ReturnType<typeof createCreatorAutoBudgetService>;
 export type ScopedCreatorBudgetServices = Partial<Record<ExtraCreatorBudgetScope, { service: BudgetService; autoService?: AutoService }>>;
 
-export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, capEditor, autoService, extraScopes = {}, extraConfigured = () => true, now = Date.now }: {
+export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, capEditor, autoService, continuousAutoService, extraScopes = {}, extraConfigured = () => true, now = Date.now }: {
   viewerIds: () => string | undefined; operatorIds: () => string | undefined;
   capEditor?: ReturnType<typeof createCreatorWebCapAdapters>; extraConfigured?: (clientId: ExtraCreatorBudgetScope) => boolean;
   extraScopes?: ScopedCreatorBudgetServices; autoService?: AutoService;
+  continuousAutoService?: ReturnType<typeof createCreatorContinuousAutoBudgetService>;
   service: BudgetService; now?: () => number;
 }) {
   const router = Router({ caseSensitive: true, strict: true });
@@ -126,19 +128,33 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
     if (!scoped) throw new WebBudgetError("AUTO_BUDGET_NOT_CONFIGURED", 404, "ยังไม่ได้ตั้งค่า Auto สำหรับ Creator นี้");
     return scoped;
   }
-  router.get(scopedPaths("/auto/status"), get, handle((req, id) => autoFor(req).status(canOperate(id), id)));
+  const continuousFor = (req: Request) => !isExtraCreatorBudgetScope(firstSegment(req)) ? continuousAutoService : undefined;
+  router.get(scopedPaths("/auto/status"), get, handle((req, id) => (continuousFor(req) ?? autoFor(req)).status(canOperate(id), id)));
   router.post(scopedPaths("/auto/arm"), onlyOperator, onlyJson, json, handle((req, id) => {
     const value: unknown = req.body;
-    if (!fields(value, ["expectedCampaignId", "expectedBudgetMinor", "expectedPolicyRevision", "durationMinutes", "nativeAutoOff", "noConcurrentChanges"])
+    const continuous = continuousFor(req);
+    const exact = ["expectedCampaignId", "expectedBudgetMinor", "expectedPolicyRevision", "nativeAutoOff", "noConcurrentChanges"];
+    if (!fields(value, continuous ? [...exact, "expectedLiveSessionId"] : [...exact, "durationMinutes"])
       || typeof value.expectedCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedCampaignId)
-      || !safeAmount(value.expectedBudgetMinor) || !safeAmount(value.expectedPolicyRevision) || !safeAmount(value.durationMinutes)
+      || !safeAmount(value.expectedBudgetMinor) || !safeAmount(value.expectedPolicyRevision)
       || value.nativeAutoOff !== true || value.noConcurrentChanges !== true) badInput();
-    return autoFor(req).arm(id, { expectedCampaignId: value.expectedCampaignId, expectedBudgetMinor: value.expectedBudgetMinor,
-      expectedPolicyRevision: value.expectedPolicyRevision, durationMinutes: value.durationMinutes,
-      nativeAutoOff: true, noConcurrentChanges: true }, () => recheck(req, id));
+    const input = { expectedCampaignId: value.expectedCampaignId, expectedBudgetMinor: value.expectedBudgetMinor,
+      expectedPolicyRevision: value.expectedPolicyRevision, nativeAutoOff: true as const, noConcurrentChanges: true as const };
+    if (continuous) {
+      if (typeof value.expectedLiveSessionId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedLiveSessionId)) badInput();
+      return continuous.arm(id, { ...input, expectedLiveSessionId: value.expectedLiveSessionId }, () => recheck(req, id));
+    }
+    if (!safeAmount(value.durationMinutes)) badInput();
+    return autoFor(req).arm(id, { ...input, durationMinutes: value.durationMinutes }, () => recheck(req, id));
   }));
   router.post(scopedPaths("/auto/stop"), onlyOperator, onlyJson, json, handle(async (req, id) => {
     const value: unknown = req.body;
+    const continuous = continuousFor(req);
+    if (continuous && fields(value, ["sessionId"])) {
+      if (typeof value.sessionId !== "string" || !WEB_BUDGET_OPERATION_ID.test(value.sessionId)) badInput();
+      if (!await recheck(req, id)) throw new WebBudgetError("BUDGET_OPERATOR_DENIED", 403, "บัญชีนี้ยังไม่ได้รับสิทธิ์สั่งงบ");
+      return continuous.stop(id, value.sessionId);
+    }
     if (!fields(value, ["grantId"]) || typeof value.grantId !== "string" || !WEB_BUDGET_OPERATION_ID.test(value.grantId)) badInput();
     if (!await recheck(req, id)) throw new WebBudgetError("BUDGET_OPERATOR_DENIED", 403, "บัญชีนี้ยังไม่ได้รับสิทธิ์สั่งงบ");
     return autoFor(req).stop(id, value.grantId);

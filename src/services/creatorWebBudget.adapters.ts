@@ -227,15 +227,21 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     // not substitute fetch time, campaign modification time or a default.
     return { campaignId: expectedCampaignId, reportingDate: raw.reportingDate as string, observedAt: raw.observedAt,
       budgetMinor: live.budgetMinor, spendMinor: c.spendMinor, aggregateSpendMinor: quality.aggregateSpendMinor,
-      fingerprint: live.fingerprint, nativeAutoState: live.native, providerSpendObservedAt: null, deliveryVerified: false, sample: live };
+      fingerprint: live.fingerprint, nativeAutoState: live.native, providerSpendObservedAt: null, deliveryVerified: false,
+      liveDeliveryState: "UNKNOWN" as const, liveSessionId: null, sample: live };
   }
 
   return {
     async readPolicy() { return checkedPolicy(await policyRequest(""), now()); },
     async acquireLease(operationId, revision, autoBudget) {
       if (!UUID.test(operationId) || !positive(revision)) unverified();
-      if (autoBudget && (!positive(autoBudget.previousBudgetMinor) || !positive(autoBudget.targetBudgetMinor) ||
-        BigInt(autoBudget.previousBudgetMinor) * 6n !== BigInt(autoBudget.targetBudgetMinor) * 5n)) unverified();
+      if (autoBudget) {
+        if (!positive(autoBudget.previousBudgetMinor) || !positive(autoBudget.targetBudgetMinor) ||
+          autoBudget.targetBudgetMinor <= autoBudget.previousBudgetMinor) unverified();
+        const scaled = BigInt(autoBudget.previousBudgetMinor) * 6n, target = BigInt(autoBudget.targetBudgetMinor);
+        if (autoBudget.rounding === undefined ? scaled !== target * 5n
+          : autoBudget.rounding !== "floor-satang" || clientId !== "punpan_020" || scaled / 5n !== target) unverified();
+      }
       const raw = await policyRequest("/lease", { operationId, revision, ...(autoBudget ? { autoBudget } : {}) });
       const at = now();
       const view = checkedPolicy(raw, at);
@@ -289,7 +295,7 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
         const second = await sample(input.campaignId, accessToken);
         if (first.budgetMinor !== input.targetBudgetMinor || second.budgetMinor !== input.targetBudgetMinor ||
           first.unchanged !== before.unchanged || second.fingerprint !== first.fingerprint) unverified();
-        return { outcome: "APPLIED_VERIFIED", observedBudgetMinor: second.budgetMinor };
+        return { outcome: "APPLIED_VERIFIED", observedBudgetMinor: second.budgetMinor, observedFingerprint: second.fingerprint };
       } catch { return { outcome: attempted ? "OUTCOME_UNKNOWN" : "NOT_SENT" }; }
     },
   };

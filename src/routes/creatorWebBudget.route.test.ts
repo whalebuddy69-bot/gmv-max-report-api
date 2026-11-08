@@ -32,7 +32,7 @@ afterEach(async () => {
   vi.resetAllMocks();
 });
 
-async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigured = true } = {}) {
+async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigured = true, withContinuous = false } = {}) {
   const service: ReturnType<typeof createCreatorWebBudgetService> = {
     status: vi.fn(async operator => ({ clientId: "punpan_020", mode: operator ? "dry-run" : "disabled", cap: null, canPrepare: false, capEditAllowed: false })),
     prepare: vi.fn(async (_id, value) => ({ operationId: ID, mode: "dry-run", campaignId: value.expectedCampaignId,
@@ -74,9 +74,20 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
       canArm: false, canStop: false, preview: null, blockers: ["CONTEXT_UNAVAILABLE"] })) },
   });
   const nn = mockScoped("nnshop5719"), ashop = mockScoped("ashopbytheta");
+  const continuous = {
+    status: vi.fn(async (_operator: boolean, _ownerId?: number) => ({ clientId: "punpan_020" as const, strategy: "continuous" as const,
+      mode: "live" as const, grant: null, continuousSession: null, canArm: true, canStop: false, preview: null, blockers: [] })),
+    arm: vi.fn(async (_owner: number, _input: unknown, recheck: () => Promise<boolean>) => {
+      if (!await recheck()) throw new AuthError(PRIVATE_ERROR);
+      return { sessionId: ID, startedAt: "2026-06-09T04:00:00.000Z" };
+    }),
+    stop: vi.fn(async (_owner: number, _session: string) => ({ stopped: true })),
+    tick: vi.fn(async () => {}),
+  };
   const app = express();
   app.use("/automation/budget", createCreatorWebBudgetRouter({ viewerIds: () => viewerIds, operatorIds: () => operatorIds, service,
     autoService, capEditor, extraConfigured: () => extraCapConfigured,
+    continuousAutoService: withContinuous ? continuous : undefined,
     extraScopes: { srihiw: { service: srihiwService }, nnshop5719: nn, ashopbytheta: ashop } }));
   // Prove this route does not run the general application parser first.
   app.use(express.json());
@@ -84,7 +95,7 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
   const { port } = server.address() as { port: number };
   const base = `http://127.0.0.1:${port}/automation/budget`;
   const post = (route: string, body = JSON.stringify(PREPARE), headers = HEADERS) => fetch(base + route, { method: "POST", headers, body });
-  return { service, srihiwService, autoService, base, post, capEditor, nn, ashop };
+  return { service, srihiwService, autoService, base, post, capEditor, nn, ashop, continuous };
 }
 
 describe("Automation web budget HTTP boundary", () => {
@@ -188,6 +199,24 @@ describe("Automation web budget HTTP boundary", () => {
     expect(h.ashop.service.confirm).not.toHaveBeenCalled();
     expect(h.service.confirm).not.toHaveBeenCalled();
     expect((await h.post("/NNSHOP5719/confirm", JSON.stringify(CONFIRM))).status).toBe(404);
+  });
+
+  it("opens the continuous contract only for Ppan, requires exact viewed LIVE room and never accepts a client time limit", async () => {
+    const h = await start({ withContinuous: true });
+    const payload = { expectedCampaignId: PREPARE.expectedCampaignId, expectedLiveSessionId: "90000000000002", expectedBudgetMinor: PREPARE.expectedBudgetMinor,
+      expectedPolicyRevision: 2, nativeAutoOff: true, noConcurrentChanges: true };
+    const status = await fetch(h.base + "/auto/status", { headers: HEADERS });
+    expect(await status.json()).toMatchObject({ strategy: "continuous" });
+    expect((await h.post("/auto/arm", JSON.stringify({ ...payload, durationMinutes: 60 }))).status).toBe(400);
+    expect((await h.post("/auto/arm", JSON.stringify({ ...payload, expectedLiveSessionId: "unknown" }))).status).toBe(400);
+    expect((await h.post("/nnshop5719/auto/arm", JSON.stringify(payload))).status).toBe(400);
+    expect((await h.post("/auto/arm", JSON.stringify(payload), { ...HEADERS, Origin: "https://evil.example" })).status).toBe(403);
+    expect(await (await h.post("/auto/arm", JSON.stringify(payload))).json()).toMatchObject({ sessionId: ID });
+    expect(h.continuous.arm).toHaveBeenCalledTimes(1);
+    expect(h.continuous.arm).toHaveBeenCalledWith(27, payload, expect.any(Function));
+    expect(h.autoService.arm).not.toHaveBeenCalled();
+    expect((await h.post("/auto/stop", JSON.stringify({ sessionId: ID }))).status).toBe(200);
+    expect(h.continuous.stop).toHaveBeenCalledWith(27, ID);
   });
 
   it("rejects malformed, non-JSON, oversized, unknown fields and caller-controlled query", async () => {
