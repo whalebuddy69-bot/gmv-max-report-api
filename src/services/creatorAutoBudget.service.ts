@@ -8,6 +8,7 @@ import { createCreatorWebBudgetService, WEB_BUDGET_CAMPAIGN_ID, WebBudgetError,
   type WebBudgetAdapters, type WebBudgetContext, type WebBudgetStore } from "./creatorWebBudget.service";
 
 type Mode = "disabled" | "shadow" | "live";
+export type AutoBudgetOverviewState = "on" | "off" | "pending" | "blocked" | null;
 type Grants = ReturnType<typeof createCreatorAutoBudgetGrantStore>;
 type Writer = ReturnType<typeof createCreatorWebBudgetService>;
 type Input = { expectedCampaignId: string; expectedBudgetMinor: number; expectedPolicyRevision: number; durationMinutes: number;
@@ -61,13 +62,37 @@ export function createCreatorAutoBudgetService({ clientId, mode, discover, adapt
       target + BigInt(context.aggregateSpendMinor - context.spendMinor) <= BigInt(policy.clientDailyCapMinor);
   }
 
-  async function status(operator: boolean, ownerId?: number) {
+  async function status(operator: boolean, ownerId?: number, view?: "summary") {
     const currentMode = mode(), day = bangkokDay(now());
-    const grantRead = operator ? await grants.get(clientId, day).then(row => ({ row, ok: true })).catch(() => ({ row: null, ok: false })) : { row: null, ok: false };
+    const readOwnerState = operator && (view !== "summary" || (typeof ownerId === "number" && Number.isSafeInteger(ownerId) && ownerId > 0));
+    const grantRead = readOwnerState ? await grants.get(clientId, day).then(row => ({ row, ok: true })).catch(() => ({ row: null, ok: false })) : { row: null, ok: false };
     const { row } = grantRead;
     const ownRow = row && row.ownerId === ownerId ? row : null;
     const grant = ownRow ? { grantId: ownRow.grantId, status: ownRow.status, expiresAt: ownRow.expiresAt } : null;
     const canStop = ownRow?.status === "ARMED" || ownRow?.status === "RESERVED";
+    if (view === "summary") {
+      // Overview is an authorization-ledger read, not a provider/arming check.
+      const at = now();
+      let overviewState: AutoBudgetOverviewState = null;
+      if (grantRead.ok && bangkokDay(at) === day && (!row || ownRow)) {
+        if (ownRow?.operationId && !ownRow.settledAt) {
+          overviewState = ownRow.status === "RESERVED" && Date.parse(ownRow.expiresAt) > at.getTime() ? "pending" : "blocked";
+        } else if (ownRow?.status === "ARMED" && Date.parse(ownRow.expiresAt) > at.getTime()) {
+          overviewState = currentMode === "live" ? "on" : "blocked";
+        } else {
+          // A send reserved before Bangkok midnight can still be unresolved.
+          // Match the runner's bounded prior-day reconciliation window.
+          const previousDay = bangkokDay(new Date(at.getTime() - 86_400_000));
+          const previous = await grants.get(clientId, previousDay).catch(() => undefined);
+          if (previous !== undefined && bangkokDay(now()) === day) {
+            overviewState = previous?.operationId && !previous.settledAt
+              ? previous.ownerId === ownerId ? "blocked" : null
+              : "off";
+          }
+        }
+      }
+      return { clientId, mode: currentMode, grant, canArm: false, canStop, preview: null, blockers: [], overviewState };
+    }
     if (currentMode === "disabled") return { clientId, mode: currentMode, grant, canArm: false, canStop, preview: null, blockers: [] };
     try {
       const facts = await read();

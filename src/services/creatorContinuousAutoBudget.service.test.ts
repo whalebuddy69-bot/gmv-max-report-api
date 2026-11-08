@@ -98,12 +98,13 @@ function fixture(mode: "shadow" | "live" = "live", evidence: "verified-room" | "
   };
   const discover = vi.fn<() => Promise<string | null>>(async () => CAMPAIGN);
   const observe = vi.fn(async (_tick: unknown) => {});
+  const legacyBusy = vi.fn(async () => false);
   const now = () => new Date(clock);
   const writer = createCreatorWebBudgetService({ store: ledger, adapters, mode: () => "live", now });
   const service = createCreatorContinuousAutoBudgetService({ mode: () => mode, discover, adapters, sessions, writer,
     ledger, recheckOwner: async (owner, authorizedAt) => owner === OWNER && authorizedAt === session?.authorizedAt,
-    legacyBusy: async () => false, evidenceMode: () => evidence, observeTick: observe, now });
-  return { service, sessions, discover, dispatch, ledger, writes, lineOutbox, observe, readContext: () => context,
+    legacyBusy, evidenceMode: () => evidence, observeTick: observe, now });
+  return { service, sessions, discover, dispatch, ledger, adapters, legacyBusy, writes, lineOutbox, observe, readContext: () => context,
     nextReservedSpend: (spend: number) => { nextReservedSpend = spend; },
     arm: () => service.arm(OWNER, evidence === "spend-trend" ? { expectedCampaignId: CAMPAIGN, expectedBudgetMinor: ORIGINAL_BUDGET,
       expectedPolicyRevision: CAP_REVISION, evidenceMode: evidence } : CONFIRM, async () => true),
@@ -116,8 +117,35 @@ function fixture(mode: "shadow" | "live" = "live", evidence: "verified-room" | "
 }
 
 describe("Ppan continuous budget automation", () => {
+  it("summarizes only the operator's continuous ledger and never checks TikTok or preflights", async () => {
+    const f = fixture("live");
+    expect(await f.service.status(false, OWNER, "summary")).toMatchObject({ overviewState: null, continuousSession: null });
+    expect(await f.service.status(true, undefined, "summary")).toMatchObject({ overviewState: null, continuousSession: null });
+    expect(f.sessions.getLatest).not.toHaveBeenCalled();
+    expect(await f.service.status(true, OWNER, "summary")).toMatchObject({ overviewState: "off", preview: null, canArm: false });
+    vi.mocked(f.sessions.getLatest).mockRejectedValueOnce(new Error("unavailable"));
+    expect(await f.service.status(true, OWNER, "summary")).toMatchObject({ overviewState: null, continuousSession: null });
+    const { sessionId } = await f.arm();
+    const row = (await f.sessions.getLatest())!;
+    const forbidden = [f.discover, f.adapters.readContext, f.adapters.readPolicy, f.ledger.hasFence, f.legacyBusy, f.dispatch].map(x => vi.mocked(x));
+    forbidden.forEach(mock => mock.mockClear());
+    expect(await f.service.status(true, OWNER, "summary")).toMatchObject({ overviewState: "on", continuousSession: { sessionId, status: "ARMED" } });
+    expect(await f.service.status(true, OWNER + 1, "summary")).toMatchObject({ overviewState: null, continuousSession: null, canStop: false });
+    vi.mocked(f.sessions.getLatest).mockResolvedValueOnce({ ...row, operationId: sessionId });
+    expect(await f.service.status(true, OWNER, "summary")).toMatchObject({ overviewState: "pending", continuousSession: { status: "SENDING" } });
+    vi.mocked(f.sessions.getLatest).mockResolvedValueOnce({ ...row, status: "BLOCKED", operationId: sessionId, lastOutcome: "OUTCOME_UNKNOWN" });
+    expect(await f.service.status(true, OWNER, "summary")).toMatchObject({ overviewState: "blocked", continuousSession: { status: "BLOCKED" } });
+    await f.service.stop(OWNER, sessionId);
+    expect(await f.service.status(true, OWNER, "summary")).toMatchObject({ overviewState: "off", continuousSession: { status: "STOPPED" } });
+    forbidden.forEach(mock => expect(mock).not.toHaveBeenCalled());
+    expect(await f.service.status(true, OWNER)).not.toHaveProperty("overviewState");
+    expect(f.discover).toHaveBeenCalledTimes(1);
+  });
+
   it("shows a shadow preview but cannot arm even with positive provider evidence", async () => {
     const f = fixture("shadow");
+    expect(await f.service.status(true, OWNER, "summary")).toMatchObject({ overviewState: "off", preview: null });
+    expect(f.discover).not.toHaveBeenCalled();
     expect(await f.service.status(true, OWNER)).toMatchObject({ strategy: "continuous", mode: "shadow", canArm: false,
       preview: { status: "WOULD_INCREASE", targetBudgetMinor: 780_000 } });
     await expect(f.arm()).rejects.toMatchObject({ code: "AUTO_BUDGET_NOT_READY" });

@@ -29,7 +29,8 @@ type AutomationRouteDependencies = {
   now?: () => Date;
 };
 type Campaign = { campaignId: string; campaignName: string; campaignStatus: "ACTIVE"; dailyBudgetMinor: number;
-  spendMinor: number | null; targetRoi: number | null; currency: "THB" };
+  spendMinor: number | null; targetRoi: number | null; currency: "THB";
+  scheduleStartAt: string | null; scheduleEndAt: string | null; viewerBoostBudgetMinor: number | null };
 type Observation = { observedAt: string; reportingDate: string; campaign: Campaign | null };
 type ObservationResult = { view: Observation; accessReason?: never } | { view: null; accessReason: AutomationAccessReason };
 type PerformancePoint = { hour: string; spendMinor: number | null; gmvMinor: number | null;
@@ -55,6 +56,11 @@ function nullableInteger(value: unknown): value is number | null { return value 
 function nullableRatio(value: unknown): value is number | null {
   return value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0);
 }
+function canonicalScheduleTime(value: unknown): string | null {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.000Z$/.test(value)) return null;
+  const time = Date.parse(value);
+  return Number.isFinite(time) && new Date(time).toISOString() === value ? value : null;
+}
 function freshObservationTime(value: unknown, reportingDate: string, now: Date, maxAgeMs: number): value is string {
   if (typeof value !== "string") return false;
   const observed = new Date(value);
@@ -76,9 +82,15 @@ function verifyObservation(raw: UnknownRecord, now: Date, adapter: AutomationCre
     || !nullableInteger(campaign.spendMinor) || !nullableRatio(campaign.targetRoi)) return null;
   const campaignName = typeof campaign.campaignName === "string"
     ? campaign.campaignName.replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, "").slice(0, 160).trim() : "";
+  const start = canonicalScheduleTime(campaign.scheduleStartAt), end = canonicalScheduleTime(campaign.scheduleEndAt);
+  const validSchedule = start !== null && (campaign.scheduleEndAt == null || (end !== null && end > start));
   return { observedAt, reportingDate, campaign: { campaignId: campaign.campaignId, campaignName: campaignName || "แคมเปญ Creator",
     campaignStatus: "ACTIVE", dailyBudgetMinor: campaign.dailyBudgetMinor, spendMinor: campaign.spendMinor,
-    targetRoi: campaign.targetRoi, currency: "THB" } };
+    targetRoi: campaign.targetRoi, currency: "THB", scheduleStartAt: validSchedule ? start : null,
+    scheduleEndAt: validSchedule ? end : null,
+    // TikTok documents Viewer Boost as a separate, additional budget. The
+    // verified no-Shop Creator read does not establish that value or a zero.
+    viewerBoostBudgetMinor: null } };
 }
 
 function verifyPerformance(raw: unknown, reportingDate: string, now: Date): PerformanceObservation | null {

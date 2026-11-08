@@ -56,8 +56,9 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
     operation: vi.fn(async (_id, operationId) => ({ operationId, status: "NOT_SENT", observedBudgetMinor: null })),
   };
   const autoService = {
-    status: vi.fn(async (_operator: boolean, _ownerId?: number) => ({ clientId: "punpan_020" as CreatorBudgetScope, mode: "shadow" as const,
-      grant: null, canArm: false, canStop: false, preview: null, blockers: ["CONTEXT_UNAVAILABLE"] })),
+    status: vi.fn(async (operator: boolean, _ownerId?: number, view?: "summary") => ({ clientId: "punpan_020" as CreatorBudgetScope, mode: "shadow" as const,
+      grant: null, canArm: false, canStop: false, preview: null, blockers: ["CONTEXT_UNAVAILABLE"],
+      ...(view === "summary" ? { overviewState: operator ? "off" as const : null } : {}) })),
     arm: vi.fn(async (_owner: number, _input: unknown, recheck: () => Promise<boolean>) => {
       if (!await recheck()) throw new AuthError(PRIVATE_ERROR);
       return { grantId: ID, expiresAt: "2026-06-09T04:02:00.000Z" };
@@ -70,13 +71,14 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
       status: vi.fn(async () => ({ clientId, mode: "disabled" as const, cap: null, canPrepare: false, capEditAllowed: false })),
       confirm: vi.fn(vi.mocked(service.confirm).getMockImplementation()),
     },
-    autoService: { ...autoService, status: vi.fn(async () => ({ clientId, mode: "shadow" as const, grant: null,
-      canArm: false, canStop: false, preview: null, blockers: ["CONTEXT_UNAVAILABLE"] })) },
+    autoService: { ...autoService, status: vi.fn(async (operator: boolean, _ownerId?: number, view?: "summary") => ({ clientId, mode: "shadow" as const, grant: null,
+      canArm: false, canStop: false, preview: null, blockers: ["CONTEXT_UNAVAILABLE"], ...(view === "summary" ? { overviewState: operator ? "off" as const : null } : {}) })) },
   });
   const nn = mockScoped("nnshop5719"), ashop = mockScoped("ashopbytheta");
   const continuous = {
-    status: vi.fn(async (_operator: boolean, _ownerId?: number) => ({ clientId: "punpan_020" as const, strategy: "continuous" as const,
-      mode: "live" as const, grant: null, continuousSession: null, canArm: true, canStop: false, preview: null, blockers: [] })),
+    status: vi.fn(async (operator: boolean, _ownerId?: number, view?: "summary") => ({ clientId: "punpan_020" as const, strategy: "continuous" as const,
+      mode: "live" as const, grant: null, continuousSession: null, canArm: view === undefined, canStop: false, preview: null, blockers: [],
+      ...(view === "summary" ? { overviewState: operator ? "off" as const : null } : {}) })),
     arm: vi.fn(async (_owner: number, _input: unknown, recheck: () => Promise<boolean>) => {
       if (!await recheck()) throw new AuthError(PRIVATE_ERROR);
       return { sessionId: ID, startedAt: "2026-06-09T04:00:00.000Z" };
@@ -86,7 +88,7 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
   };
   const app = express();
   const sriAuto = { ...continuous, arm: vi.fn(continuous.arm.getMockImplementation()), stop: vi.fn(continuous.stop.getMockImplementation()),
-    status: vi.fn(async () => ({ ...await continuous.status(true), clientId: "srihiw" as const, evidenceMode: "spend-trend" as const })) };
+    status: vi.fn(async (...args: Parameters<typeof continuous.status>) => ({ ...await continuous.status(...args), clientId: "srihiw" as const, evidenceMode: "spend-trend" as const })) };
   const diagnostics = vi.fn(async (_owner: number) => ({ history: [] }));
   app.use("/automation/budget", createCreatorWebBudgetRouter({ viewerIds: () => viewerIds, operatorIds: () => operatorIds, service,
     autoService, capEditor, extraConfigured: () => extraCapConfigured,
@@ -217,6 +219,27 @@ describe("Automation web budget HTTP boundary", () => {
     expect(h.ashop.service.confirm).not.toHaveBeenCalled();
     expect(h.service.confirm).not.toHaveBeenCalled();
     expect((await h.post("/NNSHOP5719/confirm", JSON.stringify(CONFIRM))).status).toBe(404);
+  });
+
+  it("only accepts the exact summary query on GET Auto status and preserves scoped authorization", async () => {
+    const h = await start({ withContinuous: true, withSrihiwContinuous: true });
+    for (const path of ["/auto/status?view=summary&campaignId=1", "/auto/status?view=summary&view=summary", "/auto/status?view=full", "/status?view=summary"]) {
+      expect((await fetch(h.base + path, { headers: HEADERS })).status).toBe(400);
+    }
+    expect((await h.post("/auto/status?view=summary")).status).toBe(400);
+    expect((await fetch(h.base + "/auto/status?view=summary")).status).toBe(401);
+    expect(h.continuous.status).not.toHaveBeenCalled();
+    expect(await (await fetch(h.base + "/nnshop5719/auto/status?view=summary", { headers: HEADERS })).json()).toMatchObject({ clientId: "nnshop5719", overviewState: "off" });
+    expect(h.nn.autoService.status).toHaveBeenCalledWith(true, 27, "summary");
+    expect(h.continuous.status).not.toHaveBeenCalled();
+    expect(await (await fetch(h.base + "/srihiw/auto/status?view=summary", { headers: HEADERS })).json()).toMatchObject({ clientId: "srihiw", overviewState: "off" });
+    expect(h.sriAuto.status).toHaveBeenCalledWith(true, 27, "summary");
+    const summary = await fetch(h.base + "/auto/status?view=summary", { headers: { Authorization: "Bearer report-admin" } });
+    expect(summary.headers.get("cache-control")).toBe("no-store");
+    expect(await summary.json()).toMatchObject({ overviewState: null, canArm: false });
+    expect(h.continuous.status).toHaveBeenLastCalledWith(false, 42, "summary");
+    expect(await (await fetch(h.base + "/auto/status", { headers: HEADERS })).json()).not.toHaveProperty("overviewState");
+    expect(h.continuous.status).toHaveBeenLastCalledWith(true, 27);
   });
 
   it("opens the continuous contract only for Ppan, requires exact viewed LIVE room and never accepts a client time limit", async () => {

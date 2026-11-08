@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { bangkokDay } from "./creatorRead.service";
 import { previewCreatorAutoBudget } from "./creatorAutoBudget.policy";
+import type { AutoBudgetOverviewState } from "./creatorAutoBudget.service";
 import type { CreatorContinuousAutoBudgetClient, createCreatorContinuousAutoBudgetStore } from "./creatorContinuousAutoBudget.store";
 import type { PpanAutoTickObservation, PpanAutoTickReason } from "./ppanAutoObservability.store";
 import { WEB_BUDGET_CAMPAIGN_ID, WEB_BUDGET_MAX_MINOR, WebBudgetError,
@@ -88,17 +89,29 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     return { context, policy, fenced };
   }
 
-  async function status(operator: boolean, ownerId?: number) {
+  async function status(operator: boolean, ownerId?: number, view?: "summary") {
     const currentMode = mode();
-    const state = operator ? await sessions.getLatest().then(row => ({ row, ok: true })).catch(() => ({ row: null, ok: false })) : { row: null, ok: false };
+    const readOwnerState = operator && (view !== "summary" || (typeof ownerId === "number" && Number.isSafeInteger(ownerId) && ownerId > 0));
+    const state = readOwnerState ? await sessions.getLatest().then(row => ({ row, ok: true })).catch(() => ({ row: null, ok: false })) : { row: null, ok: false };
     const row = state.row, own = row?.ownerId === ownerId ? row : null;
-    const evidence = row && row.status !== "STOPPED" ? row.evidenceMode ?? "verified-room" : evidenceMode();
+    const visible = view === "summary" ? own : row;
+    const evidence = visible && visible.status !== "STOPPED" ? visible.evidenceMode ?? "verified-room" : evidenceMode();
     const ownStatus = own?.status === "ACTIVE" ? (own.operationId ? "SENDING" : "ARMED") : own?.status;
     const continuousSession = own && ownStatus ? { sessionId: own.sessionId, status: ownStatus,
       startedAt: own.authorizedAt, reason: own.stopReason ?? (own.lastOutcome === "OUTCOME_UNKNOWN" ? own.lastOutcome : null) } : null;
     const base = { clientId, strategy: "continuous" as const, mode: currentMode, grant: null, continuousSession,
       ...(evidence === "spend-trend" ? { evidenceMode: evidence } : {}),
       canStop: !!own && own.status !== "STOPPED" };
+    if (view === "summary") {
+      let overviewState: AutoBudgetOverviewState = null;
+      if (state.ok && (!row || own)) {
+        if (own?.status === "BLOCKED" || (own?.operationId && own.lastOutcome === "OUTCOME_UNKNOWN")) overviewState = "blocked";
+        else if (own?.operationId) overviewState = "pending";
+        else if (own?.status === "ACTIVE") overviewState = currentMode === "live" ? "on" : "blocked";
+        else overviewState = "off";
+      }
+      return { ...base, canArm: false, preview: null, blockers: [], overviewState };
+    }
     if (currentMode === "disabled") return { ...base, canArm: false, preview: null, blockers: [] };
     try {
       const campaign = await discover();

@@ -23,6 +23,24 @@ function accountId(value: unknown): value is string { return typeof value === "s
 function clean(value: unknown, limit = 160): string | null {
   return typeof value === "string" ? value.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, limit) : null;
 }
+// The campaign-info response reports delivery schedule times in UTC, not the
+// Bangkok timezone of the reporting day. Round-trip to reject rolled-over dates.
+function scheduleIso(value: unknown): string | null {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)) return null;
+  const iso = value.replace(" ", "T") + ".000Z", time = Date.parse(iso);
+  return Number.isFinite(time) && new Date(time).toISOString() === iso ? iso : null;
+}
+function campaignSchedule(info: Row): { scheduleStartAt: string | null; scheduleEndAt: string | null } {
+  const unavailable = { scheduleStartAt: null, scheduleEndAt: null };
+  const start = scheduleIso(info.schedule_start_time);
+  if (!start) return unavailable;
+  if (info.schedule_type === "SCHEDULE_FROM_NOW" || info.schedule_type === "FROM_NOW") {
+    return info.schedule_end_time == null ? { scheduleStartAt: start, scheduleEndAt: null } : unavailable;
+  }
+  if (info.schedule_type !== "SCHEDULE_START_END" && info.schedule_type !== "START_END") return unavailable;
+  const end = scheduleIso(info.schedule_end_time);
+  return end && end > start ? { scheduleStartAt: start, scheduleEndAt: end } : unavailable;
+}
 // The verified without-Shop Creator campaign returns literal string "0" in
 // top-level Shop fields. Zero is not a valid positive TikTok resource ID.
 function noShop(value: unknown): boolean { return value == null || value === "" || value === "0"; }
@@ -164,7 +182,8 @@ function createReader({ loadToken, fetchImpl = fetch, now = () => new Date(), sl
     const budget = minor(info.budget);
     if (budget <= 0) throw new CreatorReadError("BUDGET_UNVERIFIED");
     base.campaign = { campaignId, campaignName: clean(info.campaign_name)?.split(accessToken).join("[REDACTED]") ?? null, status: "ACTIVE", operationStatus: "ENABLE", currency: "THB",
-      dailyBudgetMinor: budget, targetRoi: info.roas_bid, spendMinor: null, gmvMinor: null, roi: null, liveViews: null };
+      dailyBudgetMinor: budget, targetRoi: info.roas_bid, spendMinor: null, gmvMinor: null, roi: null, liveViews: null,
+      ...campaignSchedule(info) };
     const native = info.auto_budget?.auto_budget_enabled ?? info.auto_budget_enabled;
     base.nativeAutoBudgetState = native === true ? "ENABLED" : native === false ? "DISABLED" : "UNKNOWN";
     try {

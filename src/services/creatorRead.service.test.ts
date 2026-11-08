@@ -34,9 +34,25 @@ describe("Ppan-only Creator reader", () => {
     const h = setup(), value = await h.read();
     expect(value.binding).toEqual(B);
     expect(value.campaign).toMatchObject({ campaignId: CAMPAIGN, dailyBudgetMinor: 300000, spendMinor: 272352, targetRoi: 32, roi: null, gmvMinor: null, liveViews: null });
+    expect(value.campaign).toMatchObject({ scheduleStartAt: null, scheduleEndAt: null });
     expect(value.quality).toMatchObject({ aggregateSpendMinor: 282352, aggregateSpendComplete: true, reportLagSeconds: null });
     expect(value.capabilities).toEqual({ read: true, budgetWrite: false, create: false, pause: false, autoOptimization: false });
     expect(JSON.stringify(value)).not.toContain(TOKEN);
+    expect(h.calls).toHaveLength(3);
+  });
+  it.each([
+    [{ schedule_type: "SCHEDULE_START_END", schedule_start_time: "2026-11-05 23:00:00", schedule_end_time: "2026-11-06 16:00:00" },
+      "2026-11-05T23:00:00.000Z", "2026-11-06T16:00:00.000Z"],
+    [{ schedule_type: "FROM_NOW", schedule_start_time: "2026-11-05 23:00:00" }, "2026-11-05T23:00:00.000Z", null],
+    [{ schedule_type: "START_END", schedule_start_time: "2026-11-31 23:00:00", schedule_end_time: "2026-12-06 16:00:00" }, null, null],
+    [{ schedule_type: "START_END", schedule_start_time: "2026-11-06 23:00:00", schedule_end_time: "2026-11-06 16:00:00" }, null, null],
+    [{ schedule_type: "START_END", schedule_start_time: "2026-11-05 23:00:00" }, null, null],
+    [{ schedule_type: "FROM_NOW", schedule_start_time: "2026-11-05 23:00:00", schedule_end_time: "2026-11-06 16:00:00" }, null, null],
+    [{ schedule_type: "UNKNOWN", schedule_start_time: "2026-11-05 23:00:00" }, null, null],
+  ])("reads only consistent TikTok delivery schedules, without any new API call (%j)", async (info, start, end) => {
+    const h = setup({ info });
+    expect((await h.read()).campaign).toMatchObject({ campaignId: CAMPAIGN, dailyBudgetMinor: 300000,
+      scheduleStartAt: start, scheduleEndAt: end });
     expect(h.calls).toHaveLength(3);
   });
   it("coalesces concurrent requests and does not repeatedly load credentials", async () => {

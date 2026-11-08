@@ -108,6 +108,49 @@ function fixture(initialMode: ReturnType<Dependencies["mode"]> = "shadow", snaps
 }
 
 describe("Creator automatic budget runner", () => {
+  it("summarizes only the operator's one-shot ledger without any provider, preflight or write calls", async () => {
+    const h = fixture("live");
+    expect(await h.service.status(false, ownerId, "summary")).toMatchObject({ overviewState: null, grant: null });
+    expect(await h.service.status(true, undefined, "summary")).toMatchObject({ overviewState: null, grant: null });
+    expect(h.grants.get).not.toHaveBeenCalled();
+    expect(await h.service.status(true, ownerId, "summary")).toMatchObject({ overviewState: "off", preview: null, canArm: false });
+    h.grants.get.mockRejectedValueOnce(new Error("unavailable"));
+    expect(await h.service.status(true, ownerId, "summary")).toMatchObject({ overviewState: null, grant: null });
+    const { grantId } = await h.service.arm(ownerId, input, async () => true);
+    const grant = (await h.grants.get("punpan_020", day))!;
+    const forbidden = [h.discover, h.adapters.readContext, h.adapters.readPolicy, h.ledger.hasFence, h.writer.prepare, h.writer.confirm];
+    forbidden.forEach(mock => mock.mockClear());
+    expect(await h.service.status(true, ownerId, "summary")).toMatchObject({ overviewState: "on", grant: { grantId }, canArm: false, preview: null });
+    expect(await h.service.status(true, ownerId + 1, "summary")).toMatchObject({ overviewState: null, grant: null, canStop: false });
+    h.put({ ...grant, status: "RESERVED", operationId });
+    expect(await h.service.status(true, ownerId, "summary")).toMatchObject({ overviewState: "pending" });
+    h.put({ ...grant, status: "REVOKED", operationId });
+    expect(await h.service.status(true, ownerId, "summary")).toMatchObject({ overviewState: "blocked" });
+    h.put({ ...grant, status: "REVOKED", operationId, settledAt: now.toISOString() });
+    expect(await h.service.status(true, ownerId, "summary")).toMatchObject({ overviewState: "off" });
+    forbidden.forEach(mock => expect(mock).not.toHaveBeenCalled());
+    expect(await h.service.status(true, ownerId)).not.toHaveProperty("overviewState");
+    expect(h.discover).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not report off across Bangkok midnight while yesterday's send is unresolved", async () => {
+    const h = fixture("shadow");
+    expect(await h.service.status(true, ownerId, "summary")).toMatchObject({ mode: "shadow", overviewState: "off" });
+    const previous: CreatorAutoBudgetGrantRecord = {
+      grantId: operationId, clientId: "punpan_020", ownerId, campaignId, reportingDate: "2026-11-06",
+      policyRevision: policy.revision, expectedBudgetMinor: context.budgetMinor, fingerprint,
+      authorizedAt: "2026-11-06T15:00:00.000Z", expiresAt: "2026-11-06T16:00:00.000Z",
+      nativeAutoOffAttested: true, noConcurrentChangesAttested: true, status: "RESERVED", operationId,
+    };
+    h.put(previous);
+    expect(await h.service.status(true, ownerId, "summary")).toMatchObject({ overviewState: "blocked", grant: null });
+    expect(await h.service.status(true, ownerId + 1, "summary")).toMatchObject({ overviewState: null, grant: null });
+    h.put({ ...previous, status: "COMPLETED", settledAt: now.toISOString() });
+    expect(await h.service.status(true, ownerId, "summary")).toMatchObject({ overviewState: "off", grant: null });
+    expect(h.grants.get).toHaveBeenLastCalledWith("punpan_020", "2026-11-06");
+    expect(h.discover).not.toHaveBeenCalled();
+  });
+
   it("reports the shadow proposal and never arms, prepares, confirms, leases or dispatches", async () => {
     const h = fixture("shadow", { nativeAutoState: "UNKNOWN", providerSpendObservedAt: null, deliveryVerified: false });
     expect(await h.service.status(true)).toMatchObject({ mode: "shadow", grant: null,

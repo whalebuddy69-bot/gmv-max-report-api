@@ -124,9 +124,26 @@ describe("private Creator Automation read routes", () => {
       tiktokAccountIdVerified: true,
       access: "verified", observedAt: OBSERVED_AT, reportingDate: REPORTING_DATE, campaign: {
         campaignId: FAKE_CAMPAIGN_ID, campaignName: campaign.campaignName, campaignStatus: "ACTIVE", dailyBudgetMinor: 123456,
-        spendMinor: 23456, targetRoi: 2.5, currency: "THB",
+        spendMinor: 23456, targetRoi: 2.5, currency: "THB", scheduleStartAt: null, scheduleEndAt: null, viewerBoostBudgetMinor: null,
       }, capMinor: null, actions: { start: false, pause: false, increaseBudget: false, decreaseBudget: false, auto: false },
     }] });
+  });
+
+  it.each([
+    ["2026-10-15T01:00:00.000Z", "2026-10-15T08:00:00.000Z", "2026-10-15T01:00:00.000Z", "2026-10-15T08:00:00.000Z"],
+    ["2026-10-15T01:00:00.000Z", null, "2026-10-15T01:00:00.000Z", null],
+    ["2026-10-15T01:00:00.000Z", "2026-10-14T08:00:00.000Z", null, null],
+    ["2026-10-15T01:00:00.000Z", PRIVATE_MARKER, null, null],
+    ["2026-02-30T01:00:00.000Z", null, null, null],
+  ])("sanitizes optional display metadata without invalidating campaign observations", async (scheduleStartAt, scheduleEndAt, expectedStart, expectedEnd) => {
+    const h = await start({ snapshot: async () => ({ ...observed, campaign: {
+      ...campaign, scheduleStartAt, scheduleEndAt, viewerBoostBudgetMinor: 70000,
+    } }) });
+    const response = await (await fetch(h.url + "/overview", { headers: OWNER_HEADER })).text();
+    expect(response).not.toContain(PRIVATE_MARKER);
+    expect(JSON.parse(response).clients[0]).toMatchObject({ access: "verified", campaign: {
+      campaignId: FAKE_CAMPAIGN_ID, scheduleStartAt: expectedStart, scheduleEndAt: expectedEnd, viewerBoostBudgetMinor: null,
+    } });
   });
 
   it("never dispatches writes or passes caller-controlled accounts to either reader", async () => {

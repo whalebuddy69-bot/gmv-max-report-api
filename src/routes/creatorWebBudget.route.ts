@@ -14,6 +14,7 @@ import { EXTRA_CREATOR_BUDGET_SCOPE_IDS, isExtraCreatorBudgetScope, type ExtraCr
 export const CREATOR_WEB_BUDGET_ORIGIN = "https://report.whalebuddy69.com";
 const JSON_TYPE = /^application\/json(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i;
 const BOUNDARY_MS = 60_000, READ_LIMIT = 48, POST_LIMIT = 12;
+const AUTO_STATUS_PATHS = ["/auto/status", ...EXTRA_CREATOR_BUDGET_SCOPE_IDS.map(id => `/${id}/auto/status`)];
 const safeAmount = (input: unknown): input is number => typeof input === "number" && Number.isSafeInteger(input) && input > 0;
 function fields(value: unknown, keys: string[]): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === keys.length
@@ -51,7 +52,10 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
   }
   router.use((req, res, next) => {
     res.set("Cache-Control", "no-store").vary("Authorization").vary("Origin");
-    if (req.originalUrl.includes("?")) { res.status(400).json({ error: { code: "BUDGET_FIXED_SCOPE", message: "ไม่รองรับ query สำหรับคำสั่งงบ" } }); return; }
+    const query = req.originalUrl.indexOf("?");
+    if (query >= 0 && !(req.method === "GET" && AUTO_STATUS_PATHS.includes(req.path) && req.originalUrl.slice(query) === "?view=summary")) {
+      res.status(400).json({ error: { code: "BUDGET_FIXED_SCOPE", message: "ไม่รองรับ query สำหรับคำสั่งงบ" } }); return;
+    }
     if (req.method === "POST" && req.header("origin") !== CREATOR_WEB_BUDGET_ORIGIN) {
       res.status(403).json({ error: { code: "BUDGET_ORIGIN_DENIED", message: "คำสั่งนี้ใช้ได้จากหน้า Automation เท่านั้น" } }); return;
     }
@@ -139,7 +143,10 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
     if (!autoDiagnostics) throw new WebBudgetError("AUTO_DIAGNOSTICS_UNAVAILABLE", 503, "สถานะรอบตรวจยังไม่พร้อม");
     return autoDiagnostics(id);
   }));
-  router.get(scopedPaths("/auto/status"), get, handle((req, id) => (continuousFor(req) ?? autoFor(req)).status(canOperate(id), id)));
+  router.get(AUTO_STATUS_PATHS, get, handle((req, id) => {
+    const auto = continuousFor(req) ?? autoFor(req);
+    return req.originalUrl.includes("?") ? auto.status(canOperate(id), id, "summary") : auto.status(canOperate(id), id);
+  }));
   router.post(scopedPaths("/auto/arm"), onlyOperator, onlyJson, json, handle((req, id) => {
     const value: unknown = req.body;
     const continuous = continuousFor(req);
