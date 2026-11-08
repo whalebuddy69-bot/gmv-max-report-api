@@ -97,12 +97,13 @@ function fixture(mode: "shadow" | "live" = "live", evidence: "verified-room" | "
     dispatch,
   };
   const discover = vi.fn<() => Promise<string | null>>(async () => CAMPAIGN);
+  const observe = vi.fn(async (_tick: unknown) => {});
   const now = () => new Date(clock);
   const writer = createCreatorWebBudgetService({ store: ledger, adapters, mode: () => "live", now });
   const service = createCreatorContinuousAutoBudgetService({ mode: () => mode, discover, adapters, sessions, writer,
     ledger, recheckOwner: async (owner, authorizedAt) => owner === OWNER && authorizedAt === session?.authorizedAt,
-    legacyBusy: async () => false, evidenceMode: () => evidence, now });
-  return { service, sessions, discover, dispatch, ledger, writes, lineOutbox, readContext: () => context,
+    legacyBusy: async () => false, evidenceMode: () => evidence, observeTick: observe, now });
+  return { service, sessions, discover, dispatch, ledger, writes, lineOutbox, observe, readContext: () => context,
     nextReservedSpend: (spend: number) => { nextReservedSpend = spend; },
     arm: () => service.arm(OWNER, evidence === "spend-trend" ? { expectedCampaignId: CAMPAIGN, expectedBudgetMinor: ORIGINAL_BUDGET,
       expectedPolicyRevision: CAP_REVISION, evidenceMode: evidence } : CONFIRM, async () => true),
@@ -222,6 +223,20 @@ describe("Ppan continuous budget automation", () => {
 
 const unverified = { nativeAutoState: "UNKNOWN", providerSpendObservedAt: null, deliveryVerified: false, liveDeliveryState: "UNKNOWN", liveSessionId: null } as const;
 describe("Ppan opted-in spend-trend Auto", () => {
+  it("reports actual loop reasons and missing reads without changing write eligibility", async () => {
+    const f = fixture("live", "spend-trend");
+    f.refresh(0, unverified);
+    await f.service.tick();
+    expect(f.observe).toHaveBeenLastCalledWith(expect.objectContaining({ reason: "NOT_ARMED", sessionId: null }));
+    await f.arm();
+    f.refresh(60_000);
+    await f.service.tick();
+    expect(f.observe).toHaveBeenLastCalledWith(expect.objectContaining({ reason: "SPEND_TREND_PENDING", lastValidReadAt: expect.any(String) }));
+    f.discover.mockRejectedValueOnce(new Error("test timeout"));
+    await expect(f.service.tick()).rejects.toThrow("test timeout");
+    expect(f.observe).toHaveBeenLastCalledWith(expect.objectContaining({ reason: "CONTEXT_UNAVAILABLE", lastValidReadAt: null }));
+    expect(f.dispatch).not.toHaveBeenCalled();
+  });
   it("waits for two minute reads and repeats only after a new increase following exact provider readback", async () => {
     const f = fixture("live", "spend-trend");
     f.refresh(0, unverified);

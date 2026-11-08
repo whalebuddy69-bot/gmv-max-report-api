@@ -2,6 +2,7 @@ import {
   WEB_BUDGET_CAMPAIGN_ID, WEB_BUDGET_MAX_MINOR, WEB_BUDGET_OPERATION_ID,
   WebBudgetError, WebBudgetRecord, WebBudgetStore,
 } from "./creatorWebBudget.service";
+import { PPAN_CAMPAIGN_ACTION_FENCE_SQL, PPAN_CAMPAIGN_BUDGET_LOCK_SQL, PPAN_CAMPAIGN_OPERATIONS } from "./creatorCampaignActions.store";
 
 export type CreatorWebBudgetLedgerClient = "punpan_020" | "srihiw" | "nnshop5719" | "ashopbytheta";
 const PPAN_LEDGER = { clientId: "punpan_020", table: "creator_web_budget_operations", fence: "creator_web_budget_one_active_fence" } as const;
@@ -102,6 +103,13 @@ function operation(row: Record<string, unknown>, expectedClientId: CreatorWebBud
 export function createCreatorWebBudgetStore(database: CreatorWebBudgetDatabase, clientId: CreatorWebBudgetLedgerClient = "punpan_020"): WebBudgetStore & { ensureSchema(): Promise<void> } {
   const scope = ledgerScope(clientId);
   const { table } = scope;
+  async function campaignActionFenced(runner: QueryRunner, reserve: boolean) {
+    if (clientId !== "punpan_020") return false;
+    if (reserve) await runner.query(PPAN_CAMPAIGN_BUDGET_LOCK_SQL);
+    const exists = rows(await runner.query("SELECT to_regclass($1) IS NOT NULL AS present", [PPAN_CAMPAIGN_OPERATIONS]));
+    if (exists.length !== 1 || typeof exists[0].present !== "boolean") throw new Error("Unexpected campaign fence readiness");
+    return exists[0].present && rows(await runner.query(PPAN_CAMPAIGN_ACTION_FENCE_SQL)).length > 0;
+  }
   function selectOwned(runner: QueryRunner, ownerId: number, operationId: string) {
     return runner.query(`SELECT * FROM ${table} WHERE client_id=$3 AND owner_id=$1 AND operation_id=$2`, [ownerId, operationId, clientId]);
   }
@@ -143,12 +151,13 @@ export function createCreatorWebBudgetStore(database: CreatorWebBudgetDatabase, 
       });
     },
     async hasFence() {
-      return await run(async runner => rows(await runner.query(`SELECT 1 FROM ${table}
+      return await run(async runner => await campaignActionFenced(runner, false) || rows(await runner.query(`SELECT 1 FROM ${table}
         WHERE client_id=$1 AND (status='OUTCOME_UNKNOWN' OR
           (status='PROCESSING' AND (mode='live' OR expires_at > clock_timestamp()))) LIMIT 1`, [clientId])).length > 0) !== false;
     },
     async reserve(ownerId, operationId, mode) {
       return run(async runner => {
+        if (await campaignActionFenced(runner, true)) return null;
         // Expired simulations provably cannot have sent. NEVER recycle a live fence here.
         await runner.query(`UPDATE ${table} SET status='NOT_SENT', reason='SIMULATION_EXPIRED_NO_PROVIDER_WRITE', updated_at=clock_timestamp()
           WHERE client_id=$1 AND status='PROCESSING' AND mode='dry-run' AND expires_at <= clock_timestamp()`, [clientId]);

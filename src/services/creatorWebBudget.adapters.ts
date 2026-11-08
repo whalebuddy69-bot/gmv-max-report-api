@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { bangkokDay, CREATOR_BINDING, createCreatorReader, createExtraCreatorReader, minor } from "./creatorRead.service";
 import type { AutomationVerifiedCreatorBinding } from "./creatorAutomationRegistry.service";
-import { configuredCreatorWebBudgetMode, configuredPpanSpendTrendLive, creatorBudgetPolicyPath, isExtraCreatorBudgetScope, type CreatorBudgetScope } from "./creatorBudgetScope";
+import { configuredCreatorWebBudgetMode, configuredCreatorSpendTrendLive, creatorBudgetPolicyPath, isExtraCreatorBudgetScope, type CreatorBudgetScope } from "./creatorBudgetScope";
 import { WEB_BUDGET_MAX_MINOR, WebBudgetError, type WebBudgetAdapters } from "./creatorWebBudget.service";
 
 const POLICY_ORIGIN = "https://whale-buddy-ads-control-plane.onrender.com/internal/automation";
@@ -83,12 +83,12 @@ function createPolicyRequest({ fetchImpl, env, clientId }: { fetchImpl: typeof f
   const fixedPath = creatorBudgetPolicyPath(clientId);
   if (!fixedPath) unverified();
   const url = POLICY_ORIGIN + fixedPath;
-  return async function policyRequest(path: "" | "/lease" | "/finish" | "/cap", body?: Data) {
+  return async function policyRequest(path: "" | "/lease" | "/finish" | "/cap" | `/line-result/${string}`, body?: Data) {
     const key = env.CREATOR_WEB_POLICY_BRIDGE_KEY;
     if (!key || !/^[A-Za-z0-9_-]{43,100}$/.test(key) ||
       [env.CREATOR_READ_BRIDGE_KEY, env.CREATOR_BUDGET_TEST_KEY, env.INTERNAL_API_KEY, env.JWT_SECRET].includes(key)) unverified();
     const response = await fetchImpl(url + path, {
-      method: path ? "POST" : "GET", redirect: "error", signal: AbortSignal.timeout(4500),
+      method: path && !path.startsWith("/line-result/") ? "POST" : "GET", redirect: "error", signal: AbortSignal.timeout(4500),
       headers: { "X-Creator-Web-Key": key, Accept: "application/json", "Cache-Control": "no-store", ...(body ? { "Content-Type": "application/json" } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
@@ -103,6 +103,15 @@ function createPolicyRequest({ fetchImpl, env, clientId }: { fetchImpl: typeof f
     }
     return data;
   };
+}
+
+export async function readPpanAutoLineStatus(operationId: string, fetchImpl = fetch, env = process.env) {
+  if (!UUID.test(operationId)) unverified();
+  const raw = await createPolicyRequest({ fetchImpl, env, clientId: "punpan_020" })(`/line-result/${operationId}`);
+  const status = raw.status;
+  if (raw.schemaVersion !== 1 || raw.clientId !== "punpan_020" || raw.operationId !== operationId ||
+    (status !== "PENDING" && status !== "ACCEPTED" && status !== "UNCONFIRMED" && status !== "UNKNOWN")) unverified();
+  return status;
 }
 
 export function createCreatorWebCapAdapters({ fetchImpl = fetch, now = () => new Date(), env = process.env }:
@@ -263,10 +272,11 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     async dispatch(input) {
       let attempted = false;
       try {
-        const allowedAuthority = input.evidenceMode === "spend-trend" ? clientId === "punpan_020" && configuredPpanSpendTrendLive(env) &&
+        const allowedAuthority = input.evidenceMode === "spend-trend" ? configuredCreatorSpendTrendLive(env, clientId) &&
           input.nativeAutoOff === undefined && input.noConcurrentChanges === undefined &&
           positive(input.expectedBudgetMinor) && positive(input.targetBudgetMinor) &&
-          BigInt(input.targetBudgetMinor) === BigInt(input.expectedBudgetMinor) * 6n / 5n
+          BigInt(input.targetBudgetMinor) === BigInt(input.expectedBudgetMinor) * 6n / 5n &&
+          (clientId === "punpan_020" || BigInt(input.expectedBudgetMinor) * 6n % 5n === 0n)
           : input.evidenceMode === undefined && input.nativeAutoOff === true && input.noConcurrentChanges === true;
         if (configuredCreatorWebBudgetMode(env, clientId) !== "live" ||
           !allowedAuthority || !ID.test(input.campaignId) ||
@@ -278,7 +288,7 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
         const before = latest.sample;
         if (await input.canSend(latest) !== true) unverified();
         const at = now();
-        if ((input.evidenceMode === "spend-trend" && !configuredPpanSpendTrendLive(env)) || bangkokDay(at) !== input.reportingDate || latest.reportingDate !== input.reportingDate ||
+        if ((input.evidenceMode === "spend-trend" && !configuredCreatorSpendTrendLive(env, clientId)) || bangkokDay(at) !== input.reportingDate || latest.reportingDate !== input.reportingDate ||
           Date.parse(input.notAfter) - at.getTime() < 10_000 || !fresh(latest.observedAt, at.getTime(), 25_000) ||
           before.budgetMinor !== input.expectedBudgetMinor || before.fingerprint !== input.fingerprint ||
           !["DISABLED", "UNKNOWN"].includes(before.native) || input.targetBudgetMinor <= latest.spendMinor ||

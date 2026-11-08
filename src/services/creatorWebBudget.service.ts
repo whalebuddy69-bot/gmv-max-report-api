@@ -180,7 +180,8 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
         reject("BUDGET_INPUT_INVALID", 400, "ไม่รองรับกติกาปัดเศษงบนี้");
       }
       const useTrend = input.evidenceMode === "spend-trend";
-      if (useTrend ? (clientId !== WEB_BUDGET_CLIENT_ID || initial.source !== "auto" || !autoGuard || autoRounding !== "floor-satang" ||
+      if (useTrend ? ((clientId !== WEB_BUDGET_CLIENT_ID && clientId !== "srihiw") || initial.source !== "auto" || !autoGuard ||
+        (clientId === WEB_BUDGET_CLIENT_ID ? autoRounding !== "floor-satang" : autoRounding !== undefined) ||
         input.nativeAutoOff !== undefined || input.noConcurrentChanges !== undefined)
         : (input.evidenceMode !== undefined || input.nativeAutoOff !== true || input.noConcurrentChanges !== true)) {
         reject("BUDGET_ATTESTATION_REQUIRED", 400, "ต้องยืนยันสิทธิ์และเงื่อนไขการปรับงบ");
@@ -235,7 +236,7 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
               (!autoGuard || (nativeReady(latest) && await autoGuard(latest, cap))) && mode() === "live" });
           const readbackProof = typeof sent?.observedFingerprint === "string" && FINGERPRINT.test(sent.observedFingerprint) &&
             sent.observedFingerprint !== reserved.fingerprint ? sent.observedFingerprint : undefined;
-          if (sent?.outcome === "APPLIED_VERIFIED" && sent.observedBudgetMinor === reserved.targetBudgetMinor && (!autoRounding || readbackProof)) {
+          if (sent?.outcome === "APPLIED_VERIFIED" && sent.observedBudgetMinor === reserved.targetBudgetMinor && (!(autoRounding || useTrend) || readbackProof)) {
             status = "APPLIED_VERIFIED"; reason = "EXACT_PROVIDER_READBACK"; observedBudgetMinor = sent.observedBudgetMinor;
             observedFingerprint = readbackProof;
           } else if (sent?.outcome === "NOT_SENT" || sent?.outcome === "PROVIDER_REJECTED") {

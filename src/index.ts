@@ -19,10 +19,12 @@ import { logger } from "./utils/logger";
 import { creatorReadRouter } from "./routes/creatorRead.route";
 import { createCreatorBudgetTestRuntime } from "./services/creatorBudgetTest.runtime";
 import { createCreatorWebBudgetRuntime } from "./services/creatorWebBudget.runtime";
+import { createPpanCampaignActionsRuntime } from "./services/creatorCampaignActions.runtime";
 
 const app = express();
 const creatorBudgetTest = createCreatorBudgetTestRuntime();
 const creatorWebBudget = createCreatorWebBudgetRuntime();
+const ppanCampaignActions = createPpanCampaignActionsRuntime();
 
 app.use(
   cors({
@@ -32,6 +34,7 @@ app.use(
 );
 // Dedicated auth/origin and a bounded request parser, before the general JSON parser.
 app.use("/automation/budget", creatorWebBudget.router);
+app.use("/automation/campaign", ppanCampaignActions.router);
 app.use(express.json());
 
 app.get("/health", (_req, res) => {
@@ -49,6 +52,7 @@ app.use("/oauth", oauthRouter);
 
 // Dedicated server-to-server Creator read pilot. No existing Shop routes or tokens change.
 app.use("/internal/creator", creatorReadRouter);
+app.use("/internal/creator", creatorWebBudget.watchRouter);
 app.use("/internal/creator", creatorBudgetTest.router);
 
 // internal (telegram bot)
@@ -86,6 +90,7 @@ async function main(): Promise<void> {
   // Isolated additive ledger failure must not take down the Shop report service.
   await creatorBudgetTest.initialize();
   await creatorWebBudget.initialize();
+  await ppanCampaignActions.initialize();
   await fs.mkdir(config.reportOutputDir, { recursive: true });
 
   app.listen(config.port, () => {

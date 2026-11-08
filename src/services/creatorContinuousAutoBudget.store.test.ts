@@ -48,6 +48,26 @@ function operation(session: CreatorContinuousAutoBudgetSession, target = Number(
 }
 
 describe("Ppan continuous Auto session", () => {
+  it("keeps Srihiw session, attempts and writer proof independent, even with identical baseline data", async () => {
+    const h = setup(), sri = createCreatorContinuousAutoBudgetStore(h.database, "srihiw"), sriWriter = createCreatorWebBudgetStore(h.database, "srihiw");
+    await h.web.ensureSchema(); await sriWriter.ensureSchema(); await h.sessions.ensureSchema(); await sri.ensureSchema(); await sri.ensureSchema();
+    expect(await sri.arm(arm())).toBeNull();
+    const p = (await h.sessions.arm(trendArm({ baselineBudgetMinor: 85000 })))!;
+    const s = (await sri.arm(trendArm({ baselineBudgetMinor: 85000 })))!;
+    expect(s).toMatchObject({ clientId: "srihiw", status: "ACTIVE" });
+    const pOp = operation(p), sOp = operation(s);
+    await h.web.create(pOp); await sriWriter.create(sOp);
+    expect(await sri.reserve(s, pOp.operationId, pOp.targetBudgetMinor)).toBeNull();
+    expect(await h.sessions.reserve(p, sOp.operationId, sOp.targetBudgetMinor)).toBeNull();
+    expect(await h.sessions.reserve(p, pOp.operationId, pOp.targetBudgetMinor)).toBeTruthy();
+    expect(await sri.reserve(s, sOp.operationId, sOp.targetBudgetMinor)).toBeTruthy();
+    expect(await sri.isReserved(p, pOp.operationId)).toBe(false);
+    await sriWriter.reserve(s.ownerId, sOp.operationId, "live");
+    await sriWriter.finish(s.ownerId, sOp.operationId, { status: "APPLIED_VERIFIED", observedBudgetMinor: sOp.targetBudgetMinor,
+      observedFingerprint: AFTER, reason: "VERIFIED" });
+    expect(await sri.settleVerified(s, sOp.operationId, { budgetMinor: sOp.targetBudgetMinor, fingerprint: AFTER })).toMatchObject({ baselineBudgetMinor: 102000 });
+    expect(await h.sessions.getActive()).toMatchObject({ operationId: pOp.operationId, baselineBudgetMinor: 85000 });
+  });
   it("bootstraps only explicitly, permits only one open exact session, and does not expire it by elapsed time", async () => {
     const h = setup();
     await expect(h.sessions.getActive()).rejects.toThrow("CREATOR_CONTINUOUS_AUTO_STORE_UNAVAILABLE");

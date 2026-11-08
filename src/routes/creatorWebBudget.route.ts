@@ -23,13 +23,15 @@ function badInput(): never { throw new WebBudgetError("BUDGET_INPUT_INVALID", 40
 
 type BudgetService = ReturnType<typeof createCreatorWebBudgetService>;
 type AutoService = ReturnType<typeof createCreatorAutoBudgetService>;
-export type ScopedCreatorBudgetServices = Partial<Record<ExtraCreatorBudgetScope, { service: BudgetService; autoService?: AutoService }>>;
+type ContinuousAutoService = ReturnType<typeof createCreatorContinuousAutoBudgetService>;
+export type ScopedCreatorBudgetServices = Partial<Record<ExtraCreatorBudgetScope, { service: BudgetService; autoService?: AutoService; continuousAutoService?: ContinuousAutoService }>>;
 
-export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, capEditor, autoService, continuousAutoService, extraScopes = {}, extraConfigured = () => true, now = Date.now }: {
+export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, capEditor, autoService, continuousAutoService, autoDiagnostics, extraScopes = {}, extraConfigured = () => true, now = Date.now }: {
   viewerIds: () => string | undefined; operatorIds: () => string | undefined;
   capEditor?: ReturnType<typeof createCreatorWebCapAdapters>; extraConfigured?: (clientId: ExtraCreatorBudgetScope) => boolean;
   extraScopes?: ScopedCreatorBudgetServices; autoService?: AutoService;
   continuousAutoService?: ReturnType<typeof createCreatorContinuousAutoBudgetService>;
+  autoDiagnostics?: (ownerId: number) => Promise<unknown>;
   service: BudgetService; now?: () => number;
 }) {
   const router = Router({ caseSensitive: true, strict: true });
@@ -128,7 +130,15 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
     if (!scoped) throw new WebBudgetError("AUTO_BUDGET_NOT_CONFIGURED", 404, "ยังไม่ได้ตั้งค่า Auto สำหรับ Creator นี้");
     return scoped;
   }
-  const continuousFor = (req: Request) => !isExtraCreatorBudgetScope(firstSegment(req)) ? continuousAutoService : undefined;
+  const continuousFor = (req: Request) => {
+    const id = firstSegment(req);
+    if (id === "srihiw") return configuredExtra(id)?.continuousAutoService;
+    return !isExtraCreatorBudgetScope(id) ? continuousAutoService : undefined;
+  };
+  router.get("/auto/diagnostics", get, onlyOperator, handle((_req, id) => {
+    if (!autoDiagnostics) throw new WebBudgetError("AUTO_DIAGNOSTICS_UNAVAILABLE", 503, "สถานะรอบตรวจยังไม่พร้อม");
+    return autoDiagnostics(id);
+  }));
   router.get(scopedPaths("/auto/status"), get, handle((req, id) => (continuousFor(req) ?? autoFor(req)).status(canOperate(id), id)));
   router.post(scopedPaths("/auto/arm"), onlyOperator, onlyJson, json, handle((req, id) => {
     const value: unknown = req.body;
@@ -140,6 +150,7 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
       return continuous.arm(id, { expectedCampaignId: value.expectedCampaignId, expectedBudgetMinor: value.expectedBudgetMinor,
         expectedPolicyRevision: value.expectedPolicyRevision, evidenceMode: "spend-trend" }, () => recheck(req, id));
     }
+    if (continuous && firstSegment(req) === "srihiw") badInput();
     const exact = [...base, "nativeAutoOff", "noConcurrentChanges"];
     if (!fields(value, continuous ? [...exact, "expectedLiveSessionId"] : [...exact, "durationMinutes"])
       || typeof value.expectedCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedCampaignId)

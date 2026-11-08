@@ -4,6 +4,7 @@ import {
 import type { CreatorWebBudgetDatabase } from "./creatorWebBudget.store";
 
 const CLIENT = "punpan_020";
+export type CreatorContinuousAutoBudgetClient = typeof CLIENT | "srihiw";
 const FINGERPRINT = /^[a-f0-9]{64}$/;
 const STOP_REASONS = ["OPERATOR_STOPPED", "CAMPAIGN_ENDED", "LIVE_ENDED", "BASELINE_CHANGED",
   "CAP_CHANGED", "AUTHORITY_REVOKED", "AUTO_DISABLED", "NOT_SENT"] as const;
@@ -23,7 +24,7 @@ export interface CreatorContinuousAutoBudgetArmInput {
   noConcurrentChangesAttested: boolean;
 }
 export interface CreatorContinuousAutoBudgetSession extends CreatorContinuousAutoBudgetArmInput {
-  clientId: typeof CLIENT;
+  clientId: CreatorContinuousAutoBudgetClient;
   authorizedAt: string;
   status: "ACTIVE" | "BLOCKED" | "STOPPED";
   operationId: string | null;
@@ -209,8 +210,8 @@ function validAuthorizedAt(value: string): boolean {
   const at = Date.parse(value);
   return Number.isFinite(at) && new Date(at).toISOString() === value;
 }
-function validSession(value: CreatorContinuousAutoBudgetSession): boolean {
-  return validArm(value) && value.clientId === CLIENT && validAuthorizedAt(value.authorizedAt);
+function validScopedSession(value: CreatorContinuousAutoBudgetSession, clientId: CreatorContinuousAutoBudgetClient): boolean {
+  return validArm(value) && value.clientId === clientId && (clientId === CLIENT || value.evidenceMode === "spend-trend") && validAuthorizedAt(value.authorizedAt);
 }
 function validTarget(baseline: number, target: number): boolean {
   return positive(target, WEB_BUDGET_MAX_MINOR) && target > baseline && BigInt(target) === BigInt(baseline) * 6n / 5n;
@@ -222,7 +223,7 @@ function timestamp(value: unknown): string {
   if (value instanceof Date || typeof value === "string") return new Date(value).toISOString();
   throw new Error("CREATOR_CONTINUOUS_AUTO_STORE_SHAPE");
 }
-function map(row: Record<string, unknown>): CreatorContinuousAutoBudgetSession {
+function map(row: Record<string, unknown>, clientId: CreatorContinuousAutoBudgetClient): CreatorContinuousAutoBudgetSession {
   const authorizedAt = timestamp(row.authorized_at);
   const lastVerifiedAt = row.last_verified_at === null ? null : timestamp(row.last_verified_at);
   const { status, last_outcome: lastOutcome, operation_id: operationId, stop_reason: stopReason } = row;
@@ -231,7 +232,7 @@ function map(row: Record<string, unknown>): CreatorContinuousAutoBudgetSession {
     baselineBudgetMinor: integerFromDb(row.baseline_budget_minor),
     baselineFingerprint: row.baseline_fingerprint, nativeAutoOffAttested: row.native_auto_off_attested,
     noConcurrentChangesAttested: row.no_concurrent_changes_attested, authorizedAt, status, operationId, lastOutcome, lastVerifiedAt, stopReason };
-  if (row.evidence_mode === undefined || !validSession(value as CreatorContinuousAutoBudgetSession) ||
+  if (row.evidence_mode === undefined || !validScopedSession(value as CreatorContinuousAutoBudgetSession, clientId) ||
     (status !== "ACTIVE" && status !== "BLOCKED" && status !== "STOPPED") ||
     (operationId !== null && !identifier(operationId, WEB_BUDGET_OPERATION_ID)) ||
     (lastOutcome !== null && lastOutcome !== "APPLIED_VERIFIED" && lastOutcome !== "NOT_SENT" && lastOutcome !== "OUTCOME_UNKNOWN") ||
@@ -241,10 +242,10 @@ function map(row: Record<string, unknown>): CreatorContinuousAutoBudgetSession {
     (lastOutcome === "OUTCOME_UNKNOWN" && (operationId === null || status === "ACTIVE"))) throw new Error("CREATOR_CONTINUOUS_AUTO_STORE_SHAPE");
   return value as CreatorContinuousAutoBudgetSession;
 }
-function one(result: unknown) {
+function oneScoped(result: unknown, clientId: CreatorContinuousAutoBudgetClient) {
   const values = rows(result);
   if (values.length > 1) throw new Error("CREATOR_CONTINUOUS_AUTO_STORE_SHAPE");
-  return values.length ? map(values[0]) : null;
+  return values.length ? map(values[0], clientId) : null;
 }
 const SESSION = "creator_continuous_auto_budget_sessions";
 const EXACT = `s.client_id='punpan_020' AND s.session_id=$1::uuid AND s.owner_id=$2 AND s.campaign_id=$3
@@ -265,8 +266,17 @@ const EXACT_WEB_OP = `w.client_id='punpan_020' AND w.operation_id=$9::uuid AND w
  * Each operation still needs the existing short writer lease, fresh provider evidence,
  * owner revalidation, and provider readback. An unresolved send cannot be reset by Stop.
  */
-export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudgetDatabase) {
-  async function run<T>(work: (runner: Runner) => Promise<T>): Promise<T> {
+export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudgetDatabase, clientId: CreatorContinuousAutoBudgetClient = CLIENT) {
+  if (clientId !== CLIENT && clientId !== "srihiw") throw new Error("CREATOR_CONTINUOUS_AUTO_SCOPE_UNSUPPORTED");
+  // Translate only trusted, static SQL identifiers/literals. Ppan's existing
+  // tables are unchanged; Srihiw never shares a lock, attempt or writer ledger.
+  const scopedSql = (sql: string) => clientId === CLIENT ? sql : sql
+    .replaceAll("creator_continuous_", "creator_srihiw_continuous_")
+    .replaceAll("creator_web_budget_operations", "creator_web_budget_srihiw_operations")
+    .replaceAll("'punpan_020'", "'srihiw'");
+  const one = (result: unknown) => oneScoped(result, clientId);
+  const validSession = (value: CreatorContinuousAutoBudgetSession) => validScopedSession(value, clientId);
+  async function run<T>(work: (runner: Pick<Runner, "query">) => Promise<T>): Promise<T> {
     const runner = database.createQueryRunner();
     let begun = false;
     try {
@@ -275,7 +285,7 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
       await runner.query("SET LOCAL lock_timeout = '3s'");
       await runner.query("SET LOCAL statement_timeout = '5s'");
       await runner.query("SET LOCAL synchronous_commit = 'on'");
-      const value = await work(runner);
+      const value = await work({ query: (sql, parameters) => runner.query(scopedSql(sql), parameters) });
       await runner.query("COMMIT"); begun = false;
       return value;
     } catch {
@@ -299,7 +309,7 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
         ORDER BY created_order DESC LIMIT 1`)));
     },
     async arm(input: CreatorContinuousAutoBudgetArmInput) {
-      if (!validArm(input)) return null;
+      if (!validArm(input) || (clientId !== CLIENT && input.evidenceMode !== "spend-trend")) return null;
       return run(async runner => one(await runner.query(`INSERT INTO ${SESSION}
         (session_id,client_id,owner_id,campaign_id,policy_revision,baseline_budget_minor,baseline_fingerprint,live_session_id,
          authorized_at,native_auto_off_attested,no_concurrent_changes_attested,evidence_mode)

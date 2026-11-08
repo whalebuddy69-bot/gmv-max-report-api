@@ -11,7 +11,7 @@ const policy = { schemaVersion: 1, clientId: "punpan_020", revision: 4, campaign
 const SRIHIW = { clientId: "srihiw", advertiserId: "1234567890198765", tiktokAccountId: "1234567890198766",
   identityId: "synthetic-srihiw-identity", identityType: "BC_AUTH_TT" as const, identityAuthorizedBcId: "1234567890198767" };
 
-function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: boolean; spendTrend?: boolean; legacy?: boolean; policyKey?: string;
+function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: boolean; spendTrend?: boolean; sriTrend?: boolean; legacy?: boolean; policyKey?: string;
   providerResult?: "unknown" | "reject" | "roi-drift" | "reject-with-drift"; readAt?: string;
   extra?: boolean; extraLive?: boolean; extraClient?: "nnshop5719" | "ashopbytheta"; wrongProviderScope?: boolean } = {}) {
   const calls: { host: string; path: string; method: string }[] = [];
@@ -82,6 +82,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
     extraBinding: extra,
     env: { CREATOR_READ_ENABLED: "true", CREATOR_WEB_BUDGET_MODE: options.mode ?? "live", CREATOR_WEB_BUDGET_LIVE_ENABLED: "true",
       CREATOR_AUTO_BUDGET_PPAN_SPEND_TREND_LIVE_ENABLED: options.spendTrend ? "true" : "false",
+      CREATOR_AUTO_BUDGET_SRIHIW_SPEND_TREND_LIVE_ENABLED: options.sriTrend ? "true" : "false",
       CREATOR_WEB_SRIHIW_BUDGET_MODE: options.mode ?? "live", CREATOR_WEB_SRIHIW_BUDGET_LIVE_ENABLED: options.extraLive ? "true" : "false",
       ...(options.extraClient ? { [`CREATOR_WEB_${options.extraClient.toUpperCase()}_BUDGET_MODE`]: options.mode ?? "live",
         [`CREATOR_WEB_${options.extraClient.toUpperCase()}_BUDGET_LIVE_ENABLED`]: options.extraLive ? "true" : "false" } : {}),
@@ -172,6 +173,18 @@ describe("Ppan web budget boundary", () => {
 });
 
 describe("Srihiw exact budget writer boundary", () => {
+  it("uses only Srihiw's own exact opt-in and leaves all other Creator Trend writers disabled", async () => {
+    for (const [h, expected] of [
+      [harness({ extra: true, extraLive: true, nativeUnknown: true, sriTrend: true }), "APPLIED_VERIFIED"],
+      [harness({ extra: true, extraLive: true, nativeUnknown: true, spendTrend: true }), "NOT_SENT"],
+      [harness({ extraClient: "nnshop5719", extraLive: true, sriTrend: true }), "NOT_SENT"],
+      [harness({ nativeUnknown: true, sriTrend: true }), "NOT_SENT"],
+    ] as const) {
+      const { nativeAutoOff: _, noConcurrentChanges: __, ...input } = await h.input(336_000);
+      expect(await h.adapters.dispatch({ ...input, evidenceMode: "spend-trend" })).toMatchObject({ outcome: expected });
+      expect(h.providerPosts()).toHaveLength(expected === "APPLIED_VERIFIED" ? 1 : 0);
+    }
+  });
   it("uses the separately verified scope, policy lease and budget-only provider mutation", async () => {
     const h = harness({ extra: true, extraLive: true });
     expect(await h.adapters.acquireLease(OP, 4)).toMatchObject({ locked: true, operationId: OP });

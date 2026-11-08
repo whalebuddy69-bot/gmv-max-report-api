@@ -32,7 +32,7 @@ afterEach(async () => {
   vi.resetAllMocks();
 });
 
-async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigured = true, withContinuous = false } = {}) {
+async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigured = true, withContinuous = false, withSrihiwContinuous = false } = {}) {
   const service: ReturnType<typeof createCreatorWebBudgetService> = {
     status: vi.fn(async operator => ({ clientId: "punpan_020", mode: operator ? "dry-run" : "disabled", cap: null, canPrepare: false, capEditAllowed: false })),
     prepare: vi.fn(async (_id, value) => ({ operationId: ID, mode: "dry-run", campaignId: value.expectedCampaignId,
@@ -85,20 +85,38 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
     tick: vi.fn(async () => {}),
   };
   const app = express();
+  const sriAuto = { ...continuous, arm: vi.fn(continuous.arm.getMockImplementation()), stop: vi.fn(continuous.stop.getMockImplementation()),
+    status: vi.fn(async () => ({ ...await continuous.status(true), clientId: "srihiw" as const, evidenceMode: "spend-trend" as const })) };
+  const diagnostics = vi.fn(async (_owner: number) => ({ history: [] }));
   app.use("/automation/budget", createCreatorWebBudgetRouter({ viewerIds: () => viewerIds, operatorIds: () => operatorIds, service,
     autoService, capEditor, extraConfigured: () => extraCapConfigured,
     continuousAutoService: withContinuous ? continuous : undefined,
-    extraScopes: { srihiw: { service: srihiwService }, nnshop5719: nn, ashopbytheta: ashop } }));
+    autoDiagnostics: diagnostics,
+    extraScopes: { srihiw: { service: srihiwService, continuousAutoService: withSrihiwContinuous ? sriAuto : undefined }, nnshop5719: nn, ashopbytheta: ashop } }));
   // Prove this route does not run the general application parser first.
   app.use(express.json());
   server = await new Promise<Server>(resolve => { const instance = app.listen(0, "127.0.0.1", () => resolve(instance)); });
   const { port } = server.address() as { port: number };
   const base = `http://127.0.0.1:${port}/automation/budget`;
   const post = (route: string, body = JSON.stringify(PREPARE), headers = HEADERS) => fetch(base + route, { method: "POST", headers, body });
-  return { service, srihiwService, autoService, base, post, capEditor, nn, ashop, continuous };
+  return { service, srihiwService, autoService, base, post, capEditor, nn, ashop, continuous, sriAuto, diagnostics };
 }
 
 describe("Automation web budget HTTP boundary", () => {
+  it("keeps Srihiw continuous arm isolated and Ppan diagnostics limited to operators", async () => {
+    const h = await start({ withContinuous: true, withSrihiwContinuous: true });
+    const payload = { expectedCampaignId: PREPARE.expectedCampaignId, expectedBudgetMinor: PREPARE.expectedBudgetMinor,
+      expectedPolicyRevision: 2, evidenceMode: "spend-trend" };
+    expect((await h.post("/srihiw/auto/arm", JSON.stringify(payload))).status).toBe(200);
+    expect(h.sriAuto.arm).toHaveBeenCalledWith(27, payload, expect.any(Function));
+    expect(h.continuous.arm).not.toHaveBeenCalled();
+    expect((await h.post("/srihiw/auto/stop", JSON.stringify({ sessionId: ID }))).status).toBe(200);
+    expect(h.sriAuto.stop).toHaveBeenCalledWith(27, ID);
+    expect((await fetch(h.base + "/auto/diagnostics", { headers: { Authorization: "Bearer report-admin" } })).status).toBe(403);
+    expect((await fetch(h.base + "/srihiw/auto/diagnostics", { headers: HEADERS })).status).toBe(404);
+    expect((await fetch(h.base + "/auto/diagnostics", { headers: HEADERS })).status).toBe(200);
+    expect(h.diagnostics).toHaveBeenCalledWith(27);
+  });
   it("uses authenticated viewer access for cap status, no-store even for an anonymous request", async () => {
     const h = await start();
     const missing = await fetch(h.base + "/status");
