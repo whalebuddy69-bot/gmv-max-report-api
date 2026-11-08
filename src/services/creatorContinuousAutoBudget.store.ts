@@ -8,17 +8,19 @@ const FINGERPRINT = /^[a-f0-9]{64}$/;
 const STOP_REASONS = ["OPERATOR_STOPPED", "CAMPAIGN_ENDED", "LIVE_ENDED", "BASELINE_CHANGED",
   "CAP_CHANGED", "AUTHORITY_REVOKED", "AUTO_DISABLED", "NOT_SENT"] as const;
 export type CreatorContinuousAutoBudgetStopReason = (typeof STOP_REASONS)[number];
+export type CreatorContinuousAutoBudgetEvidenceMode = "verified-room" | "spend-trend";
 
 export interface CreatorContinuousAutoBudgetArmInput {
   sessionId: string;
   ownerId: number;
   campaignId: string;
-  liveSessionId: string;
+  liveSessionId: string | null;
+  evidenceMode?: CreatorContinuousAutoBudgetEvidenceMode;
   policyRevision: number;
   baselineBudgetMinor: number;
   baselineFingerprint: string;
-  nativeAutoOffAttested: true;
-  noConcurrentChangesAttested: true;
+  nativeAutoOffAttested: boolean;
+  noConcurrentChangesAttested: boolean;
 }
 export interface CreatorContinuousAutoBudgetSession extends CreatorContinuousAutoBudgetArmInput {
   clientId: typeof CLIENT;
@@ -72,6 +74,59 @@ CREATE TABLE IF NOT EXISTS creator_continuous_auto_budget_attempts (
   UNIQUE (client_id,campaign_id,baseline_fingerprint)
 );`;
 
+// Upgrade exactly the published v1 constraints. The existing tables, client scope,
+// open-session index, historical rows and consumed fingerprints are retained.
+const CREATOR_CONTINUOUS_SPEND_TREND_SCHEMA_SQL = `
+DO $creator_continuous_evidence$
+DECLARE
+  native_checks name[];
+  changes_checks name[];
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='creator_continuous_auto_budget_sessions'::regclass
+      AND conname='creator_continuous_auto_budget_session_evidence_v2' AND convalidated AND contype='c')
+    AND EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='creator_continuous_auto_budget_attempts'::regclass
+      AND conname='creator_continuous_auto_budget_attempt_evidence_v2' AND convalidated AND contype='c') THEN
+    RETURN;
+  END IF;
+  LOCK TABLE creator_continuous_auto_budget_sessions, creator_continuous_auto_budget_attempts IN ACCESS EXCLUSIVE MODE;
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='creator_continuous_auto_budget_sessions'::regclass
+      AND conname='creator_continuous_auto_budget_session_evidence_v2' AND convalidated AND contype='c')
+    AND EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='creator_continuous_auto_budget_attempts'::regclass
+      AND conname='creator_continuous_auto_budget_attempt_evidence_v2' AND convalidated AND contype='c') THEN
+    RETURN;
+  END IF;
+  SELECT array_agg(conname) INTO native_checks FROM pg_constraint
+    WHERE conrelid='creator_continuous_auto_budget_sessions'::regclass AND convalidated AND contype='c'
+      AND pg_get_expr(conbin,conrelid)='native_auto_off_attested';
+  SELECT array_agg(conname) INTO changes_checks FROM pg_constraint
+    WHERE conrelid='creator_continuous_auto_budget_sessions'::regclass AND convalidated AND contype='c'
+      AND pg_get_expr(conbin,conrelid)='no_concurrent_changes_attested';
+  IF cardinality(native_checks) IS DISTINCT FROM 1 OR cardinality(changes_checks) IS DISTINCT FROM 1
+    OR EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid IN ('creator_continuous_auto_budget_sessions'::regclass,
+      'creator_continuous_auto_budget_attempts'::regclass) AND attname='evidence_mode' AND NOT attisdropped) THEN
+    RAISE EXCEPTION 'Unrecognized Creator continuous evidence constraints';
+  END IF;
+  -- Auto-generated names can be shortened differently across Postgres versions.
+  -- Only the two recognized simple boolean expressions above are replaced.
+  EXECUTE format('ALTER TABLE creator_continuous_auto_budget_sessions DROP CONSTRAINT %I, DROP CONSTRAINT %I',
+    native_checks[1], changes_checks[1]);
+  ALTER TABLE creator_continuous_auto_budget_sessions
+    ADD COLUMN evidence_mode text NOT NULL DEFAULT 'verified-room',
+    ALTER COLUMN live_session_id DROP NOT NULL,
+    ADD CONSTRAINT creator_continuous_auto_budget_session_evidence_v2 CHECK (
+      (evidence_mode='verified-room' AND live_session_id IS NOT NULL AND native_auto_off_attested AND no_concurrent_changes_attested)
+      OR (evidence_mode='spend-trend' AND live_session_id IS NULL AND NOT native_auto_off_attested AND NOT no_concurrent_changes_attested)
+    );
+  ALTER TABLE creator_continuous_auto_budget_attempts
+    ADD COLUMN evidence_mode text NOT NULL DEFAULT 'verified-room',
+    ALTER COLUMN live_session_id DROP NOT NULL,
+    ADD CONSTRAINT creator_continuous_auto_budget_attempt_evidence_v2 CHECK (
+      (evidence_mode='verified-room' AND live_session_id IS NOT NULL)
+      OR (evidence_mode='spend-trend' AND live_session_id IS NULL)
+    );
+END
+$creator_continuous_evidence$;`;
+
 type Runner = ReturnType<CreatorWebBudgetDatabase["createQueryRunner"]>;
 function rows(value: unknown): Record<string, unknown>[] {
   if (!Array.isArray(value)) throw new Error("CREATOR_CONTINUOUS_AUTO_STORE_SHAPE");
@@ -90,10 +145,12 @@ function integerFromDb(value: unknown): number {
 }
 function validArm(value: CreatorContinuousAutoBudgetArmInput | null | undefined): value is CreatorContinuousAutoBudgetArmInput {
   return !!value && identifier(value.sessionId, WEB_BUDGET_OPERATION_ID) && positive(value.ownerId) &&
-    identifier(value.campaignId, WEB_BUDGET_CAMPAIGN_ID) && identifier(value.liveSessionId, WEB_BUDGET_CAMPAIGN_ID) &&
-    positive(value.policyRevision) &&
+    identifier(value.campaignId, WEB_BUDGET_CAMPAIGN_ID) && positive(value.policyRevision) &&
     positive(value.baselineBudgetMinor, WEB_BUDGET_MAX_MINOR) && identifier(value.baselineFingerprint, FINGERPRINT) &&
-    value.nativeAutoOffAttested === true && value.noConcurrentChangesAttested === true;
+    (value.evidenceMode === "spend-trend"
+      ? value.liveSessionId === null && value.nativeAutoOffAttested === false && value.noConcurrentChangesAttested === false
+      : (value.evidenceMode === undefined || value.evidenceMode === "verified-room") &&
+        identifier(value.liveSessionId, WEB_BUDGET_CAMPAIGN_ID) && value.nativeAutoOffAttested === true && value.noConcurrentChangesAttested === true);
 }
 function validAuthorizedAt(value: string): boolean {
   const at = Date.parse(value);
@@ -117,11 +174,11 @@ function map(row: Record<string, unknown>): CreatorContinuousAutoBudgetSession {
   const lastVerifiedAt = row.last_verified_at === null ? null : timestamp(row.last_verified_at);
   const { status, last_outcome: lastOutcome, operation_id: operationId, stop_reason: stopReason } = row;
   const value = { clientId: row.client_id, sessionId: row.session_id, ownerId: integerFromDb(row.owner_id),
-    campaignId: row.campaign_id, liveSessionId: row.live_session_id, policyRevision: integerFromDb(row.policy_revision),
+    campaignId: row.campaign_id, liveSessionId: row.live_session_id, evidenceMode: row.evidence_mode, policyRevision: integerFromDb(row.policy_revision),
     baselineBudgetMinor: integerFromDb(row.baseline_budget_minor),
     baselineFingerprint: row.baseline_fingerprint, nativeAutoOffAttested: row.native_auto_off_attested,
     noConcurrentChangesAttested: row.no_concurrent_changes_attested, authorizedAt, status, operationId, lastOutcome, lastVerifiedAt, stopReason };
-  if (!validSession(value as CreatorContinuousAutoBudgetSession) ||
+  if (row.evidence_mode === undefined || !validSession(value as CreatorContinuousAutoBudgetSession) ||
     (status !== "ACTIVE" && status !== "BLOCKED" && status !== "STOPPED") ||
     (operationId !== null && !identifier(operationId, WEB_BUDGET_OPERATION_ID)) ||
     (lastOutcome !== null && lastOutcome !== "APPLIED_VERIFIED" && lastOutcome !== "NOT_SENT" && lastOutcome !== "OUTCOME_UNKNOWN") ||
@@ -139,7 +196,9 @@ function one(result: unknown) {
 const SESSION = "creator_continuous_auto_budget_sessions";
 const EXACT = `s.client_id='punpan_020' AND s.session_id=$1::uuid AND s.owner_id=$2 AND s.campaign_id=$3
   AND s.policy_revision=$4 AND s.baseline_budget_minor=$5 AND s.baseline_fingerprint=$6
-  AND s.authorized_at=$7::timestamptz AND s.live_session_id=$8 AND s.native_auto_off_attested AND s.no_concurrent_changes_attested`;
+  AND s.authorized_at=$7::timestamptz AND s.live_session_id IS NOT DISTINCT FROM $8::text
+  AND ((s.evidence_mode='verified-room' AND $8::text IS NOT NULL AND s.native_auto_off_attested AND s.no_concurrent_changes_attested)
+    OR (s.evidence_mode='spend-trend' AND $8::text IS NULL AND NOT s.native_auto_off_attested AND NOT s.no_concurrent_changes_attested))`;
 function args(session: CreatorContinuousAutoBudgetSession) {
   return [session.sessionId, session.ownerId, session.campaignId, session.policyRevision, session.baselineBudgetMinor,
     session.baselineFingerprint, session.authorizedAt, session.liveSessionId];
@@ -172,7 +231,10 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
     } finally { try { await runner.release(); } catch { /* No driver details in status. */ } }
   }
   return {
-    async ensureSchema() { await run(async runner => { await runner.query(CREATOR_CONTINUOUS_AUTO_BUDGET_SCHEMA_SQL); }); },
+    async ensureSchema() { await run(async runner => {
+      await runner.query(CREATOR_CONTINUOUS_AUTO_BUDGET_SCHEMA_SQL);
+      await runner.query(CREATOR_CONTINUOUS_SPEND_TREND_SCHEMA_SQL);
+    }); },
     async getActive() {
       // Includes stopped sessions whose already reserved operation still needs reconciliation.
       return run(async runner => one(await runner.query(`SELECT * FROM ${SESSION} WHERE client_id='punpan_020'
@@ -186,13 +248,30 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
       if (!validArm(input)) return null;
       return run(async runner => one(await runner.query(`INSERT INTO ${SESSION}
         (session_id,client_id,owner_id,campaign_id,policy_revision,baseline_budget_minor,baseline_fingerprint,live_session_id,
-         authorized_at,native_auto_off_attested,no_concurrent_changes_attested)
-        SELECT $1::uuid,'punpan_020',$2,$3,$4,$5,$6,$7,date_trunc('milliseconds',clock_timestamp()),true,true
+         authorized_at,native_auto_off_attested,no_concurrent_changes_attested,evidence_mode)
+        SELECT $1::uuid,'punpan_020',$2,$3,$4,$5,$6,$7,date_trunc('milliseconds',clock_timestamp()),$8,$9,$10
         WHERE NOT EXISTS (SELECT 1 FROM creator_continuous_auto_budget_attempts
           WHERE client_id='punpan_020' AND campaign_id=$3 AND baseline_fingerprint=$6)
         ON CONFLICT DO NOTHING RETURNING *`,
       [input.sessionId, input.ownerId, input.campaignId, input.policyRevision, input.baselineBudgetMinor,
-        input.baselineFingerprint, input.liveSessionId])));
+        input.baselineFingerprint, input.liveSessionId, input.nativeAutoOffAttested, input.noConcurrentChangesAttested,
+        input.evidenceMode ?? "verified-room"])));
+    },
+    async adoptBaseline(session: CreatorContinuousAutoBudgetSession, next: { budgetMinor: number; fingerprint: string; policyRevision: number }) {
+      if (!validSession(session) || session.evidenceMode !== "spend-trend" || session.status !== "ACTIVE" ||
+        session.operationId !== null || next.policyRevision !== session.policyRevision ||
+        !positive(next.budgetMinor, WEB_BUDGET_MAX_MINOR) || !identifier(next.fingerprint, FINGERPRINT) ||
+        next.fingerprint === session.baselineFingerprint) return null;
+      // This only rebases the current observation. It cannot reserve or send a
+      // provider command, clear a fence, consume a fingerprint or fake readback.
+      return run(async runner => one(await runner.query(`UPDATE ${SESSION} s
+        SET baseline_budget_minor=$9,baseline_fingerprint=$10,updated_at=clock_timestamp()
+        WHERE ${EXACT} AND s.evidence_mode='spend-trend' AND s.status='ACTIVE' AND s.operation_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM creator_continuous_auto_budget_attempts a WHERE a.client_id=s.client_id
+            AND a.campaign_id=s.campaign_id AND a.baseline_fingerprint=$10)
+          AND NOT EXISTS (SELECT 1 FROM creator_web_budget_operations w WHERE w.client_id=s.client_id
+            AND (w.status='OUTCOME_UNKNOWN' OR (w.status='PROCESSING' AND (w.mode='live' OR w.expires_at > clock_timestamp()))))
+        RETURNING s.*`, [...args(session), next.budgetMinor, next.fingerprint])));
     },
     async reserve(session: CreatorContinuousAutoBudgetSession, operationId: string, targetBudgetMinor: number) {
       if (!validSession(session) || !identifier(operationId, WEB_BUDGET_OPERATION_ID) || !validTarget(session.baselineBudgetMinor, targetBudgetMinor)) return null;
@@ -204,8 +283,8 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
           WHERE ${EXACT} AND s.status='ACTIVE' AND s.operation_id IS NULL FOR UPDATE`, input.slice(0, 8)));
         if (current.length !== 1) return null;
         const attempt = rows(await runner.query(`INSERT INTO creator_continuous_auto_budget_attempts
-          (operation_id,session_id,client_id,campaign_id,live_session_id,baseline_fingerprint,baseline_budget_minor,target_budget_minor)
-          SELECT $9::uuid,s.session_id,s.client_id,s.campaign_id,s.live_session_id,s.baseline_fingerprint,s.baseline_budget_minor,$10
+          (operation_id,session_id,client_id,campaign_id,live_session_id,baseline_fingerprint,baseline_budget_minor,target_budget_minor,evidence_mode)
+          SELECT $9::uuid,s.session_id,s.client_id,s.campaign_id,s.live_session_id,s.baseline_fingerprint,s.baseline_budget_minor,$10,s.evidence_mode
           FROM ${SESSION} s
           WHERE ${EXACT} AND EXISTS (SELECT 1 FROM creator_web_budget_operations w WHERE ${EXACT_WEB_OP}
             AND w.target_budget_minor=$10 AND w.status='PREPARED' AND w.expires_at > clock_timestamp())

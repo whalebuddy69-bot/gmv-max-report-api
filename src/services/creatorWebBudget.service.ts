@@ -31,10 +31,12 @@ export interface WebBudgetContext {
   liveSessionId?: string | null;
 }
 export type WebAutoBudgetProof = { previousBudgetMinor: number; targetBudgetMinor: number; rounding?: "floor-satang" };
-export interface WebBudgetDispatch {
+export type WebBudgetAuthorization = { nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: never }
+  | { evidenceMode: "spend-trend"; nativeAutoOff?: never; noConcurrentChanges?: never };
+export type WebBudgetDispatch = WebBudgetAuthorization & {
   campaignId: string; reportingDate: string; expectedBudgetMinor: number; targetBudgetMinor: number;
   campaignCapMinor: number; clientDailyCapMinor: number;
-  fingerprint: string; notAfter: string; nativeAutoOff: true; noConcurrentChanges: true;
+  fingerprint: string; notAfter: string;
   canSend: (latest: WebBudgetContext) => Promise<boolean>;
 }
 export interface WebBudgetAdapters {
@@ -170,17 +172,23 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
       await store.create(row);
       return proposal(row);
     },
-    async confirm(ownerId: number, input: { operationId: string; nativeAutoOff: true; noConcurrentChanges: true }, recheckOperator: () => Promise<boolean>,
+    async confirm(ownerId: number, input: { operationId: string } & WebBudgetAuthorization, recheckOperator: () => Promise<boolean>,
       autoGuard?: (context: WebBudgetContext, policy: WebBudgetPolicy) => Promise<boolean>, autoRounding?: "floor-satang") {
       const initial = await store.get(ownerId, input.operationId);
       if (!initial || (initial.source === "auto") !== (typeof autoGuard === "function")) reject("BUDGET_OPERATION_NOT_FOUND", 404, "ไม่พบรายการนี้");
       if (autoRounding !== undefined && (autoRounding !== "floor-satang" || !autoGuard || clientId !== WEB_BUDGET_CLIENT_ID)) {
         reject("BUDGET_INPUT_INVALID", 400, "ไม่รองรับกติกาปัดเศษงบนี้");
       }
+      const useTrend = input.evidenceMode === "spend-trend";
+      if (useTrend ? (clientId !== WEB_BUDGET_CLIENT_ID || initial.source !== "auto" || !autoGuard || autoRounding !== "floor-satang" ||
+        input.nativeAutoOff !== undefined || input.noConcurrentChanges !== undefined)
+        : (input.evidenceMode !== undefined || input.nativeAutoOff !== true || input.noConcurrentChanges !== true)) {
+        reject("BUDGET_ATTESTATION_REQUIRED", 400, "ต้องยืนยันสิทธิ์และเงื่อนไขการปรับงบ");
+      }
+      const nativeReady = (context: WebBudgetContext) => context.nativeAutoState === "DISABLED" || (useTrend && context.nativeAutoState === "UNKNOWN");
       if (initial.status !== "PREPARED") return result(initial);
       const activeMode = mode();
       if (activeMode === "disabled" || activeMode !== initial.mode) reject("BUDGET_MODE_CHANGED", 409, "โหมดเปลี่ยนแล้ว กรุณาเปิดรายการใหม่");
-      if (input.nativeAutoOff !== true || input.noConcurrentChanges !== true) reject("BUDGET_ATTESTATION_REQUIRED", 400, "ต้องยืนยันว่าไม่มีการแก้งบพร้อมกัน");
       if (timeMs(initial.expiresAt) <= now().getTime()) reject("BUDGET_PROPOSAL_EXPIRED", 409, "รายการหมดอายุ กรุณาเปิดรายการใหม่");
       const reserved = await store.reserve(ownerId, input.operationId, activeMode);
       if (!reserved) {
@@ -196,7 +204,7 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
         if (!sameCap(reserved.cap, cap) || context.reportingDate !== reserved.reportingDate || context.fingerprint !== reserved.fingerprint) {
           reject("BUDGET_PRECONDITION_CHANGED", 409, "งบหรือเพดานเปลี่ยน กรุณาเปิดรายการใหม่");
         }
-        if (autoGuard && (context.nativeAutoState !== "DISABLED" || cap.autoLineReady !== true || !await autoGuard(context, cap))) {
+        if (autoGuard && (!nativeReady(context) || cap.autoLineReady !== true || !await autoGuard(context, cap))) {
           reject("BUDGET_AUTO_PREFLIGHT", 409, "ข้อมูลสำหรับ Auto ยังไม่พร้อม");
         }
         if (mode() !== activeMode || !await recheckOperator() || timeMs(reserved.expiresAt) <= now().getTime()) {
@@ -220,9 +228,10 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
           const sent = await adapters.dispatch({ campaignId: reserved.campaignId, reportingDate: reserved.reportingDate,
             expectedBudgetMinor: reserved.currentBudgetMinor, targetBudgetMinor: reserved.targetBudgetMinor, fingerprint: reserved.fingerprint,
             campaignCapMinor: lease.campaignCapMinor, clientDailyCapMinor: lease.clientDailyCapMinor,
-            notAfter: new Date(deadline).toISOString(), nativeAutoOff: true, noConcurrentChanges: true,
+            notAfter: new Date(deadline).toISOString(), ...(useTrend ? { evidenceMode: "spend-trend" as const }
+              : { nativeAutoOff: true as const, noConcurrentChanges: true as const }),
             canSend: async latest => mode() === "live" && await recheckOperator() &&
-              (!autoGuard || (latest.nativeAutoState === "DISABLED" && await autoGuard(latest, cap))) && mode() === "live" });
+              (!autoGuard || (nativeReady(latest) && await autoGuard(latest, cap))) && mode() === "live" });
           const readbackProof = typeof sent?.observedFingerprint === "string" && FINGERPRINT.test(sent.observedFingerprint) &&
             sent.observedFingerprint !== reserved.fingerprint ? sent.observedFingerprint : undefined;
           if (sent?.outcome === "APPLIED_VERIFIED" && sent.observedBudgetMinor === reserved.targetBudgetMinor && (!autoRounding || readbackProof)) {

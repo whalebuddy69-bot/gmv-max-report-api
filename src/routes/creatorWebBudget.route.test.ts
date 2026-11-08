@@ -230,6 +230,20 @@ describe("Automation web budget HTTP boundary", () => {
     expect(h.service.prepare).not.toHaveBeenCalled(); expect(h.service.confirm).not.toHaveBeenCalled();
   });
 
+  it("accepts spend-trend only for authorized Ppan Auto arming and does not accept it on manual confirm", async () => {
+    const h = await start({ withContinuous: true });
+    const payload = { expectedCampaignId: PREPARE.expectedCampaignId, expectedBudgetMinor: PREPARE.expectedBudgetMinor,
+      expectedPolicyRevision: 2, evidenceMode: "spend-trend" };
+    expect((await h.post("/auto/arm", JSON.stringify(payload), { ...HEADERS, Authorization: "Bearer report-admin" })).status).toBe(403);
+    expect((await h.post("/srihiw/auto/arm", JSON.stringify(payload))).status).toBe(400);
+    expect((await h.post("/auto/arm", JSON.stringify({ ...payload, nativeAutoOff: true }))).status).toBe(400);
+    expect((await h.post("/confirm", JSON.stringify({ operationId: ID, evidenceMode: "spend-trend" }))).status).toBe(400);
+    expect((await h.post("/auto/arm", JSON.stringify(payload))).status).toBe(200);
+    expect(h.continuous.arm).toHaveBeenCalledTimes(1);
+    expect(h.continuous.arm).toHaveBeenCalledWith(27, payload, expect.any(Function));
+    expect(h.service.confirm).not.toHaveBeenCalled();
+  });
+
   it("passes only validated fields and verifies the operator's session again at dispatch", async () => {
     const h = await start();
     const p = await h.post("/prepare");

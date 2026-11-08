@@ -47,3 +47,8 @@ export function configuredCreatorAutoBudgetMode(env: NodeJS.ProcessEnv = process
     (exact.autoLive === null || env[exact.autoLive] === "true") && configuredCreatorWebBudgetMode(env, clientId) === "live") return "live";
   return "disabled";
 }
+
+// Independent from the shared Auto live switch, which must not enable other Creators for Ppan's policy.
+export function configuredPpanSpendTrendLive(env: NodeJS.ProcessEnv = process.env) {
+  return env.CREATOR_AUTO_BUDGET_PPAN_SPEND_TREND_LIVE_ENABLED === "true" && configuredCreatorWebBudgetMode(env, "punpan_020") === "live";
+}

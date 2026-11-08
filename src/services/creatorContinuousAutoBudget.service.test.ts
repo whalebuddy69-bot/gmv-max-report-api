@@ -15,7 +15,7 @@ const CONFIRM = { expectedCampaignId: CAMPAIGN, expectedLiveSessionId: ROOM, exp
   expectedPolicyRevision: CAP_REVISION, nativeAutoOff: true, noConcurrentChanges: true } as const;
 const ts = (ms: number) => new Date(ms).toISOString();
 
-function fixture(mode: "shadow" | "live" = "live") {
+function fixture(mode: "shadow" | "live" = "live", evidence: "verified-room" | "spend-trend" = "verified-room") {
   let clock = Date.parse("2026-11-07T14:14:00.000Z");
   let session: CreatorContinuousAutoBudgetSession | null = null;
   let context: WebBudgetContext = {
@@ -63,9 +63,11 @@ function fixture(mode: "shadow" | "live" = "live") {
     getLatest: vi.fn(async () => session),
     arm: vi.fn(async input => {
       if (session && (session.status !== "STOPPED" || session.operationId)) return null;
-      return session = { ...input, clientId: "punpan_020", status: "ACTIVE", authorizedAt: ts(clock),
+      return session = { ...input, evidenceMode: input.evidenceMode ?? "verified-room", clientId: "punpan_020", status: "ACTIVE", authorizedAt: ts(clock),
         operationId: null, lastOutcome: null, lastVerifiedAt: null, stopReason: null };
     }),
+    adoptBaseline: vi.fn(async (prior, next) => session?.sessionId === prior.sessionId && session.status === "ACTIVE" && !session.operationId
+      ? save({ baselineBudgetMinor: next.budgetMinor, baselineFingerprint: next.fingerprint }) : null),
     reserve: vi.fn(async (prior, id) => session && session.sessionId === prior.sessionId && session.status === "ACTIVE" && !session.operationId
       ? save({ operationId: id, lastOutcome: null }) : null),
     isReserved: vi.fn(async (prior, id) => isPending(prior, id) && session?.status === "ACTIVE"),
@@ -96,9 +98,10 @@ function fixture(mode: "shadow" | "live" = "live") {
   const writer = createCreatorWebBudgetService({ store: ledger, adapters, mode: () => "live", now });
   const service = createCreatorContinuousAutoBudgetService({ mode: () => mode, discover, adapters, sessions, writer,
     ledger, recheckOwner: async (owner, authorizedAt) => owner === OWNER && authorizedAt === session?.authorizedAt,
-    legacyBusy: async () => false, now });
+    legacyBusy: async () => false, evidenceMode: () => evidence, now });
   return { service, sessions, discover, dispatch, ledger, writes, lineOutbox, readContext: () => context,
-    arm: () => service.arm(OWNER, CONFIRM, async () => true),
+    arm: () => service.arm(OWNER, evidence === "spend-trend" ? { expectedCampaignId: CAMPAIGN, expectedBudgetMinor: ORIGINAL_BUDGET,
+      expectedPolicyRevision: CAP_REVISION, evidenceMode: evidence } : CONFIRM, async () => true),
     refresh: (deltaMs = 0, changes: Partial<WebBudgetContext> = {}) => {
       clock += deltaMs;
       context = { ...context, observedAt: ts(clock), ...changes };
@@ -210,5 +213,69 @@ describe("Ppan continuous budget automation", () => {
     expect(f.ledger.create).toHaveBeenCalledTimes(1);
     expect(f.dispatch).toHaveBeenCalledTimes(1);
     expect(f.lineOutbox.size).toBe(0);
+  });
+});
+
+const unverified = { nativeAutoState: "UNKNOWN", providerSpendObservedAt: null, deliveryVerified: false, liveDeliveryState: "UNKNOWN", liveSessionId: null } as const;
+describe("Ppan opted-in spend-trend Auto", () => {
+  it("waits for two minute reads and repeats only after a new increase following exact provider readback", async () => {
+    const f = fixture("live", "spend-trend");
+    f.refresh(0, unverified);
+    expect(await f.service.status(true, OWNER)).toMatchObject({ evidenceMode: "spend-trend", canArm: true, blockers: [] });
+    await f.arm();
+    expect(await f.sessions.getLatest()).toMatchObject({ liveSessionId: null, nativeAutoOffAttested: false, noConcurrentChangesAttested: false });
+    f.refresh(60_000);
+    await f.service.tick();
+    f.refresh(60_000);
+    await f.service.tick();
+    f.refresh(0, { spendMinor: ORIGINAL_THRESHOLD + 1 });
+    await f.service.tick();
+    expect(f.writes).toEqual([]);
+    f.refresh(60_000, { spendMinor: ORIGINAL_THRESHOLD + 2 });
+    await f.service.tick();
+    expect(f.writes).toEqual([780_000]);
+    expect(f.dispatch.mock.calls[0][0]).toMatchObject({ evidenceMode: "spend-trend" });
+    expect(f.dispatch.mock.calls[0][0]).not.toHaveProperty("nativeAutoOff");
+    f.refresh(60_000, { spendMinor: 624_000, aggregateSpendMinor: 626_000 });
+    await f.service.tick();
+    expect(f.writes).toEqual([780_000]);
+    f.refresh(60_000, { spendMinor: 624_001 });
+    await f.service.tick();
+    expect(f.writes).toEqual([780_000, 936_000]);
+    expect(f.lineOutbox.size).toBe(2);
+  });
+
+  it("holds when a confirmed other Auto system appears and stops for a missing campaign", async () => {
+    const f = fixture("live", "spend-trend");
+    f.refresh(0, { ...unverified, nativeAutoState: "ENABLED" });
+    await expect(f.arm()).rejects.toMatchObject({ code: "AUTO_BUDGET_NOT_READY" });
+    f.refresh(0, unverified);
+    await f.arm();
+    f.refresh(60_000);
+    await f.service.tick();
+    f.refresh(60_000, { spendMinor: ORIGINAL_THRESHOLD + 1, nativeAutoState: "ENABLED" });
+    await f.service.tick();
+    expect(f.writes).toEqual([]);
+    f.discover.mockResolvedValue(null);
+    await f.service.tick();
+    expect(await f.sessions.getLatest()).toMatchObject({ status: "STOPPED", stopReason: "CAMPAIGN_ENDED" });
+  });
+
+  it("adopts a separately changed budget, but never writes above the cap", async () => {
+    const f = fixture("live", "spend-trend");
+    f.refresh(0, unverified);
+    await f.arm();
+    f.refresh(60_000, { budgetMinor: 800_000, fingerprint: "e".repeat(64), spendMinor: 640_000, aggregateSpendMinor: 650_000 });
+    await f.service.tick();
+    expect(f.writes).toEqual([]);
+    expect(await f.sessions.getLatest()).toMatchObject({ status: "ACTIVE", baselineBudgetMinor: 800_000 });
+    f.refresh(60_000, { spendMinor: 640_001 });
+    await f.service.tick();
+    expect(f.writes).toEqual([960_000]);
+    f.refresh(60_000, { spendMinor: 768_000, aggregateSpendMinor: 780_000 });
+    await f.service.tick();
+    f.refresh(60_000, { spendMinor: 768_001 });
+    await f.service.tick();
+    expect(f.writes).toEqual([960_000]);
   });
 });

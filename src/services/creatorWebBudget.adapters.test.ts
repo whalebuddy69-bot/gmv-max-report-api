@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { CREATOR_BINDING } from "./creatorRead.service";
 import { createCreatorWebBudgetAdapters, createCreatorWebCapAdapters } from "./creatorWebBudget.adapters";
-import { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode, creatorBudgetPolicyPath, type CreatorBudgetScope } from "./creatorBudgetScope";
+import { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode, configuredPpanSpendTrendLive, creatorBudgetPolicyPath, type CreatorBudgetScope } from "./creatorBudgetScope";
 
 const NOW = "2025-03-15T09:00:00.000Z", TODAY = "2025-03-15", CAMPAIGN = "1234567890123456";
 const OP = "5035df00-1801-4d02-8051-01affbbefdc9", KEY = "p".repeat(43), TOKEN = "synthetic-tiktok-adapter-key";
@@ -11,7 +11,7 @@ const policy = { schemaVersion: 1, clientId: "punpan_020", revision: 4, campaign
 const SRIHIW = { clientId: "srihiw", advertiserId: "1234567890198765", tiktokAccountId: "1234567890198766",
   identityId: "synthetic-srihiw-identity", identityType: "BC_AUTH_TT" as const, identityAuthorizedBcId: "1234567890198767" };
 
-function harness(options: { mode?: string; competing?: boolean; legacy?: boolean; policyKey?: string;
+function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: boolean; spendTrend?: boolean; legacy?: boolean; policyKey?: string;
   providerResult?: "unknown" | "reject" | "roi-drift" | "reject-with-drift"; readAt?: string;
   extra?: boolean; extraLive?: boolean; extraClient?: "nnshop5719" | "ashopbytheta"; wrongProviderScope?: boolean } = {}) {
   const calls: { host: string; path: string; method: string }[] = [];
@@ -69,7 +69,7 @@ function harness(options: { mode?: string; competing?: boolean; legacy?: boolean
       advertiser_id: binding.advertiserId, campaign_id: CAMPAIGN, campaign_name: "Fixture LIVE", shopping_ads_type: "LIVE",
       store_id: "0", store_authorized_bc_id: "0", operation_status: "ENABLE", budget, roas_bid: roi,
       optimization_goal: "VALUE", deep_bid_type: "VO_MIN_ROAS", schedule_type: "SCHEDULE_FROM_NOW",
-      schedule_start_time: "2025-03-15 08:30:00", auto_budget_enabled: options.competing === true,
+      schedule_start_time: "2025-03-15 08:30:00", ...(options.nativeUnknown ? {} : { auto_budget_enabled: options.competing === true }),
       promotion_days: { is_enabled: false }, identity_list: [{ identity_id: binding.identityId,
         identity_type: binding.identityType, identity_authorized_bc_id: binding.identityAuthorizedBcId }] } });
     expect(url.pathname).toBe("/open_api/v1.3/report/integrated/get/");
@@ -81,6 +81,7 @@ function harness(options: { mode?: string; competing?: boolean; legacy?: boolean
   const adapters = createCreatorWebBudgetAdapters({ loadToken: async () => TOKEN, fetchImpl, now: () => new Date(NOW), sleep: async () => {},
     extraBinding: extra,
     env: { CREATOR_READ_ENABLED: "true", CREATOR_WEB_BUDGET_MODE: options.mode ?? "live", CREATOR_WEB_BUDGET_LIVE_ENABLED: "true",
+      CREATOR_AUTO_BUDGET_PPAN_SPEND_TREND_LIVE_ENABLED: options.spendTrend ? "true" : "false",
       CREATOR_WEB_SRIHIW_BUDGET_MODE: options.mode ?? "live", CREATOR_WEB_SRIHIW_BUDGET_LIVE_ENABLED: options.extraLive ? "true" : "false",
       ...(options.extraClient ? { [`CREATOR_WEB_${options.extraClient.toUpperCase()}_BUDGET_MODE`]: options.mode ?? "live",
         [`CREATOR_WEB_${options.extraClient.toUpperCase()}_BUDGET_LIVE_ENABLED`]: options.extraLive ? "true" : "false" } : {}),
@@ -120,6 +121,29 @@ describe("Ppan web budget boundary", () => {
   it("can safely request a decrease above spend", async () => {
     const h = harness();
     expect(await h.adapters.dispatch(await h.input(255_000))).toMatchObject({ outcome: "APPLIED_VERIFIED", observedBudgetMinor: 255_000 });
+  });
+
+  it("dispatches exact Ppan spend-trend with unknown native state, and rejects cross-scope and non-20% requests", async () => {
+    for (const [h, target, outcome] of [
+      [harness({ nativeUnknown: true, spendTrend: true }), 336_000, "APPLIED_VERIFIED"],
+      [harness({ nativeUnknown: true }), 336_000, "NOT_SENT"],
+      [harness({ nativeUnknown: true, spendTrend: true }), 336_001, "NOT_SENT"],
+      [harness({ extra: true, extraLive: true, nativeUnknown: true, spendTrend: true }), 336_000, "NOT_SENT"],
+      [harness({ competing: true, spendTrend: true }), 336_000, "NOT_SENT"],
+    ] as const) {
+      const { nativeAutoOff: _, noConcurrentChanges: __, ...input } = await h.input(target);
+      expect(await h.adapters.dispatch({ ...input, evidenceMode: "spend-trend" })).toMatchObject({ outcome });
+      expect(h.providerPosts()).toHaveLength(outcome === "APPLIED_VERIFIED" ? 1 : 0);
+    }
+  });
+
+  it("requires explicit Ppan-only spend mode without opening the shared Auto switch", () => {
+    const env = { CREATOR_READ_ENABLED: "true", CREATOR_WEB_BUDGET_MODE: "live", CREATOR_WEB_BUDGET_LIVE_ENABLED: "true",
+      CREATOR_AUTO_BUDGET_PPAN_SPEND_TREND_LIVE_ENABLED: "true", CREATOR_AUTO_BUDGET_MODE: "shadow", CREATOR_AUTO_BUDGET_SRIHIW_MODE: "live" };
+    expect(configuredPpanSpendTrendLive(env)).toBe(true);
+    expect(configuredCreatorAutoBudgetMode(env)).toBe("shadow");
+    expect(configuredCreatorAutoBudgetMode(env, "srihiw")).toBe("disabled");
+    expect(configuredPpanSpendTrendLive({ ...env, CREATOR_WEB_BUDGET_LIVE_ENABLED: "false" })).toBe(false);
   });
 
   it.each(["disabled", "dry-run"])("does not dispatch in mode %s", async mode => {

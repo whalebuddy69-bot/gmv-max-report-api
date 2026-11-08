@@ -7,8 +7,10 @@ import { WEB_BUDGET_CAMPAIGN_ID, WEB_BUDGET_MAX_MINOR, WebBudgetError,
 
 type Sessions = ReturnType<typeof createCreatorContinuousAutoBudgetStore>;
 type Session = NonNullable<Awaited<ReturnType<Sessions["getLatest"]>>>;
-type ArmInput = { expectedCampaignId: string; expectedLiveSessionId: string; expectedBudgetMinor: number; expectedPolicyRevision: number;
-  nativeAutoOff: true; noConcurrentChanges: true };
+type EvidenceMode = "verified-room" | "spend-trend";
+type ArmInput = { expectedCampaignId: string; expectedBudgetMinor: number; expectedPolicyRevision: number } & (
+  { expectedLiveSessionId: string; nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: never } |
+  { evidenceMode: "spend-trend"; expectedLiveSessionId?: never; nativeAutoOff?: never; noConcurrentChanges?: never });
 type Mode = "disabled" | "shadow" | "live";
 const unavailable = () => new WebBudgetError("AUTO_BUDGET_NOT_READY", 409, "ข้อมูลสำหรับเปิด Auto ยังไม่ครบ จึงยังไม่ส่งคำสั่งจริง");
 const CLIENT = "punpan_020" as const;
@@ -32,17 +34,23 @@ function spendReady(ctx: WebBudgetContext, at: Date, after?: string | null) {
 function preview(ctx: WebBudgetContext, policy: WebBudgetPolicy, at: Date) {
   return previewCreatorAutoBudget({ now: at, context: ctx, policy, rounding: "floor-satang" });
 }
-function blockers(ctx: WebBudgetContext, policy: WebBudgetPolicy, fenced: boolean, at: Date, session?: Session) {
+const verifiedEnded = (ctx: WebBudgetContext) => ctx.deliveryVerified === true && ctx.liveDeliveryState === "NOT_LIVE";
+function blockers(ctx: WebBudgetContext, policy: WebBudgetPolicy, fenced: boolean, at: Date, evidence: EvidenceMode, session?: Session) {
   const codes: string[] = [];
-  if (ctx.nativeAutoState !== "DISABLED") codes.push("NATIVE_AUTO_UNVERIFIED");
-  if (!spendReady(ctx, at, session?.lastVerifiedAt)) codes.push(ctx.providerSpendObservedAt ? "SPEND_UPDATE_PENDING" : "SPEND_WATERMARK_MISSING");
-  if (!hasRoom(ctx)) codes.push("LIVE_DELIVERY_UNVERIFIED");
+  if (evidence === "spend-trend") {
+    if (ctx.nativeAutoState !== "DISABLED" && ctx.nativeAutoState !== "UNKNOWN") codes.push("NATIVE_AUTO_CONFLICT");
+    if (verifiedEnded(ctx)) codes.push("LIVE_ENDED");
+  } else {
+    if (ctx.nativeAutoState !== "DISABLED") codes.push("NATIVE_AUTO_UNVERIFIED");
+    if (!spendReady(ctx, at, session?.lastVerifiedAt)) codes.push(ctx.providerSpendObservedAt ? "SPEND_UPDATE_PENDING" : "SPEND_WATERMARK_MISSING");
+    if (!hasRoom(ctx)) codes.push("LIVE_DELIVERY_UNVERIFIED");
+  }
   if (policy.autoLineReady !== true) codes.push("LINE_NOT_READY");
   if (fenced || policy.locked) codes.push("WRITE_LOCKED");
   return codes;
 }
-function canStart(ctx: WebBudgetContext, policy: WebBudgetPolicy, fenced: boolean, at: Date) {
-  if (blockers(ctx, policy, fenced, at).length) return false;
+function canStart(ctx: WebBudgetContext, policy: WebBudgetPolicy, fenced: boolean, at: Date, evidence: EvidenceMode) {
+  if (blockers(ctx, policy, fenced, at, evidence).length) return false;
   const result = preview(ctx, policy, at);
   if (result.status === "WOULD_INCREASE") return true;
   if (result.status !== "BELOW_THRESHOLD") return false;
@@ -52,11 +60,27 @@ function canStart(ctx: WebBudgetContext, policy: WebBudgetPolicy, fenced: boolea
 }
 
 export function createCreatorContinuousAutoBudgetService({ mode, discover, adapters, sessions, writer, ledger, recheckOwner, legacyBusy,
-  now = () => new Date() }: {
+  evidenceMode = () => "verified-room", now = () => new Date() }: {
   mode: () => Mode; discover: () => Promise<string | null>; adapters: WebBudgetAdapters; sessions: Sessions;
   writer: ReturnType<typeof createCreatorWebBudgetService>; ledger: WebBudgetStore;
-  recheckOwner: (id: number, authorizedAt: string) => Promise<boolean>; legacyBusy: () => Promise<boolean>; now?: () => Date;
+  recheckOwner: (id: number, authorizedAt: string) => Promise<boolean>; legacyBusy: () => Promise<boolean>;
+  evidenceMode?: () => EvidenceMode; now?: () => Date;
 }) {
+  // Deliberately process-local. A restart or incomplete read requires a fresh
+  // pair of minute polls; an old qualifying sample never survives a restart.
+  let pulse: { key: string; at: number; spend: number } | undefined;
+  function observeTrend(row: Session, ctx: WebBudgetContext) {
+    const timestamp = instant(ctx.observedAt), anchor = Math.max(instant(row.authorizedAt), row.lastVerifiedAt ? instant(row.lastVerifiedAt) : 0);
+    if (!Number.isFinite(anchor) || timestamp <= anchor || !Number.isSafeInteger(ctx.spendMinor) || ctx.spendMinor < 0) {
+      pulse = undefined;
+      return false;
+    }
+    const key = `${row.sessionId}:${ctx.reportingDate}:${ctx.fingerprint}:${anchor}`;
+    const previous = pulse, gap = previous ? timestamp - previous.at : NaN;
+    if (previous?.key === key && gap >= 0 && gap < 40_000 && ctx.spendMinor >= previous.spend) return false;
+    pulse = { key, at: timestamp, spend: ctx.spendMinor };
+    return previous?.key === key && gap >= 40_000 && gap <= 95_000 && ctx.spendMinor > previous.spend;
+  }
   async function read(campaignId: string) {
     const [context, policy, fenced] = await Promise.all([adapters.readContext(campaignId), adapters.readPolicy(), ledger.hasFence()]);
     return { context, policy, fenced };
@@ -66,10 +90,12 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     const currentMode = mode();
     const state = operator ? await sessions.getLatest().then(row => ({ row, ok: true })).catch(() => ({ row: null, ok: false })) : { row: null, ok: false };
     const row = state.row, own = row?.ownerId === ownerId ? row : null;
+    const evidence = row && row.status !== "STOPPED" ? row.evidenceMode ?? "verified-room" : evidenceMode();
     const ownStatus = own?.status === "ACTIVE" ? (own.operationId ? "SENDING" : "ARMED") : own?.status;
     const continuousSession = own && ownStatus ? { sessionId: own.sessionId, status: ownStatus,
       startedAt: own.authorizedAt, reason: own.stopReason ?? (own.lastOutcome === "OUTCOME_UNKNOWN" ? own.lastOutcome : null) } : null;
     const base = { clientId: CLIENT, strategy: "continuous" as const, mode: currentMode, grant: null, continuousSession,
+      ...(evidence === "spend-trend" ? { evidenceMode: evidence } : {}),
       canStop: !!own && own.status !== "STOPPED" };
     if (currentMode === "disabled") return { ...base, canArm: false, preview: null, blockers: [] };
     try {
@@ -78,27 +104,33 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       const { context, policy, fenced } = await read(campaign), at = now();
       const verdict = preview(context, policy, at);
       const canArm = currentMode === "live" && operator && state.ok && (!row || (row.status === "STOPPED" && !row.operationId)) &&
-        canStart(context, policy, fenced, at) && !await legacyBusy();
+        canStart(context, policy, fenced, at, evidence) && !await legacyBusy();
+      const reasons = blockers(context, policy, fenced, at, evidence, row?.status === "ACTIVE" ? row : undefined);
+      if (evidence === "spend-trend" && row?.status === "ACTIVE" && !row.operationId && verdict.status === "WOULD_INCREASE" && !reasons.length) reasons.push("SPEND_TREND_PENDING");
       return { ...base, canArm, preview: { status: verdict.status, campaignId: context.campaignId, currentBudgetMinor: context.budgetMinor,
         liveSessionId: hasRoom(context) ? context.liveSessionId : null,
         spendMinor: context.spendMinor, policyRevision: policy.revision, thresholdMinor: Number((BigInt(context.budgetMinor) * 8n + 9n) / 10n),
         targetBudgetMinor: verdict.status === "WOULD_INCREASE" ? verdict.targetBudgetMinor : null,
         projectedClientSpendMinor: verdict.status === "WOULD_INCREASE" ? verdict.projectedClientSpendMinor : null,
-        observedAt: context.observedAt }, blockers: blockers(context, policy, fenced, at, row?.status === "ACTIVE" ? row : undefined) };
+        observedAt: context.observedAt }, blockers: reasons };
     } catch { return { ...base, canArm: false, preview: null, blockers: ["CONTEXT_UNAVAILABLE"] }; }
   }
 
   async function arm(ownerId: number, input: ArmInput, recheckOperator: () => Promise<boolean>) {
-    if (mode() !== "live" || !WEB_BUDGET_CAMPAIGN_ID.test(input.expectedCampaignId) || !WEB_BUDGET_CAMPAIGN_ID.test(input.expectedLiveSessionId) || input.nativeAutoOff !== true ||
-      input.noConcurrentChanges !== true || await legacyBusy()) throw unavailable();
+    const evidence = evidenceMode();
+    const trend = input.evidenceMode === "spend-trend";
+    if (mode() !== "live" || !WEB_BUDGET_CAMPAIGN_ID.test(input.expectedCampaignId) || trend !== (evidence === "spend-trend") ||
+      (trend ? input.expectedLiveSessionId !== undefined || input.nativeAutoOff !== undefined || input.noConcurrentChanges !== undefined
+        : !WEB_BUDGET_CAMPAIGN_ID.test(input.expectedLiveSessionId) || input.nativeAutoOff !== true || input.noConcurrentChanges !== true) || await legacyBusy()) throw unavailable();
     const campaignId = await discover();
     if (!campaignId || campaignId !== input.expectedCampaignId) throw unavailable();
     const { context, policy, fenced } = await read(campaignId);
-    if (!hasRoom(context) || context.liveSessionId !== input.expectedLiveSessionId || context.campaignId !== campaignId || context.budgetMinor !== input.expectedBudgetMinor ||
-      policy.revision !== input.expectedPolicyRevision || !canStart(context, policy, fenced, now()) || !await recheckOperator() || mode() !== "live") throw unavailable();
-    const row = await sessions.arm({ sessionId: randomUUID(), ownerId, campaignId, liveSessionId: context.liveSessionId,
+    if ((!trend && (!hasRoom(context) || context.liveSessionId !== input.expectedLiveSessionId)) || context.campaignId !== campaignId || context.budgetMinor !== input.expectedBudgetMinor ||
+      policy.revision !== input.expectedPolicyRevision || !canStart(context, policy, fenced, now(), evidence) || !await recheckOperator() || mode() !== "live" || evidenceMode() !== evidence) throw unavailable();
+    const row = await sessions.arm({ sessionId: randomUUID(), ownerId, campaignId,
       policyRevision: policy.revision, baselineBudgetMinor: context.budgetMinor, baselineFingerprint: context.fingerprint,
-      nativeAutoOffAttested: true, noConcurrentChangesAttested: true });
+      ...(trend ? { evidenceMode: "spend-trend" as const, liveSessionId: null, nativeAutoOffAttested: false as const, noConcurrentChangesAttested: false as const }
+        : { liveSessionId: input.expectedLiveSessionId, nativeAutoOffAttested: true as const, noConcurrentChangesAttested: true as const }) });
     if (!row) throw new WebBudgetError("AUTO_BUDGET_SESSION_EXISTS", 409, "มีรอบ Auto หรือรายการที่ยังต้องตรวจสอบอยู่แล้ว");
     return { sessionId: row.sessionId, startedAt: row.authorizedAt };
   }
@@ -134,41 +166,53 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     busy = true;
     try {
       const row = await sessions.getLatest();
-      if (!row) return;
-      if (row.status === "ACTIVE" && mode() !== "live") {
+      if (!row) { pulse = undefined; return; }
+      const evidence = row.evidenceMode ?? "verified-room", trend = evidence === "spend-trend";
+      if (row.status === "ACTIVE" && (mode() !== "live" || evidenceMode() !== evidence)) {
         await sessions.stop(row.ownerId, row.sessionId, "AUTO_DISABLED");
       }
-      if (row.operationId) { await reconcile(row); return; }
-      if (row.status !== "ACTIVE" || mode() !== "live") return;
+      if (row.operationId) { pulse = undefined; await reconcile(row); return; }
+      if (row.status !== "ACTIVE" || mode() !== "live" || evidenceMode() !== evidence) { pulse = undefined; return; }
       if (!await recheckOwner(row.ownerId, row.authorizedAt)) { await sessions.stop(row.ownerId, row.sessionId, "AUTHORITY_REVOKED"); return; }
       if (await legacyBusy()) return;
       const campaign = await discover();
-      if (campaign !== row.campaignId) { await sessions.stop(row.ownerId, row.sessionId, "CAMPAIGN_ENDED"); return; }
+      if (campaign !== row.campaignId) { pulse = undefined; await sessions.stop(row.ownerId, row.sessionId, "CAMPAIGN_ENDED"); return; }
       const { context, policy, fenced } = await read(campaign), at = now();
-      if (context.campaignId !== campaign || !freshContext(context, at)) return;
-      if ((context.deliveryVerified === true && context.liveDeliveryState === "NOT_LIVE") || (hasRoom(context) && context.liveSessionId !== row.liveSessionId)) {
+      if (context.campaignId !== campaign || !freshContext(context, at)) { pulse = undefined; return; }
+      if (verifiedEnded(context) || (!trend && hasRoom(context) && context.liveSessionId !== row.liveSessionId)) {
         await sessions.stop(row.ownerId, row.sessionId, "LIVE_ENDED"); return;
       }
       if (policy.revision !== row.policyRevision) { await sessions.stop(row.ownerId, row.sessionId, "CAP_CHANGED"); return; }
       if (context.budgetMinor !== row.baselineBudgetMinor || context.fingerprint !== row.baselineFingerprint) {
-        await sessions.stop(row.ownerId, row.sessionId, "BASELINE_CHANGED"); return;
+        pulse = undefined;
+        if (!trend) { await sessions.stop(row.ownerId, row.sessionId, "BASELINE_CHANGED"); return; }
+        if (!canStart(context, policy, fenced, at, evidence)) return;
+        const adopted = await sessions.adoptBaseline(row, { budgetMinor: context.budgetMinor, fingerprint: context.fingerprint, policyRevision: policy.revision });
+        if (adopted) observeTrend(adopted, context);
+        return;
       }
+      const current = row;
       const verdict = preview(context, policy, at);
-      if (verdict.status !== "WOULD_INCREASE" || blockers(context, policy, fenced, at, row).length || mode() !== "live") return;
+      if (blockers(context, policy, fenced, at, evidence, current).length) { pulse = undefined; return; }
+      const moving = !trend || observeTrend(current, context);
+      if (!moving || verdict.status !== "WOULD_INCREASE" || mode() !== "live" || evidenceMode() !== evidence) return;
       const op = await writer.prepare(row.ownerId, { expectedCampaignId: row.campaignId,
         expectedBudgetMinor: row.baselineBudgetMinor, targetBudgetMinor: verdict.targetBudgetMinor }, "auto");
       if (!await sessions.reserve(row, op.operationId, verdict.targetBudgetMinor)) return;
-      const allowed = async () => mode() === "live" && await recheckOwner(row.ownerId, row.authorizedAt) && await sessions.isReserved(row, op.operationId);
-      await writer.confirm(row.ownerId, { operationId: op.operationId, nativeAutoOff: true, noConcurrentChanges: true }, allowed,
+      const allowed = async () => mode() === "live" && evidenceMode() === evidence && await recheckOwner(current.ownerId, current.authorizedAt) && await sessions.isReserved(current, op.operationId);
+      await writer.confirm(row.ownerId, { operationId: op.operationId,
+        ...(trend ? { evidenceMode: "spend-trend" as const } : { nativeAutoOff: true as const, noConcurrentChanges: true as const }) }, allowed,
         async (latest, latestPolicy) => {
           const nowAt = now(), decision = preview(latest, latestPolicy, nowAt);
-          return latest.campaignId === row.campaignId && hasRoom(latest) && latest.liveSessionId === row.liveSessionId &&
-            latest.budgetMinor === row.baselineBudgetMinor && latest.fingerprint === row.baselineFingerprint && latestPolicy.revision === row.policyRevision &&
-            !blockers(latest, latestPolicy, false, nowAt, row).length && decision.status === "WOULD_INCREASE" &&
+          return latest.campaignId === current.campaignId && (trend ? latest.reportingDate === context.reportingDate &&
+            instant(latest.observedAt) >= instant(context.observedAt) && latest.spendMinor >= context.spendMinor
+            : hasRoom(latest) && latest.liveSessionId === current.liveSessionId) &&
+            latest.budgetMinor === current.baselineBudgetMinor && latest.fingerprint === current.baselineFingerprint && latestPolicy.revision === current.policyRevision &&
+            !blockers(latest, latestPolicy, false, nowAt, evidence, current).length && decision.status === "WOULD_INCREASE" &&
             decision.targetBudgetMinor === verdict.targetBudgetMinor && await allowed();
         }, "floor-satang");
       await reconcile({ ...row, operationId: op.operationId });
-    } finally { busy = false; }
+    } catch (error) { pulse = undefined; throw error; } finally { busy = false; }
   }
   return { status, arm, stop, tick };
 }

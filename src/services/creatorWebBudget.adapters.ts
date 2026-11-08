@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { bangkokDay, CREATOR_BINDING, createCreatorReader, createExtraCreatorReader, minor } from "./creatorRead.service";
 import type { AutomationVerifiedCreatorBinding } from "./creatorAutomationRegistry.service";
-import { configuredCreatorWebBudgetMode, creatorBudgetPolicyPath, isExtraCreatorBudgetScope, type CreatorBudgetScope } from "./creatorBudgetScope";
+import { configuredCreatorWebBudgetMode, configuredPpanSpendTrendLive, creatorBudgetPolicyPath, isExtraCreatorBudgetScope, type CreatorBudgetScope } from "./creatorBudgetScope";
 import { WEB_BUDGET_MAX_MINOR, WebBudgetError, type WebBudgetAdapters } from "./creatorWebBudget.service";
 
 const POLICY_ORIGIN = "https://whale-buddy-ads-control-plane.onrender.com/internal/automation";
@@ -263,8 +263,13 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     async dispatch(input) {
       let attempted = false;
       try {
+        const allowedAuthority = input.evidenceMode === "spend-trend" ? clientId === "punpan_020" && configuredPpanSpendTrendLive(env) &&
+          input.nativeAutoOff === undefined && input.noConcurrentChanges === undefined &&
+          positive(input.expectedBudgetMinor) && positive(input.targetBudgetMinor) &&
+          BigInt(input.targetBudgetMinor) === BigInt(input.expectedBudgetMinor) * 6n / 5n
+          : input.evidenceMode === undefined && input.nativeAutoOff === true && input.noConcurrentChanges === true;
         if (configuredCreatorWebBudgetMode(env, clientId) !== "live" ||
-          input.nativeAutoOff !== true || input.noConcurrentChanges !== true || !ID.test(input.campaignId) ||
+          !allowedAuthority || !ID.test(input.campaignId) ||
           !positive(input.expectedBudgetMinor) || !positive(input.targetBudgetMinor) || input.expectedBudgetMinor === input.targetBudgetMinor ||
           !positive(input.campaignCapMinor) || !positive(input.clientDailyCapMinor) || input.targetBudgetMinor > input.campaignCapMinor ||
           !/^[a-f0-9]{64}$/.test(input.fingerprint) || !validIso(input.notAfter)) unverified();
@@ -273,7 +278,7 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
         const before = latest.sample;
         if (await input.canSend(latest) !== true) unverified();
         const at = now();
-        if (bangkokDay(at) !== input.reportingDate || latest.reportingDate !== input.reportingDate ||
+        if ((input.evidenceMode === "spend-trend" && !configuredPpanSpendTrendLive(env)) || bangkokDay(at) !== input.reportingDate || latest.reportingDate !== input.reportingDate ||
           Date.parse(input.notAfter) - at.getTime() < 10_000 || !fresh(latest.observedAt, at.getTime(), 25_000) ||
           before.budgetMinor !== input.expectedBudgetMinor || before.fingerprint !== input.fingerprint ||
           !["DISABLED", "UNKNOWN"].includes(before.native) || input.targetBudgetMinor <= latest.spendMinor ||

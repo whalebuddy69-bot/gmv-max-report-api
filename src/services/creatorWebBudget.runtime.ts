@@ -12,7 +12,7 @@ import { createCreatorContinuousAutoBudgetStore } from "./creatorContinuousAutoB
 import { bangkokDay, createCreatorReader, createExtraCreatorReader } from "./creatorRead.service";
 import { parseAutomationViewerIds } from "../routes/automation.route";
 import { User } from "../entities/User";
-import { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode,
+import { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode, configuredPpanSpendTrendLive,
   isExtraCreatorBudgetScope, type CreatorBudgetScope } from "./creatorBudgetScope";
 export { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode } from "./creatorBudgetScope";
 
@@ -43,8 +43,9 @@ export function createCreatorWebBudgetRuntime() {
   const ppanAdapters = createCreatorWebBudgetAdapters({ loadToken: loadCreatorToken });
   const ppan = makeRuntime("punpan_020", ppanAdapters, ppanReader);
   const continuousAutoService = createCreatorContinuousAutoBudgetService({ sessions, writer: ppan.service, ledger: ppan.store,
-    adapters: ppanAdapters, recheckOwner, mode: () => {
+    adapters: ppanAdapters, recheckOwner, evidenceMode: () => configuredPpanSpendTrendLive() ? "spend-trend" : "verified-room", mode: () => {
       if (!continuousReady || !ledgerReady.has("punpan_020")) return "disabled";
+      if (configuredPpanSpendTrendLive()) return "live";
       const configured = configuredCreatorAutoBudgetMode();
       return configured === "live" && process.env.CREATOR_AUTO_BUDGET_PPAN_CONTINUOUS_LIVE_ENABLED !== "true" ? "shadow" : configured;
     }, discover: async () => (await ppanReader()).campaign?.campaignId ?? null,
@@ -81,7 +82,7 @@ export function createCreatorWebBudgetRuntime() {
         try { await store.ensureSchema(); ledgerReady.add(clientId); }
         catch { ledgerReady.delete(clientId); }
       }));
-      if (allRuntimes.some(({ clientId }) => ledgerReady.has(clientId) && configuredCreatorAutoBudgetMode(process.env, clientId) !== "disabled")) {
+      if (configuredPpanSpendTrendLive() || allRuntimes.some(({ clientId }) => ledgerReady.has(clientId) && configuredCreatorAutoBudgetMode(process.env, clientId) !== "disabled")) {
         try { await grants.ensureSchema(); autoLedgerReady = true; }
         catch { autoLedgerReady = false; }
       }

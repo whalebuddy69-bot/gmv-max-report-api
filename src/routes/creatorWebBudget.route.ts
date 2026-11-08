@@ -133,7 +133,14 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
   router.post(scopedPaths("/auto/arm"), onlyOperator, onlyJson, json, handle((req, id) => {
     const value: unknown = req.body;
     const continuous = continuousFor(req);
-    const exact = ["expectedCampaignId", "expectedBudgetMinor", "expectedPolicyRevision", "nativeAutoOff", "noConcurrentChanges"];
+    const base = ["expectedCampaignId", "expectedBudgetMinor", "expectedPolicyRevision"];
+    if (continuous && fields(value, [...base, "evidenceMode"]) && value.evidenceMode === "spend-trend") {
+      if (typeof value.expectedCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedCampaignId)
+        || !safeAmount(value.expectedBudgetMinor) || !safeAmount(value.expectedPolicyRevision)) badInput();
+      return continuous.arm(id, { expectedCampaignId: value.expectedCampaignId, expectedBudgetMinor: value.expectedBudgetMinor,
+        expectedPolicyRevision: value.expectedPolicyRevision, evidenceMode: "spend-trend" }, () => recheck(req, id));
+    }
+    const exact = [...base, "nativeAutoOff", "noConcurrentChanges"];
     if (!fields(value, continuous ? [...exact, "expectedLiveSessionId"] : [...exact, "durationMinutes"])
       || typeof value.expectedCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedCampaignId)
       || !safeAmount(value.expectedBudgetMinor) || !safeAmount(value.expectedPolicyRevision)
