@@ -9,7 +9,7 @@ const ID = /^[1-9]\d{5,30}$/;
 type Status = "ENABLE" | "DISABLE" | "DELETE";
 type Coverage = "complete" | "partial" | "unavailable";
 type Data = Record<string, unknown>;
-type DayMetrics = { spendMinor: number | null; gmvMinor: number | null; activityToday: boolean };
+type DayMetrics = { spendMinor: number | null; gmvMinor: number | null; skuOrders: number | null; liveViews: number | null; activityToday: boolean };
 export type CreatorCampaignDayRow = DayMetrics & {
   campaignId: string; campaignName: string; operationStatus: Status; dailyBudgetMinor: number | null;
   targetRoi: number | null; roi: number | null; scheduleStartAt: string | null; scheduleEndAt: string | null;
@@ -127,10 +127,10 @@ export function createCreatorCampaignDayReader({ loadToken, fetchImpl = fetch, n
         (d.advertiser_id !== undefined && d.advertiser_id !== binding.advertiserId) ||
         (d.store_id !== undefined && d.store_id !== "0")) unverified();
       const spendMinor = money(row.metrics.cost), gmvMinor = money(row.metrics.all_shops_gross_revenue);
-      const orders = count(row.metrics.all_shops_orders), liveViews = count(row.metrics.live_views);
-      const activityToday = [spendMinor, gmvMinor, orders, liveViews].some(value => value !== null && value > 0);
-      if (!activityToday && [spendMinor, gmvMinor, orders, liveViews].some(value => value === null)) metricsIncomplete = true;
-      return { key: d.campaign_id, item: { spendMinor, gmvMinor, activityToday } };
+      const skuOrders = count(row.metrics.all_shops_orders), liveViews = count(row.metrics.live_views);
+      const activityToday = [spendMinor, gmvMinor, skuOrders, liveViews].some(value => value !== null && value > 0);
+      if (!activityToday && [spendMinor, gmvMinor, skuOrders, liveViews].some(value => value === null)) metricsIncomplete = true;
+      return { key: d.campaign_id, item: { spendMinor, gmvMinor, skuOrders, liveViews, activityToday } };
     }).catch(() => null);
 
     if (!listed && !reported) return empty(day);
@@ -155,13 +155,13 @@ export function createCreatorCampaignDayReader({ loadToken, fetchImpl = fetch, n
           (info.tiktok_account_id !== undefined && info.tiktok_account_id !== binding.tiktokAccountId)) unverified();
         const before = listed?.items.get(id);
         if (before !== undefined && before !== info.operation_status) complete = false;
-        const metrics = reported?.items.get(id) ?? { spendMinor: null, gmvMinor: null, activityToday: false };
+        const metrics = reported?.items.get(id) ?? { spendMinor: null, gmvMinor: null, skuOrders: null, liveViews: null, activityToday: false };
         if (info.operation_status !== "ENABLE" && !metrics.activityToday) continue;
         const dailyBudgetMinor = money(info.budget), name = campaignName(info.campaign_name, token);
         campaigns.push({ campaignId: id, campaignName: name || "แคมเปญ Creator", operationStatus: info.operation_status,
           dailyBudgetMinor: dailyBudgetMinor && dailyBudgetMinor > 0 ? dailyBudgetMinor : null,
           targetRoi: typeof info.roas_bid === "number" && Number.isFinite(info.roas_bid) && info.roas_bid > 0 ? info.roas_bid : null,
-          spendMinor: metrics.spendMinor, gmvMinor: metrics.gmvMinor, activityToday: metrics.activityToday,
+          ...metrics,
           roi: metrics.spendMinor !== null && metrics.spendMinor > 0 && metrics.gmvMinor !== null ? metrics.gmvMinor / metrics.spendMinor : null,
           ...campaignSchedule(info) });
       } catch { complete = false; }

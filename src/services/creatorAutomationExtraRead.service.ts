@@ -2,6 +2,7 @@ import { createExtraCreatorTokenLoader } from "../routes/creatorRead.route";
 import { createExtraCreatorReader, type CreatorReadBinding, type CreatorReadDependencies } from "./creatorRead.service";
 import { createExtraCreatorAutomationPerformance, type CreatorAutomationPerformance, type CreatorAutomationScope } from "./creatorAutomationPerformance.service";
 import { createCreatorCampaignDayReader } from "./creatorCampaignDay.service";
+import { createCreatorIdentityUsernameReader } from "./creatorIdentityUsername.service";
 
 type VerifiedExtraBinding = Omit<CreatorReadBinding, "identityType"> & { clientId: string; identityType: "BC_AUTH_TT" };
 
@@ -17,6 +18,7 @@ export function createVerifiedExtraCreatorReadAdapter(configured: VerifiedExtraB
     clientId, binding, tiktokAccountIdVerified: false as const,
     readSnapshot,
     readCampaignDay: createCreatorCampaignDayReader(deps, binding),
+    readUsername: createCreatorIdentityUsernameReader(deps, binding),
     async readPerformance(scope: CreatorAutomationScope): Promise<CreatorAutomationPerformance> {
       const unavailable = { state: "unavailable", observedAt: null, series: [] } as const;
       const { campaignId, reportingDate } = scope;

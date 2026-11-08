@@ -50,8 +50,8 @@ describe("Creator same-day campaign reader", () => {
     const h = setup();
     const got = await h.read();
     expect(got).toMatchObject({ reportingDate: DAY, observedAt: AT, coverage: "complete", campaigns: [
-      { campaignId: ACTIVE, operationStatus: "ENABLE", spendMinor: null, roi: null, activityToday: false },
-      { campaignId: PAUSED, operationStatus: "DISABLE", spendMinor: 1050, gmvMinor: 4200, roi: 4, targetRoi: 2.3,
+      { campaignId: ACTIVE, operationStatus: "ENABLE", spendMinor: null, skuOrders: null, liveViews: null, roi: null, activityToday: false },
+      { campaignId: PAUSED, operationStatus: "DISABLE", spendMinor: 1050, gmvMinor: 4200, skuOrders: 0, liveViews: 2, roi: 4, targetRoi: 2.3,
         activityToday: true, dailyBudgetMinor: 10000, scheduleStartAt: `${DAY}T00:00:00.000Z`, scheduleEndAt: null },
     ] });
     const [reportUrl] = h.fetchImpl.mock.calls[2];

@@ -52,22 +52,23 @@ afterEach(async () => {
 
 async function start(options: { viewerIds?: string; snapshot?: () => Promise<unknown>;
   performance?: () => Promise<unknown>; campaignDay?: () => Promise<unknown>; now?: () => Date;
-  extraConfig?: string; verifiedExtras?: AutomationCreatorReadAdapter[] } = {}) {
+  username?: () => Promise<string | null>; extraConfig?: string; verifiedExtras?: AutomationCreatorReadAdapter[] } = {}) {
   const readSnapshot = vi.fn(options.snapshot ?? (async () => observed));
   const readPerformance = vi.fn(options.performance ?? (async () => ({ state: "available", observedAt: PERFORMANCE_OBSERVED_AT, series: [
     { hour: "08:00", spendMinor: 123, gmvMinor: null, orders: 0, roi: null, liveViews: 55, secret: PRIVATE_MARKER },
     { hour: "07:00", spendMinor: null, gmvMinor: 600, orders: 3, roi: 1.5, liveViews: null },
   ] })));
   const readCampaignDay = vi.fn(options.campaignDay ?? (async () => null));
+  const readUsername = vi.fn(options.username ?? (async () => null));
   let allowlist = options.viewerIds ?? "27";
   const app = express();
-  app.use("/automation", createAutomationRouter({ viewerIds: () => allowlist, readSnapshot, readPerformance, readCampaignDay,
+  app.use("/automation", createAutomationRouter({ viewerIds: () => allowlist, readSnapshot, readPerformance, readCampaignDay, readUsername,
     configuredExtraClients: () => options.extraConfig, verifiedExtras: () => options.verifiedExtras ?? [],
     now: options.now ?? (() => NOW) }));
   server = await new Promise<Server>(resolve => { const instance = app.listen(0, "127.0.0.1", () => resolve(instance)); });
   const { port } = server.address() as { port: number };
   const url = `http://127.0.0.1:${port}/automation`;
-  return { url, readSnapshot, readPerformance, readCampaignDay, setAllowlist: (next: string) => { allowlist = next; } };
+  return { url, readSnapshot, readPerformance, readCampaignDay, readUsername, setAllowlist: (next: string) => { allowlist = next; } };
 }
 
 function extraAdapter(snapshot: unknown = { ...observed, clientId: EXTRA.clientId, binding: EXTRA_BINDING,
@@ -82,7 +83,7 @@ function extraAdapter(snapshot: unknown = { ...observed, clientId: EXTRA.clientI
 describe("private Creator Automation read routes", () => {
   it("serves a read-only list of exact scoped today campaigns, including verified closed rows", async () => {
     const paused = { campaignId: EXTRA_CAMPAIGN, campaignName: "Paused Synthetic", operationStatus: "DISABLE", dailyBudgetMinor: 20000,
-      targetRoi: 3, spendMinor: 400, gmvMinor: 1000, activityToday: true, roi: 999, scheduleStartAt: null, scheduleEndAt: null,
+      targetRoi: 3, spendMinor: 400, gmvMinor: 1000, skuOrders: 2, liveViews: 0, activityToday: true, roi: 999, scheduleStartAt: null, scheduleEndAt: null,
       secret: PRIVATE_MARKER };
     const h = await start({ campaignDay: async () => ({ reportingDate: REPORTING_DATE, observedAt: OBSERVED_AT, coverage: "complete",
       campaigns: [paused, { ...paused, campaignId: FAKE_CAMPAIGN_ID, campaignName: "Active Synthetic", operationStatus: "ENABLE",
@@ -99,7 +100,7 @@ describe("private Creator Automation read routes", () => {
     expect(res.headers.get("cache-control")).toBe("no-store");
     expect(raw).not.toContain(PRIVATE_MARKER);
     expect(JSON.parse(raw)).toMatchObject({ schemaVersion: 1, clientId: "punpan_020", coverage: "complete", reportingDate: REPORTING_DATE,
-      campaigns: [{ campaignId: FAKE_CAMPAIGN_ID, roi: null }, { campaignId: EXTRA_CAMPAIGN, roi: 2.5 }] });
+      campaigns: [{ campaignId: FAKE_CAMPAIGN_ID, roi: null }, { campaignId: EXTRA_CAMPAIGN, roi: 2.5, skuOrders: 2, liveViews: 0 }] });
     expect(h.readCampaignDay.mock.calls).toEqual([[]]);
     expect(h.readSnapshot).not.toHaveBeenCalled();
   });
@@ -151,7 +152,7 @@ describe("private Creator Automation read routes", () => {
   });
 
   it("publishes only the verified configured Creator and read-only action capabilities", async () => {
-    const h = await start();
+    const h = await start({ username: async () => "exact.creator" });
     const res = await fetch(h.url + "/overview", { headers: OWNER_HEADER });
     const body = await res.text();
     expect(res.headers.get("cache-control")).toBe("no-store");
@@ -159,12 +160,21 @@ describe("private Creator Automation read routes", () => {
     expect(body).not.toContain(CREATOR_BINDING.identityId);
     expect(JSON.parse(body)).toEqual({ schemaVersion: 1, checkedAt: NOW.toISOString(), coverage: "configured-creators-only", clients: [{
       clientId: "punpan_020", displayName: "Ppan", advertiserId: CREATOR_BINDING.advertiserId, tiktokAccountId: CREATOR_BINDING.tiktokAccountId,
-      tiktokAccountIdVerified: true,
+      tiktokAccountIdVerified: true, tiktokUsername: "exact.creator",
       access: "verified", observedAt: OBSERVED_AT, reportingDate: REPORTING_DATE, campaign: {
         campaignId: FAKE_CAMPAIGN_ID, campaignName: campaign.campaignName, campaignStatus: "ACTIVE", dailyBudgetMinor: 123456,
         spendMinor: 23456, targetRoi: 2.5, currency: "THB", scheduleStartAt: null, scheduleEndAt: null, viewerBoostBudgetMinor: null,
       }, capMinor: null, actions: { start: false, pause: false, increaseBudget: false, decreaseBudget: false, auto: false },
     }] });
+  });
+
+  it("does not call the identity lookup before authentication or leak aliases across configured accounts", async () => {
+    const h = await start({ username: async () => "@malformed", extraConfig: JSON.stringify([EXTRA]) });
+    expect((await fetch(h.url + "/overview")).status).toBe(401);
+    expect(h.readUsername).not.toHaveBeenCalled();
+    const response = await (await fetch(h.url + "/overview", { headers: OWNER_HEADER })).json();
+    expect(response.clients.map((row: { tiktokUsername: string | null }) => row.tiktokUsername)).toEqual([null, null]);
+    expect(h.readUsername).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -262,7 +272,7 @@ describe("private Creator Automation read routes", () => {
     const overview = await (await fetch(h.url + "/overview", { headers: OWNER_HEADER })).json();
     expect(overview.clients).toHaveLength(2);
     expect(overview.clients[0]).toMatchObject({ clientId: "punpan_020", access: "verified" });
-    expect(overview.clients[1]).toEqual({ ...EXTRA, tiktokAccountIdVerified: false, access: "unavailable", accessReason: "needs-authorization", observedAt: null,
+    expect(overview.clients[1]).toEqual({ ...EXTRA, tiktokAccountIdVerified: false, tiktokUsername: null, access: "unavailable", accessReason: "needs-authorization", observedAt: null,
       reportingDate: null, campaign: null, capMinor: null,
       actions: { start: false, pause: false, increaseBudget: false, decreaseBudget: false, auto: false } });
     expect(await (await fetch(`${h.url}/performance/${EXTRA.clientId}`, { headers: OWNER_HEADER })).json()).toMatchObject({

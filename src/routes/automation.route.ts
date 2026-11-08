@@ -4,6 +4,7 @@ import { requireAuth } from "../middleware/auth";
 import { bangkokDay, CREATOR_BINDING, CreatorReadError, createCreatorReader } from "../services/creatorRead.service";
 import { createCreatorAutomationPerformance } from "../services/creatorAutomationPerformance.service";
 import { CREATOR_DAY_MAX_ROWS, createCreatorCampaignDayReader, type CreatorCampaignDay, type CreatorCampaignDayRow } from "../services/creatorCampaignDay.service";
+import { createCreatorIdentityUsernameReader, verifiedTikTokUsername } from "../services/creatorIdentityUsername.service";
 import { createAutomationReadRegistry, parseExtraAutomationClients, parseVerifiedAutomationBindings,
   PPAN_AUTOMATION_CREATOR, validAutomationClientId } from "../services/creatorAutomationRegistry.service";
 import type { AutomationAccessReason, AutomationCreator, AutomationCreatorReadAdapter, AutomationCreatorReadEntry,
@@ -26,6 +27,7 @@ type AutomationRouteDependencies = {
   readSnapshot: () => Promise<unknown>;
   readPerformance: (scope: AutomationPerformanceScope) => Promise<unknown>;
   readCampaignDay?: () => Promise<unknown>;
+  readUsername?: () => Promise<string | null>;
   configuredExtraClients?: () => string | undefined;
   verifiedExtras?: () => readonly AutomationCreatorReadAdapter[];
   pendingReason?: (creator: AutomationCreator) => AutomationAccessReason | undefined;
@@ -129,22 +131,24 @@ function verifyCampaignDay(raw: unknown, now: Date): CreatorCampaignDay {
     const scheduleVerified = start !== null && (campaign.scheduleEndAt === null || (end !== null && end > start));
     const roi = campaign.gmvMinor !== null && campaign.spendMinor !== null && campaign.spendMinor > 0 ? campaign.gmvMinor / campaign.spendMinor : null;
     seen.add(campaign.campaignId);
+    const skuOrders = campaign.skuOrders ?? null, liveViews = campaign.liveViews ?? null;
+    if (!nullableInteger(skuOrders) || !nullableInteger(liveViews)) return unavailable;
     campaigns.push({ campaignId: campaign.campaignId, campaignName: name || "แคมเปญ Creator", operationStatus: campaign.operationStatus,
       dailyBudgetMinor: campaign.dailyBudgetMinor, targetRoi: campaign.targetRoi, spendMinor: campaign.spendMinor, gmvMinor: campaign.gmvMinor,
-      roi, activityToday: campaign.activityToday, scheduleStartAt: scheduleVerified ? start : null, scheduleEndAt: scheduleVerified ? end : null });
+      skuOrders, liveViews, roi, activityToday: campaign.activityToday, scheduleStartAt: scheduleVerified ? start : null, scheduleEndAt: scheduleVerified ? end : null });
   }
   campaigns.sort((a, b) => Number(b.operationStatus === "ENABLE") - Number(a.operationStatus === "ENABLE") ||
     b.campaignId.length - a.campaignId.length || b.campaignId.localeCompare(a.campaignId));
   return { reportingDate, observedAt: raw.observedAt, coverage: raw.coverage, campaigns };
 }
 
-export function createAutomationRouter({ viewerIds, readSnapshot, readPerformance, readCampaignDay, configuredExtraClients, verifiedExtras,
+export function createAutomationRouter({ viewerIds, readSnapshot, readPerformance, readCampaignDay, readUsername, configuredExtraClients, verifiedExtras,
   pendingReason, now = () => new Date() }: AutomationRouteDependencies) {
   const router = Router();
   let windowStart = -Infinity;
   const viewerRequests = new Map<number, number>();
   const registry = () => createAutomationReadRegistry({ extraConfig: configuredExtraClients?.(),
-    ppan: { readSnapshot, readPerformance, readCampaignDay }, verifiedExtras: verifiedExtras?.(), pendingReason });
+    ppan: { readSnapshot, readPerformance, readCampaignDay, readUsername }, verifiedExtras: verifiedExtras?.(), pendingReason });
 
   router.use((_req, res, next) => {
     res.set("Cache-Control", "no-store").vary("Authorization");
@@ -208,8 +212,10 @@ export function createAutomationRouter({ viewerIds, readSnapshot, readPerformanc
     try {
       if (!fixedGet(req, res)) return;
       const clients = await Promise.all(registry().map(async entry => {
-        const { view, accessReason } = await observe(entry);
+        const [{ view, accessReason }, tiktokUsername] = await Promise.all([observe(entry),
+          Promise.resolve().then(() => entry.adapter?.readUsername?.()).then(verifiedTikTokUsername).catch(() => null)]);
         return { ...entry.creator, tiktokAccountIdVerified: entry.creator.clientId === PPAN_AUTOMATION_CREATOR.clientId,
+          tiktokUsername,
           access: view ? "verified" : "unavailable", ...(accessReason ? { accessReason } : {}),
           observedAt: view?.observedAt ?? null, reportingDate: view?.reportingDate ?? null,
           campaign: view?.campaign ?? null, capMinor: null, actions: ACTIONS };
@@ -274,6 +280,7 @@ export function createAutomationRouter({ viewerIds, readSnapshot, readPerformanc
 const creatorSnapshot = createCreatorReader({ loadToken: loadCreatorToken });
 const creatorPerformance = createCreatorAutomationPerformance({ loadToken: loadCreatorToken });
 const creatorCampaignDay = createCreatorCampaignDayReader({ loadToken: loadCreatorToken }, CREATOR_BINDING);
+const creatorUsername = createCreatorIdentityUsernameReader({ loadToken: loadCreatorToken }, CREATOR_BINDING);
 const creatorReadEnabled = () => process.env.CREATOR_READ_ENABLED === "true";
 const configuredExtraClients = () => process.env.CREATOR_AUTOMATION_EXTRA_READ_CLIENTS;
 const configuredVerifiedBindings = () => process.env.CREATOR_AUTOMATION_VERIFIED_READ_BINDINGS;
@@ -297,4 +304,5 @@ export const automationRouter = createAutomationRouter({
   readSnapshot: () => creatorReadEnabled() ? creatorSnapshot() : Promise.resolve(null),
   readPerformance: scope => creatorReadEnabled() ? creatorPerformance(scope) : Promise.resolve(null),
   readCampaignDay: () => creatorReadEnabled() ? creatorCampaignDay() : Promise.resolve(null),
+  readUsername: () => creatorReadEnabled() ? creatorUsername() : Promise.resolve(null),
 });
