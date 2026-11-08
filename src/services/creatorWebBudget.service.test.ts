@@ -119,11 +119,23 @@ describe("Creator web budget workflow", () => {
     expect(await h.confirm(p.operationId)).toMatchObject({ status: "APPLIED_VERIFIED", observedBudgetMinor: TARGET });
     expect(await h.confirm(p.operationId)).toMatchObject({ status: "APPLIED_VERIFIED" });
     expect(h.trace).toEqual(["reserve", "lease", "dispatch", "finish", "release"]);
+    expect(h.adapters.readContext.mock.calls).toEqual([[CAMPAIGN, "manual"], [CAMPAIGN, "manual"]]);
     expect(h.adapters.dispatch).toHaveBeenCalledTimes(1);
     expect(h.adapters.dispatch).toHaveBeenCalledWith(expect.objectContaining({
-      targetBudgetMinor: TARGET, expectedBudgetMinor: CURRENT, nativeAutoOff: true, noConcurrentChanges: true,
+      targetBudgetMinor: TARGET, expectedBudgetMinor: CURRENT, nativeAutoOff: true, noConcurrentChanges: true, source: "manual",
       campaignCapMinor: 600_000, clientDailyCapMinor: 800_000, notAfter: "2026-06-09T04:01:00.000Z", canSend: expect.any(Function),
     }));
+  });
+
+  it("keeps manual-only read evidence out of Auto and gives a safe actionable manual read error", async () => {
+    const h = harness("live");
+    h.adapters.readContext.mockRejectedValueOnce(new Error("private provider diagnostics"));
+    await expect(h.service.prepare(OWNER, PREPARE)).rejects.toMatchObject({ code: "BUDGET_CONTEXT_UNVERIFIED", httpStatus: 409 });
+    expect(h.rows.size).toBe(0);
+    const p = await h.service.prepare(OWNER, PREPARE, "auto");
+    expect(h.adapters.readContext).toHaveBeenLastCalledWith(CAMPAIGN, "auto");
+    await expect(h.confirm(p.operationId)).rejects.toMatchObject({ code: "BUDGET_OPERATION_NOT_FOUND" });
+    expect(h.adapters.dispatch).not.toHaveBeenCalled();
   });
 
   it("retains uncertainty when response or exact readback is unavailable, and forbids a second operation", async () => {

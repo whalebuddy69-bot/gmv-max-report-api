@@ -7,6 +7,7 @@ export const CREATOR_BINDING = Object.freeze({
 export const CREATOR_APP_ID = "7667234745498992657";
 const BASE = "https://business-api.tiktok.com/open_api/v1.3";
 const ENDPOINTS = new Set(["/gmv_max/campaign/get/", "/campaign/gmv_max/info/", "/report/integrated/get/"]);
+const GMV_DAY_REPORT = "/gmv_max/report/get/";
 type Row = Record<string, any>;
 export class CreatorReadError extends Error {
   constructor(readonly code: string) { super(code); }
@@ -84,6 +85,11 @@ export function createCreatorReader(dependencies: CreatorReadDependencies) {
   return createReader(dependencies, "punpan_020", CREATOR_BINDING, false);
 }
 
+/** Fresh manual web preflight only; never used as status or Auto evidence. */
+export function createPpanManualBudgetReader(dependencies: CreatorReadDependencies) {
+  return createReader(dependencies, "punpan_020", CREATOR_BINDING, true, true);
+}
+
 /** Used only by the server's verified, separately configured extra read adapters. */
 export function createExtraCreatorReader(dependencies: CreatorReadDependencies, clientId: string, configured: CreatorReadBinding) {
   if (typeof clientId !== "string" || !/^[a-z][a-z0-9_-]{1,39}$/.test(clientId) || clientId === "punpan_020" ||
@@ -99,7 +105,7 @@ export function createExtraCreatorReader(dependencies: CreatorReadDependencies, 
 
 /** Cache belongs to this one immutable client binding and is never financial truth. */
 function createReader({ loadToken, fetchImpl = fetch, now = () => new Date(), sleep = ms => new Promise(r => setTimeout(r, ms)) }: CreatorReadDependencies,
-  clientId: string, binding: CreatorReadBinding, verifyAdvertiser: boolean) {
+  clientId: string, binding: CreatorReadBinding, verifyAdvertiser: boolean, manualPpanZero = false) {
   let cached: { at: number; value: Row } | undefined;
   let inFlight: Promise<Row> | undefined;
   async function read(): Promise<Row> {
@@ -109,13 +115,15 @@ function createReader({ loadToken, fetchImpl = fetch, now = () => new Date(), sl
     const deadline = Date.now() + 18_000;
     let calls = 0, lastStart = 0;
     async function get(endpoint: string, params: Row): Promise<Row> {
-      if (!(ENDPOINTS.has(endpoint) || (verifyAdvertiser && endpoint === "/advertiser/info/")) || ++calls > 10 || Date.now() >= deadline) throw new CreatorReadError("REQUEST_BOUNDARY");
+      if (!(ENDPOINTS.has(endpoint) || (verifyAdvertiser && endpoint === "/advertiser/info/") || (manualPpanZero && endpoint === GMV_DAY_REPORT)) ||
+        ++calls > (manualPpanZero ? 13 : 10) || Date.now() >= deadline) throw new CreatorReadError("REQUEST_BOUNDARY");
       if (lastStart) await sleep(Math.max(0, 500 - (Date.now() - lastStart)));
       lastStart = Date.now();
       const url = new URL(BASE + endpoint);
       for (const [key, value] of Object.entries(params)) url.searchParams.set(key, typeof value === "object" ? JSON.stringify(value) : String(value));
       try {
-        const response = await fetchImpl(url, { method: "GET", redirect: "error", headers: { "Access-Token": accessToken, Accept: "application/json" }, signal: AbortSignal.timeout(Math.max(1, Math.min(6000, deadline - Date.now()))) });
+        const response = await fetchImpl(url, { method: "GET", redirect: "error", headers: { "Access-Token": accessToken, Accept: "application/json",
+          ...(manualPpanZero ? { "Cache-Control": "no-cache" } : {}) }, signal: AbortSignal.timeout(Math.max(1, Math.min(6000, deadline - Date.now()))) });
         const payload = await body(response);
         if (!response.ok || payload.code !== 0 || !payload.data || typeof payload.data !== "object") throw new CreatorReadError(payload.code === 40001 ? "CREATOR_PERMISSION_DENIED" : "CREATOR_READ_REJECTED");
         return payload.data;
@@ -187,13 +195,15 @@ function createReader({ loadToken, fetchImpl = fetch, now = () => new Date(), sl
     const native = info.auto_budget?.auto_budget_enabled ?? info.auto_budget_enabled;
     base.nativeAutoBudgetState = native === true ? "ENABLED" : native === false ? "DISABLED" : "UNKNOWN";
     try {
-      let aggregate = 0, target = 0, rowCount = 0, expectedRows: number | undefined, reportPages: number | undefined;
+      let aggregate = 0, rowCount = 0, expectedRows: number | undefined, reportPages: number | undefined;
       const dimensions = new Set<string>();
+      const spendByCampaign = new Map<string, number>();
       for (let page = 1; page <= 3; page++) {
         const data = await get("/report/integrated/get/", { advertiser_id: binding.advertiserId, service_type: "AUCTION", report_type: "TT_SHOP", data_level: "AUCTION_CAMPAIGN",
           dimensions: ["campaign_id", "country_code", "stat_time_day"], metrics: ["spend"], start_date: date, end_date: date, page, page_size: 1000 });
         const pagination = data.page_info;
-        if (verifyAdvertiser && data.advertiser_id !== undefined && data.advertiser_id !== binding.advertiserId) {
+        if ((verifyAdvertiser && data.advertiser_id !== undefined && data.advertiser_id !== binding.advertiserId) ||
+          (manualPpanZero && data.currency !== undefined && data.currency !== "THB")) {
           throw new CreatorReadError("SPEND_SCOPE_UNVERIFIED");
         }
         if (!Array.isArray(data.list) || data.list.length > 1000 || pagination?.page !== page || !Number.isSafeInteger(pagination.total_page)
@@ -206,21 +216,30 @@ function createReader({ loadToken, fetchImpl = fetch, now = () => new Date(), sl
           if ((verifyAdvertiser && ((row?.advertiser_id !== undefined && row.advertiser_id !== binding.advertiserId) ||
               (dim?.advertiser_id !== undefined && dim.advertiser_id !== binding.advertiserId))) ||
             !accountId(dim?.campaign_id) || typeof dim.stat_time_day !== "string" || dim.stat_time_day.slice(0, 10) !== date
-            || typeof dim.country_code !== "string") throw new CreatorReadError("SPEND_SCOPE_UNVERIFIED");
-          const key = JSON.stringify([dim.campaign_id, dim.country_code, dim.stat_time_day]);
+            || typeof dim.country_code !== "string" || (manualPpanZero && (!sameReportDay(dim.stat_time_day, date) ||
+              (row.currency !== undefined && row.currency !== "THB") || (dim.currency !== undefined && dim.currency !== "THB")))) {
+            throw new CreatorReadError("SPEND_SCOPE_UNVERIFIED");
+          }
+          const key = JSON.stringify([dim.campaign_id, dim.country_code, manualPpanZero ? date : dim.stat_time_day]);
           if (dimensions.has(key)) throw new CreatorReadError("SPEND_DUPLICATE_ROW");
           dimensions.add(key); rowCount++;
           const value = minor(row.metrics?.spend);
           aggregate += value;
-          if (dim.campaign_id === campaignId) target += value;
+          spendByCampaign.set(dim.campaign_id, (spendByCampaign.get(dim.campaign_id) ?? 0) + value);
           if (!Number.isSafeInteger(aggregate)) throw new CreatorReadError("SPEND_TOTAL_UNVERIFIED");
         }
         if (page >= reportPages!) break;
         if (page === 3) throw new CreatorReadError("SPEND_PAGE_LIMIT");
       }
       if (rowCount !== expectedRows) throw new CreatorReadError("SPEND_TOTAL_UNVERIFIED");
-      // Absence of this campaign is not evidence of zero spend for the new Creator dialect.
-      if (!Array.from(dimensions).some(key => JSON.parse(key)[0] === campaignId)) throw new CreatorReadError("TARGET_SPEND_UNAVAILABLE");
+      let target = spendByCampaign.get(campaignId);
+      // A missing row never means zero. The manual-only exception requires a
+      // separate explicit provider zero and a complete account-wide baseline.
+      if (target === undefined) {
+        if (!manualPpanZero) throw new CreatorReadError("TARGET_SPEND_UNAVAILABLE");
+        await verifyPpanManualZero(get, binding, date, campaignId, spendByCampaign);
+        target = 0;
+      }
       base.campaign.spendMinor = target;
       base.quality.aggregateSpendMinor = aggregate;
       base.quality.aggregateSpendComplete = true;
@@ -233,4 +252,43 @@ function createReader({ loadToken, fetchImpl = fetch, now = () => new Date(), sl
     if (!inFlight) inFlight = read().then(value => { cached = { at: Date.now(), value }; return value; }).finally(() => { inFlight = undefined; });
     return inFlight;
   };
+}
+
+function sameReportDay(value: unknown, day: string): boolean { return value === day || value === `${day} 00:00:00`; }
+
+async function verifyPpanManualZero(get: (path: string, params: Row) => Promise<Row>, binding: CreatorReadBinding, date: string,
+  targetCampaignId: string, integrated: ReadonlyMap<string, number>) {
+  const fail = () => { throw new CreatorReadError("MANUAL_ZERO_SPEND_UNVERIFIED"); };
+  const seen = new Set<string>();
+  let pages: number | undefined, count: number | undefined;
+  for (let page = 1; page <= 3; page++) {
+    const data = await get(GMV_DAY_REPORT, { advertiser_id: binding.advertiserId, store_ids: ["0"], start_date: date, end_date: date,
+      dimensions: ["campaign_id", "stat_time_day"], metrics: ["cost", "all_shops_gross_revenue", "all_shops_orders", "live_views"],
+      filtering: { gmv_max_promotion_types: ["LIVE"], campaign_statuses: ["STATUS_ALL"] }, page, page_size: 100 });
+    const p = data.page_info;
+    if ((data.advertiser_id !== undefined && data.advertiser_id !== binding.advertiserId) || (data.currency !== undefined && data.currency !== "THB") ||
+      !Array.isArray(data.list) || data.list.length > 100 || p?.page !== page || (p.page_size !== undefined && p.page_size !== 100) ||
+      !Number.isSafeInteger(p.total_page) || p.total_page < 1 || p.total_page < page ||
+      !Number.isSafeInteger(p.total_number) || p.total_number < 1 ||
+      (pages !== undefined && pages !== p.total_page) || (count !== undefined && count !== p.total_number)) fail();
+    pages = p.total_page; count = p.total_number;
+    for (const row of data.list) {
+      const d = row?.dimensions;
+      if (!accountId(d?.campaign_id) || !sameReportDay(d.stat_time_day, date) || seen.has(d.campaign_id) ||
+        (row.advertiser_id !== undefined && row.advertiser_id !== binding.advertiserId) ||
+        (d.advertiser_id !== undefined && d.advertiser_id !== binding.advertiserId) ||
+        (row.store_id !== undefined && row.store_id !== "0") || (d.store_id !== undefined && d.store_id !== "0") ||
+        (row.currency !== undefined && row.currency !== "THB") || (d.currency !== undefined && d.currency !== "THB")) fail();
+      const cost = minor(row.metrics?.cost);
+      // Also reject disagreement that would raise the account total. Keep the
+      // integrated total (which covers all Shop ad campaigns on the account).
+      if (cost > (integrated.get(d.campaign_id) ?? 0)) fail();
+      seen.add(d.campaign_id);
+    }
+    if (page === pages) {
+      if (seen.size !== count || !seen.has(targetCampaignId)) fail();
+      return;
+    }
+  }
+  fail();
 }

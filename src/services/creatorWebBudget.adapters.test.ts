@@ -1,25 +1,33 @@
 import { describe, expect, it } from "vitest";
 import { CREATOR_BINDING } from "./creatorRead.service";
 import { createCreatorWebBudgetAdapters, createCreatorWebCapAdapters } from "./creatorWebBudget.adapters";
+import type { WebBudgetSource } from "./creatorWebBudget.service";
 import { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode, configuredPpanSpendTrendLive, creatorBudgetPolicyPath, type CreatorBudgetScope } from "./creatorBudgetScope";
 
 const NOW = "2025-03-15T09:00:00.000Z", TODAY = "2025-03-15", CAMPAIGN = "1234567890123456";
+const OTHER_CAMPAIGN = "1234567890123457", MISSING_CAMPAIGN = "1234567890123458";
 const OP = "5035df00-1801-4d02-8051-01affbbefdc9", KEY = "p".repeat(43), TOKEN = "synthetic-tiktok-adapter-key";
 const LEASE_END = "2025-03-15T09:00:55.000Z";
 const policy = { schemaVersion: 1, clientId: "punpan_020", revision: 4, campaignCapMinor: 600_000,
   clientDailyCapMinor: 700_000, readAt: NOW, locked: false };
 const SRIHIW = { clientId: "srihiw", advertiserId: "1234567890198765", tiktokAccountId: "1234567890198766",
   identityId: "synthetic-srihiw-identity", identityType: "BC_AUTH_TT" as const, identityAuthorizedBcId: "1234567890198767" };
+const dailyRow = (campaignId: string, cost: unknown = "0.00", dimensions = {}) => ({
+  dimensions: { campaign_id: campaignId, stat_time_day: `${TODAY} 00:00:00`, store_id: "0", ...dimensions }, metrics: { cost },
+});
+const pageInfo = (count: number, page = 1, pages = 1) => ({ page, total_page: pages, total_number: count });
 
 function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: boolean; spendTrend?: boolean; sriTrend?: boolean; legacy?: boolean; policyKey?: string;
   providerResult?: "unknown" | "reject" | "roi-drift" | "reject-with-drift"; readAt?: string;
-  extra?: boolean; extraLive?: boolean; extraClient?: "nnshop5719" | "ashopbytheta"; wrongProviderScope?: boolean } = {}) {
+  extra?: boolean; extraLive?: boolean; extraClient?: "nnshop5719" | "ashopbytheta"; wrongProviderScope?: boolean;
+  targetAbsent?: boolean; integrated?: Record<string, unknown>; daily?: (page: number) => unknown; currency?: string } = {}) {
   const calls: { host: string; path: string; method: string }[] = [];
   const extra = options.extraClient ? { ...SRIHIW, clientId: options.extraClient,
     advertiserId: options.extraClient === "nnshop5719" ? "1234567890198768" : "1234567890198769",
     identityId: `synthetic-${options.extraClient}-identity` } : options.extra ? SRIHIW : undefined;
   const binding = extra ?? CREATOR_BINDING;
   let budget = 2800, roi = 15, stamp = "2025-03-15 08:55:00", spend = "2100.09", otherSpend = "20.00";
+  let daily = options.daily ?? (() => ({ page_info: pageInfo(2), list: [dailyRow(CAMPAIGN), dailyRow(MISSING_CAMPAIGN, 0)] }));
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input));
     const method = init?.method ?? "GET";
@@ -60,7 +68,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
       return Response.json({ code: 0, data: { campaign_id: CAMPAIGN } });
     }
     if (url.pathname.endsWith("/advertiser/info/")) return Response.json({ code: 0, data: { list: [{ advertiser_id: binding.advertiserId,
-      timezone: "Asia/Bangkok", currency: "THB" }] } });
+      timezone: "Asia/Bangkok", currency: options.currency ?? "THB" }] } });
     expect(url.searchParams.get("advertiser_id")).toBe(binding.advertiserId);
     if (url.pathname.endsWith("/gmv_max/campaign/get/")) return Response.json({ code: 0, data: {
       page_info: { page: 1, total_page: 1, total_number: 1 }, list: [{ campaign_id: CAMPAIGN,
@@ -72,11 +80,21 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
       schedule_start_time: "2025-03-15 08:30:00", ...(options.nativeUnknown ? {} : { auto_budget_enabled: options.competing === true }),
       promotion_days: { is_enabled: false }, identity_list: [{ identity_id: binding.identityId,
         identity_type: binding.identityType, identity_authorized_bc_id: binding.identityAuthorizedBcId }] } });
+    if (url.pathname.endsWith("/gmv_max/report/get/")) {
+      expect(method).toBe("GET");
+      expect(headers.get("Cache-Control")).toBe("no-cache");
+      expect(url.searchParams.get("store_ids")).toBe('["0"]');
+      expect(url.searchParams.get("filtering")).toBe('{"gmv_max_promotion_types":["LIVE"],"campaign_statuses":["STATUS_ALL"]}');
+      expect(url.searchParams.get("start_date")).toBe(TODAY);
+      expect(url.searchParams.get("end_date")).toBe(TODAY);
+      return Response.json({ code: 0, data: daily(Number(url.searchParams.get("page"))) });
+    }
     expect(url.pathname).toBe("/open_api/v1.3/report/integrated/get/");
-    return Response.json({ code: 0, data: { page_info: { page: 1, total_page: 1, total_number: 2 }, list: [
-      { dimensions: { campaign_id: CAMPAIGN, country_code: "TH", stat_time_day: TODAY }, metrics: { spend } },
-      { dimensions: { campaign_id: "1234567890123457", country_code: "TH", stat_time_day: TODAY }, metrics: { spend: otherSpend } },
-    ] } });
+    const list = [
+      ...(options.targetAbsent ? [] : [{ dimensions: { campaign_id: CAMPAIGN, country_code: "TH", stat_time_day: TODAY }, metrics: { spend } }]),
+      { dimensions: { campaign_id: OTHER_CAMPAIGN, country_code: "TH", stat_time_day: TODAY }, metrics: { spend: otherSpend } },
+    ];
+    return Response.json({ code: 0, data: { page_info: pageInfo(list.length), list, ...options.integrated } });
   }) as typeof fetch;
   const adapters = createCreatorWebBudgetAdapters({ loadToken: async () => TOKEN, fetchImpl, now: () => new Date(NOW), sleep: async () => {},
     extraBinding: extra,
@@ -88,13 +106,78 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
         [`CREATOR_WEB_${options.extraClient.toUpperCase()}_BUDGET_LIVE_ENABLED`]: options.extraLive ? "true" : "false" } : {}),
       CREATOR_BUDGET_TEST_ENABLED: options.legacy ? "true" : "false", CREATOR_WEB_POLICY_BRIDGE_KEY: options.policyKey ?? KEY } });
   return { adapters, calls, edit(value: number) { budget = value; stamp = "2025-03-15 08:59:30"; }, setSpend(value: string) { spend = value; },
-    setOtherSpend(value: string) { otherSpend = value; }, async input(targetBudgetMinor = 310_000) {
-      const ctx = await adapters.readContext(CAMPAIGN);
+    setOtherSpend(value: string) { otherSpend = value; }, setDaily(value: typeof daily) { daily = value; },
+    async input(targetBudgetMinor = 310_000, source?: WebBudgetSource) {
+      const ctx = await adapters.readContext(CAMPAIGN, source);
       return { campaignId: CAMPAIGN, reportingDate: TODAY, expectedBudgetMinor: ctx.budgetMinor, targetBudgetMinor,
         fingerprint: ctx.fingerprint, notAfter: LEASE_END, campaignCapMinor: policy.campaignCapMinor, clientDailyCapMinor: policy.clientDailyCapMinor,
-        nativeAutoOff: true as const, noConcurrentChanges: true as const, canSend: async () => true };
+        source, nativeAutoOff: true as const, noConcurrentChanges: true as const, canSend: async () => true };
     }, providerPosts() { return calls.filter(c => c.host === "business-api.tiktok.com" && c.method === "POST"); } };
 }
+
+describe("Ppan manual-only verified zero spend", () => {
+  it("keeps the integrated account total when the complete GMV day has an explicit zero for each omitted row", async () => {
+    const h = harness({ targetAbsent: true, daily: page => ({ page_info: pageInfo(3, page, 2),
+      list: page === 1 ? [dailyRow(OTHER_CAMPAIGN, 20), dailyRow(MISSING_CAMPAIGN, 0)] : [dailyRow(CAMPAIGN)] }) });
+    const read = await h.adapters.readContext(CAMPAIGN, "manual");
+    expect(read).toMatchObject({ campaignId: CAMPAIGN, reportingDate: TODAY, spendMinor: 0, aggregateSpendMinor: 2_000,
+      providerSpendObservedAt: null, deliveryVerified: false });
+    const input = await h.input(310_000, "manual");
+    expect(await h.adapters.dispatch(input)).toMatchObject({ outcome: "APPLIED_VERIFIED", observedBudgetMinor: 310_000 });
+    expect(h.calls.filter(x => x.path.endsWith("/gmv_max/report/get/"))).toHaveLength(6);
+    expect(h.providerPosts()).toHaveLength(1);
+  });
+
+  it.each([
+    ["no exact row", [dailyRow(MISSING_CAMPAIGN)]],
+    ["no explicit cost", [dailyRow(CAMPAIGN, null)]],
+    ["nonzero exact cost", [dailyRow(CAMPAIGN, "0.01")]],
+    ["nonzero other omitted cost", [dailyRow(CAMPAIGN), dailyRow(MISSING_CAMPAIGN, "0.01")]],
+    ["unknown other omitted cost", [dailyRow(CAMPAIGN), dailyRow(MISSING_CAMPAIGN, "--")]],
+    ["dedicated cost higher than integrated", [dailyRow(CAMPAIGN), dailyRow(OTHER_CAMPAIGN, "20.01")]],
+    ["duplicate target", [dailyRow(CAMPAIGN), dailyRow(CAMPAIGN)]],
+    ["wrong date", [dailyRow(CAMPAIGN, 0, { stat_time_day: "2025-03-14" })]],
+    ["foreign advertiser", [dailyRow(CAMPAIGN, 0, { advertiser_id: "1234567890198765" })]],
+    ["Shop row", [dailyRow(CAMPAIGN, 0, { store_id: OTHER_CAMPAIGN })]],
+  ])("does not substitute zero with %s", async (_label, list) => {
+    const h = harness({ targetAbsent: true, daily: () => ({ page_info: pageInfo(list.length), list }) });
+    await expect(h.adapters.readContext(CAMPAIGN, "manual")).rejects.toThrow("UNVERIFIED");
+    expect(h.providerPosts()).toHaveLength(0);
+  });
+
+  it("does not fall back from incomplete/mis-scoped integrated spend, wrong currency, or an incomplete dedicated day", async () => {
+    for (const h of [harness({ targetAbsent: true, integrated: { page_info: pageInfo(2) } }),
+      harness({ targetAbsent: true, integrated: { advertiser_id: SRIHIW.advertiserId } }), harness({ targetAbsent: true, currency: "USD" })]) {
+      await expect(h.adapters.readContext(CAMPAIGN, "manual")).rejects.toThrow();
+      expect(h.calls.some(x => x.path.endsWith("/gmv_max/report/get/"))).toBe(false);
+    }
+    const truncated = harness({ targetAbsent: true, daily: () => ({ page_info: pageInfo(2), list: [dailyRow(CAMPAIGN)] }) });
+    await expect(truncated.adapters.readContext(CAMPAIGN, "manual")).rejects.toThrow("UNVERIFIED");
+  });
+
+  it("refuses normal and trend Auto, keeps other creators unchanged, and rechecks the manual fallback before send", async () => {
+    const h = harness({ targetAbsent: true, spendTrend: true });
+    await expect(h.adapters.readContext(CAMPAIGN)).rejects.toThrow("UNVERIFIED");
+    await expect(h.adapters.readContext(CAMPAIGN, "auto")).rejects.toThrow("UNVERIFIED");
+    await expect(harness({ extra: true, extraLive: true, targetAbsent: true }).adapters.readContext(CAMPAIGN, "manual")).rejects.toThrow("UNVERIFIED");
+    expect(h.calls.some(x => x.path.endsWith("/gmv_max/report/get/"))).toBe(false);
+    const input = await h.input(336_000, "manual");
+    const { nativeAutoOff: _, noConcurrentChanges: __, ...common } = input;
+    expect(await h.adapters.dispatch({ ...input, source: "auto" })).toEqual({ outcome: "NOT_SENT" });
+    expect(await h.adapters.dispatch({ ...common, evidenceMode: "spend-trend" })).toEqual({ outcome: "NOT_SENT" });
+    h.setDaily(() => ({ page_info: pageInfo(1), list: [dailyRow(CAMPAIGN, "0.01")] }));
+    expect(await h.adapters.dispatch(input)).toEqual({ outcome: "NOT_SENT" });
+    expect(h.providerPosts()).toHaveLength(0);
+  });
+
+  it("includes other integrated spend when rejecting a manual fallback budget that exceeds the total cap", async () => {
+    const h = harness({ targetAbsent: true });
+    const input = await h.input(310_000, "manual");
+    h.setOtherSpend("4000.01");
+    expect(await h.adapters.dispatch(input)).toEqual({ outcome: "NOT_SENT" });
+    expect(h.providerPosts()).toHaveLength(0);
+  });
+});
 
 describe("Ppan web budget boundary", () => {
   it("reads fixed policy with a distinct key and validates lease/outcome envelopes", async () => {

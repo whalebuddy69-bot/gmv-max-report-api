@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { bangkokDay, CREATOR_BINDING, createCreatorReader, createExtraCreatorReader, minor } from "./creatorRead.service";
+import { bangkokDay, CREATOR_BINDING, createCreatorReader, createExtraCreatorReader, createPpanManualBudgetReader, minor } from "./creatorRead.service";
 import type { AutomationVerifiedCreatorBinding } from "./creatorAutomationRegistry.service";
 import { configuredCreatorWebBudgetMode, configuredCreatorSpendTrendLive, creatorBudgetPolicyPath, isExtraCreatorBudgetScope, type CreatorBudgetScope } from "./creatorBudgetScope";
-import { WEB_BUDGET_MAX_MINOR, WebBudgetError, type WebBudgetAdapters } from "./creatorWebBudget.service";
+import { WEB_BUDGET_MAX_MINOR, WebBudgetError, type WebBudgetAdapters, type WebBudgetSource } from "./creatorWebBudget.service";
 
 const POLICY_ORIGIN = "https://whale-buddy-ads-control-plane.onrender.com/internal/automation";
 const TIKTOK = "https://business-api.tiktok.com/open_api/v1.3";
@@ -222,15 +222,17 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     return { budgetMinor, stamp: row.modify_time, unchanged, native, fingerprint: hash([budgetMinor, row.modify_time, unchanged]) };
   }
 
-  async function context(expectedCampaignId: string, accessToken: string) {
+  async function context(expectedCampaignId: string, accessToken: string, source?: WebBudgetSource) {
     const deps = { loadToken: async () => accessToken, fetchImpl, now, sleep };
-    const raw = await (extraBinding ? createExtraCreatorReader(deps, clientId, extraBinding) : createCreatorReader(deps))();
+    const read = extraBinding ? createExtraCreatorReader(deps, clientId, extraBinding)
+      : source === "manual" ? createPpanManualBudgetReader(deps) : createCreatorReader(deps);
+    const raw = await read();
     const c = object(raw.campaign), quality = object(raw.quality);
+    if (c.campaignId !== expectedCampaignId || quality.aggregateSpendComplete !== true ||
+      !nonnegative(c.spendMinor) || !nonnegative(quality.aggregateSpendMinor) || quality.aggregateSpendMinor < c.spendMinor) unverified();
     const live = await sample(expectedCampaignId, accessToken);
     const at = now();
-    if (raw.reportingDate !== bangkokDay(at) || !fresh(raw.observedAt, at.getTime(), 25_000) ||
-      c.campaignId !== expectedCampaignId || c.dailyBudgetMinor !== live.budgetMinor || quality.aggregateSpendComplete !== true ||
-      !nonnegative(c.spendMinor) || !nonnegative(quality.aggregateSpendMinor) || quality.aggregateSpendMinor < c.spendMinor) unverified();
+    if (raw.reportingDate !== bangkokDay(at) || !fresh(raw.observedAt, at.getTime(), 25_000) || c.dailyBudgetMinor !== live.budgetMinor) unverified();
     // The currently verified Creator report has no provider timestamp for
     // today's spend and ENABLE is not proof that a LIVE is delivering. Do
     // not substitute fetch time, campaign modification time or a default.
@@ -264,9 +266,9 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
       if (raw.schemaVersion !== 1 || raw.operationId !== operationId || raw.outcome !== outcome ||
         raw.locked !== (outcome === "OUTCOME_UNKNOWN")) unverified();
     },
-    async readContext(expectedCampaignId) {
+    async readContext(expectedCampaignId, source) {
       if (env.CREATOR_READ_ENABLED !== "true" || !ID.test(expectedCampaignId)) unverified();
-      const { sample: _, ...result } = await context(expectedCampaignId, await token());
+      const { sample: _, ...result } = await context(expectedCampaignId, await token(), source);
       return result;
     },
     async dispatch(input) {
@@ -284,7 +286,7 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
           !positive(input.campaignCapMinor) || !positive(input.clientDailyCapMinor) || input.targetBudgetMinor > input.campaignCapMinor ||
           !/^[a-f0-9]{64}$/.test(input.fingerprint) || !validIso(input.notAfter)) unverified();
         const accessToken = await token();
-        const latest = await context(input.campaignId, accessToken);
+        const latest = await context(input.campaignId, accessToken, input.evidenceMode === undefined ? input.source : undefined);
         const before = latest.sample;
         if (await input.canSend(latest) !== true) unverified();
         const at = now();

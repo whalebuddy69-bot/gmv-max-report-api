@@ -37,13 +37,14 @@ export type WebBudgetDispatch = WebBudgetAuthorization & {
   campaignId: string; reportingDate: string; expectedBudgetMinor: number; targetBudgetMinor: number;
   campaignCapMinor: number; clientDailyCapMinor: number;
   fingerprint: string; notAfter: string;
+  source?: WebBudgetSource;
   canSend: (latest: WebBudgetContext) => Promise<boolean>;
 }
 export interface WebBudgetAdapters {
   readPolicy(): Promise<WebBudgetPolicy>;
   acquireLease(operationId: string, revision: number, autoBudget?: WebAutoBudgetProof): Promise<WebBudgetPolicy & { operationId: string; expiresAt: string }>;
   finishLease(operationId: string, outcome: WebBudgetOutcome): Promise<void>;
-  readContext(expectedCampaignId: string): Promise<WebBudgetContext>;
+  readContext(expectedCampaignId: string, source?: WebBudgetSource): Promise<WebBudgetContext>;
   dispatch(input: WebBudgetDispatch): Promise<{ outcome: WebBudgetOutcome; observedBudgetMinor?: number; observedFingerprint?: string }>;
 }
 export interface WebBudgetProposal {
@@ -129,8 +130,13 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
   store: WebBudgetStore; adapters: WebBudgetAdapters; mode: () => WebBudgetMode; clientId?: CreatorBudgetScope; now?: () => Date;
 }) {
   async function getPolicy() { return checkPolicy(await adapters.readPolicy(), now().getTime()); }
-  async function validatedInputs(campaignId: string, current: number, target: number) {
-    const [rawCap, rawContext] = await Promise.all([adapters.readPolicy(), adapters.readContext(campaignId)]);
+  async function validatedInputs(campaignId: string, current: number, target: number, source: WebBudgetSource) {
+    const [rawCap, rawContext] = await Promise.all([adapters.readPolicy(), adapters.readContext(campaignId, source).catch(error => {
+      if (source === "manual" && !(error instanceof WebBudgetError)) {
+        reject("BUDGET_CONTEXT_UNVERIFIED", 409, "ยังยืนยันงบและยอดใช้ล่าสุดไม่ครบ กรุณาลองใหม่");
+      }
+      throw error;
+    })]);
     const timestamp = now().getTime(), cap = checkPolicy(rawCap, timestamp);
     if (cap.locked) reject("BUDGET_POLICY_LOCKED", 409, "ยังมีรายการปรับงบที่ต้องยืนยันผลก่อน");
     const context = checkContext(rawContext, campaignId, current, timestamp);
@@ -162,7 +168,7 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
         reject("BUDGET_INPUT_INVALID", 400, "แคมเปญหรืองบไม่ถูกต้อง");
       }
       if (await store.hasFence()) reject("BUDGET_WRITE_FENCED", 409, "ยังมีรายการปรับงบที่ต้องตรวจผลก่อน");
-      const { cap, context, projected, timestamp } = await validatedInputs(input.expectedCampaignId, input.expectedBudgetMinor, input.targetBudgetMinor);
+      const { cap, context, projected, timestamp } = await validatedInputs(input.expectedCampaignId, input.expectedBudgetMinor, input.targetBudgetMinor, source);
       const endOfDay = Date.parse(`${context.reportingDate}T00:00:00+07:00`) + 86_400_000;
       const expiresAt = Math.min(timestamp + PROPOSAL_TTL_MS, endOfDay);
       if (expiresAt - timestamp < MIN_SEND_WINDOW_MS || mode() !== activeMode) reject("BUDGET_MODE_CHANGED", 409, "กรุณาเปิดรายการใหม่อีกครั้ง");
@@ -201,7 +207,9 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
       let reason = "PREFLIGHT_BLOCKED", observedBudgetMinor: number | null = null, observedFingerprint: string | undefined;
       let leaseAttempted = false, dispatchInvoked = false;
       try {
-        const { cap, context } = await validatedInputs(reserved.campaignId, reserved.currentBudgetMinor, reserved.targetBudgetMinor);
+        const source = reserved.source ?? "manual";
+        if (source !== (initial.source ?? "manual")) reject("BUDGET_PRECONDITION_CHANGED", 409, "รายการเปลี่ยน กรุณาเปิดรายการใหม่");
+        const { cap, context } = await validatedInputs(reserved.campaignId, reserved.currentBudgetMinor, reserved.targetBudgetMinor, source);
         if (!sameCap(reserved.cap, cap) || context.reportingDate !== reserved.reportingDate || context.fingerprint !== reserved.fingerprint) {
           reject("BUDGET_PRECONDITION_CHANGED", 409, "งบหรือเพดานเปลี่ยน กรุณาเปิดรายการใหม่");
         }
@@ -229,7 +237,7 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
           dispatchInvoked = true;
           const sent = await adapters.dispatch({ campaignId: reserved.campaignId, reportingDate: reserved.reportingDate,
             expectedBudgetMinor: reserved.currentBudgetMinor, targetBudgetMinor: reserved.targetBudgetMinor, fingerprint: reserved.fingerprint,
-            campaignCapMinor: lease.campaignCapMinor, clientDailyCapMinor: lease.clientDailyCapMinor,
+            campaignCapMinor: lease.campaignCapMinor, clientDailyCapMinor: lease.clientDailyCapMinor, source,
             notAfter: new Date(deadline).toISOString(), ...(useTrend ? { evidenceMode: "spend-trend" as const }
               : { nativeAutoOff: true as const, noConcurrentChanges: true as const }),
             canSend: async latest => mode() === "live" && await recheckOperator() &&
