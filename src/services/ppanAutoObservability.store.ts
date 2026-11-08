@@ -56,7 +56,13 @@ const SCOPE = "punpan_020";
 const ERROR_REASONS_SQL = "'CONTEXT_UNAVAILABLE','LINE_NOT_READY','ERROR'";
 const HEALTH_TABLE = "creator_ppan_auto_observability";
 const ALERT_TABLE = "creator_ppan_auto_health_alerts";
+const EPOCH_TABLE = "creator_ppan_auto_observability_epoch";
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS ${EPOCH_TABLE} (
+  client_id text PRIMARY KEY CHECK (client_id='${SCOPE}'),
+  installed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+INSERT INTO ${EPOCH_TABLE}(client_id) VALUES ('${SCOPE}') ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS ${HEALTH_TABLE} (
   client_id text PRIMARY KEY CHECK (client_id='${SCOPE}'),
   session_id uuid,
@@ -107,8 +113,9 @@ ORDER BY w.updated_at DESC,a.operation_id LIMIT 6`;
 const READ_HEALTH = `WITH session AS (SELECT session_id,authorized_at,status FROM creator_continuous_auto_budget_sessions
   WHERE client_id='${SCOPE}' AND owner_id=$1 ORDER BY created_order DESC LIMIT 1)
 SELECT h.checked_at,h.last_valid_read_at,h.reason,
-  s.status IN ('ACTIVE','BLOCKED') AND COALESCE(h.checked_at,s.authorized_at)<=clock_timestamp()-interval '3 minutes' AS heartbeat_stale
-FROM session s LEFT JOIN ${HEALTH_TABLE} h ON h.client_id='${SCOPE}' AND h.session_id=s.session_id`;
+  s.status IN ('ACTIVE','BLOCKED') AND COALESCE(h.checked_at,GREATEST(s.authorized_at,e.installed_at))<=clock_timestamp()-interval '3 minutes' AS heartbeat_stale
+FROM session s LEFT JOIN ${HEALTH_TABLE} h ON h.client_id='${SCOPE}' AND h.session_id=s.session_id
+LEFT JOIN ${EPOCH_TABLE} e ON e.client_id='${SCOPE}'`;
 
 // An independent monitor can read the same stable incident and reuse its single persisted retry key.
 // Do not use this service's in-process timer to claim availability monitoring when the process is down.
@@ -118,10 +125,11 @@ const ALERT_CANDIDATE = `WITH latest AS (
 ), findings AS (
   SELECT s.session_id,f.kind,f.incident_key,f.priority
   FROM latest s LEFT JOIN ${HEALTH_TABLE} h ON h.client_id='${SCOPE}' AND h.session_id=s.session_id
+  LEFT JOIN ${EPOCH_TABLE} e ON e.client_id='${SCOPE}'
   CROSS JOIN LATERAL (VALUES
     ('OUTCOME_UNKNOWN', CASE WHEN s.last_outcome='OUTCOME_UNKNOWN' THEN s.operation_id::text END, 1),
-    ('HEARTBEAT_STALE', CASE WHEN s.status IN ('ACTIVE','BLOCKED') AND COALESCE(h.checked_at,s.authorized_at)<=clock_timestamp()-interval '3 minutes'
-      THEN floor(extract(epoch FROM COALESCE(h.checked_at,s.authorized_at))*1000)::bigint::text END, 2),
+    ('HEARTBEAT_STALE', CASE WHEN s.status IN ('ACTIVE','BLOCKED') AND COALESCE(h.checked_at,GREATEST(s.authorized_at,e.installed_at))<=clock_timestamp()-interval '3 minutes'
+      THEN floor(extract(epoch FROM COALESCE(h.checked_at,GREATEST(s.authorized_at,e.installed_at)))*1000)::bigint::text END, 2),
     ('CHECKS_FAILING', CASE WHEN s.status='ACTIVE' AND h.failing_since<=clock_timestamp()-interval '3 minutes'
       THEN floor(extract(epoch FROM h.failing_since)*1000)::bigint::text END, 3)
   ) f(kind,incident_key,priority)

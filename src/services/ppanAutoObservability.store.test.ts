@@ -94,6 +94,12 @@ describe("Ppan Auto observability", () => {
     const session = await arm(h);
     expect(await h.obs.watchdog()).toBeNull();
     await h.db.query("UPDATE creator_continuous_auto_budget_sessions SET authorized_at=clock_timestamp()-interval '5 minutes' WHERE session_id=$1", [session.sessionId]);
+    // A pre-existing authorization is not evidence that the newly installed
+    // monitor missed a tick. Only the monitor's own elapsed time counts.
+    expect(await h.obs.watchdog()).toBeNull();
+    expect((await h.obs.status(OWNER)).heartbeatStale).toBe(false);
+    await h.db.query("UPDATE creator_ppan_auto_observability_epoch SET installed_at=clock_timestamp()-interval '5 minutes' WHERE client_id='punpan_020'");
+    await h.obs.ensureSchema(); // Restart must not reset the persisted window.
     const stale = (await h.obs.watchdog())!;
     expect(stale).toMatchObject({ kind: "HEARTBEAT_STALE", sessionId: session.sessionId });
     expect((await h.obs.status(OWNER)).heartbeatStale).toBe(true);
