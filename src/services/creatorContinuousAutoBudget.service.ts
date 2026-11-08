@@ -73,13 +73,13 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     const timestamp = instant(ctx.observedAt), anchor = Math.max(instant(row.authorizedAt), row.lastVerifiedAt ? instant(row.lastVerifiedAt) : 0);
     if (!Number.isFinite(anchor) || timestamp <= anchor || !Number.isSafeInteger(ctx.spendMinor) || ctx.spendMinor < 0) {
       pulse = undefined;
-      return false;
+      return null;
     }
     const key = `${row.sessionId}:${ctx.reportingDate}:${ctx.fingerprint}:${anchor}`;
     const previous = pulse, gap = previous ? timestamp - previous.at : NaN;
-    if (previous?.key === key && gap >= 0 && gap < 40_000 && ctx.spendMinor >= previous.spend) return false;
+    if (previous?.key === key && gap >= 0 && gap < 40_000 && ctx.spendMinor >= previous.spend) return null;
     pulse = { key, at: timestamp, spend: ctx.spendMinor };
-    return previous?.key === key && gap >= 40_000 && gap <= 95_000 && ctx.spendMinor > previous.spend;
+    return previous?.key === key && gap >= 40_000 && gap <= 95_000 && ctx.spendMinor > previous.spend ? previous.spend : null;
   }
   async function read(campaignId: string) {
     const [context, policy, fenced] = await Promise.all([adapters.readContext(campaignId), adapters.readPolicy(), ledger.hasFence()]);
@@ -194,22 +194,30 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       const current = row;
       const verdict = preview(context, policy, at);
       if (blockers(context, policy, fenced, at, evidence, current).length) { pulse = undefined; return; }
-      const moving = !trend || observeTrend(current, context);
-      if (!moving || verdict.status !== "WOULD_INCREASE" || mode() !== "live" || evidenceMode() !== evidence) return;
+      const previousSpend = trend ? observeTrend(current, context) : null;
+      if ((trend && previousSpend === null) || verdict.status !== "WOULD_INCREASE" || mode() !== "live" || evidenceMode() !== evidence) return;
       const op = await writer.prepare(row.ownerId, { expectedCampaignId: row.campaignId,
         expectedBudgetMinor: row.baselineBudgetMinor, targetBudgetMinor: verdict.targetBudgetMinor }, "auto");
       if (!await sessions.reserve(row, op.operationId, verdict.targetBudgetMinor)) return;
+      if (trend) pulse = undefined; // Even a proven never-sent attempt needs a new pair.
       const allowed = async () => mode() === "live" && evidenceMode() === evidence && await recheckOwner(current.ownerId, current.authorizedAt) && await sessions.isReserved(current, op.operationId);
       await writer.confirm(row.ownerId, { operationId: op.operationId,
         ...(trend ? { evidenceMode: "spend-trend" as const } : { nativeAutoOff: true as const, noConcurrentChanges: true as const }) }, allowed,
         async (latest, latestPolicy) => {
           const nowAt = now(), decision = preview(latest, latestPolicy, nowAt);
-          return latest.campaignId === current.campaignId && (trend ? latest.reportingDate === context.reportingDate &&
-            instant(latest.observedAt) >= instant(context.observedAt) && latest.spendMinor >= context.spendMinor
-            : hasRoom(latest) && latest.liveSessionId === current.liveSessionId) &&
-            latest.budgetMinor === current.baselineBudgetMinor && latest.fingerprint === current.baselineFingerprint && latestPolicy.revision === current.policyRevision &&
-            !blockers(latest, latestPolicy, false, nowAt, evidence, current).length && decision.status === "WOULD_INCREASE" &&
-            decision.targetBudgetMinor === verdict.targetBudgetMinor && await allowed();
+          const signal = trend ? previousSpend !== null && latest.reportingDate === context.reportingDate &&
+            instant(latest.observedAt) >= instant(context.observedAt) && latest.spendMinor > previousSpend
+            : hasRoom(latest) && latest.liveSessionId === current.liveSessionId;
+          const same = latest.campaignId === current.campaignId && latest.budgetMinor === current.baselineBudgetMinor &&
+            latest.fingerprint === current.baselineFingerprint && latestPolicy.revision === current.policyRevision;
+          const eligible = decision.status === "WOULD_INCREASE" && decision.targetBudgetMinor === verdict.targetBudgetMinor &&
+            !blockers(latest, latestPolicy, false, nowAt, evidence, current).length;
+          if (trend && (!signal || !same || !eligible)) throw new WebBudgetError(!signal ? "PPAN_TREND_PREFLIGHT_SIGNAL" :
+            !same ? "PPAN_TREND_PREFLIGHT_BASELINE" : "PPAN_TREND_PREFLIGHT_POLICY", 409, "ข้อมูลเปลี่ยนระหว่างตรวจซ้ำ");
+          if (!signal || !same || !eligible) return false;
+          const authorized = await allowed();
+          if (trend && !authorized) throw new WebBudgetError("PPAN_TREND_PREFLIGHT_AUTHORITY", 409, "ยืนยันสิทธิ์ปรับงบไม่สำเร็จ");
+          return authorized;
         }, "floor-satang");
       await reconcile({ ...row, operationId: op.operationId });
     } catch (error) { pulse = undefined; throw error; } finally { busy = false; }

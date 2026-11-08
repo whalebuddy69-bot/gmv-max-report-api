@@ -29,6 +29,7 @@ function fixture(mode: "shadow" | "live" = "live", evidence: "verified-room" | "
   const records = new Map<string, WebBudgetRecord>();
   const writes: number[] = [];
   const lineOutbox = new Set<string>();
+  let nextReservedSpend: number | undefined;
   const getOp = (ownerId: number, operationId: string) => {
     const record = records.get(operationId);
     return record?.ownerId === ownerId ? record : null;
@@ -42,6 +43,7 @@ function fixture(mode: "shadow" | "live" = "live", evidence: "verified-room" | "
       if (row?.status !== "PREPARED") return null;
       const pending = { ...row, status: "PROCESSING" as const };
       records.set(id, pending);
+      if (nextReservedSpend !== undefined) { context = { ...context, spendMinor: nextReservedSpend }; nextReservedSpend = undefined; }
       return pending;
     }),
     finish: vi.fn(async (owner, id, result) => {
@@ -74,8 +76,9 @@ function fixture(mode: "shadow" | "live" = "live", evidence: "verified-room" | "
     markUnknown: vi.fn(async (prior, id) => isPending(prior, id) ? save({ status: "BLOCKED", lastOutcome: "OUTCOME_UNKNOWN" }) : null),
     settleVerified: vi.fn(async (prior, id, next) => isPending(prior, id) ? save({ operationId: null,
       baselineBudgetMinor: next.budgetMinor, baselineFingerprint: next.fingerprint, lastOutcome: "APPLIED_VERIFIED", lastVerifiedAt: ts(clock) }) : null),
-    settleNotSent: vi.fn(async (prior, id) => isPending(prior, id) ? save({ status: "STOPPED", operationId: null,
-      lastOutcome: "NOT_SENT", stopReason: "NOT_SENT" }) : null),
+    settleNotSent: vi.fn(async (prior, id) => isPending(prior, id) ? save({ ...(prior.evidenceMode === "spend-trend" && session?.status === "ACTIVE" &&
+      records.get(id)?.status === "NOT_SENT" ? {} : { status: "STOPPED" as const, stopReason: "NOT_SENT" as const }),
+      operationId: null, lastOutcome: "NOT_SENT" }) : null),
     stop: vi.fn(async (owner, id, reason = "OPERATOR_STOPPED") => session && session.ownerId === owner && session.sessionId === id
       ? save({ status: "STOPPED", stopReason: reason }) : null),
   };
@@ -100,6 +103,7 @@ function fixture(mode: "shadow" | "live" = "live", evidence: "verified-room" | "
     ledger, recheckOwner: async (owner, authorizedAt) => owner === OWNER && authorizedAt === session?.authorizedAt,
     legacyBusy: async () => false, evidenceMode: () => evidence, now });
   return { service, sessions, discover, dispatch, ledger, writes, lineOutbox, readContext: () => context,
+    nextReservedSpend: (spend: number) => { nextReservedSpend = spend; },
     arm: () => service.arm(OWNER, evidence === "spend-trend" ? { expectedCampaignId: CAMPAIGN, expectedBudgetMinor: ORIGINAL_BUDGET,
       expectedPolicyRevision: CAP_REVISION, evidenceMode: evidence } : CONFIRM, async () => true),
     refresh: (deltaMs = 0, changes: Partial<WebBudgetContext> = {}) => {
@@ -259,6 +263,29 @@ describe("Ppan opted-in spend-trend Auto", () => {
     f.discover.mockResolvedValue(null);
     await f.service.tick();
     expect(await f.sessions.getLatest()).toMatchObject({ status: "STOPPED", stopReason: "CAMPAIGN_ENDED" });
+  });
+
+  it("handles mixed provider replicas and only tries again after a new pair following proven no-send", async () => {
+    const f = fixture("live", "spend-trend");
+    f.refresh(0, unverified);
+    await f.arm();
+    f.refresh(60_000);
+    await f.service.tick();
+    f.refresh(60_000, { spendMinor: ORIGINAL_THRESHOLD + 30 });
+    f.nextReservedSpend(ORIGINAL_THRESHOLD);
+    await f.service.tick();
+    expect(f.dispatch).not.toHaveBeenCalled();
+    expect(await f.sessions.getLatest()).toMatchObject({ status: "ACTIVE", lastOutcome: "NOT_SENT", operationId: null });
+    expect(f.ledger.finish).toHaveBeenCalledWith(OWNER, expect.any(String), expect.objectContaining({ reason: "PPAN_TREND_PREFLIGHT_SIGNAL" }));
+
+    f.refresh(60_000, { spendMinor: ORIGINAL_THRESHOLD + 10 });
+    await f.service.tick();
+    expect(f.writes).toEqual([]);
+    f.refresh(60_000, { spendMinor: ORIGINAL_THRESHOLD + 30 });
+    f.nextReservedSpend(ORIGINAL_THRESHOLD + 20);
+    await f.service.tick();
+    expect(f.writes).toEqual([780_000]);
+    expect(f.lineOutbox.size).toBe(1);
   });
 
   it("adopts a separately changed budget, but never writes above the cap", async () => {

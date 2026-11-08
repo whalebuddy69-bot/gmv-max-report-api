@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS creator_continuous_auto_budget_attempts (
 
 // Upgrade exactly the published v1 constraints. The existing tables, client scope,
 // open-session index, historical rows and consumed fingerprints are retained.
-const CREATOR_CONTINUOUS_SPEND_TREND_SCHEMA_SQL = `
+export const CREATOR_CONTINUOUS_SPEND_TREND_SCHEMA_SQL = `
 DO $creator_continuous_evidence$
 DECLARE
   native_checks name[];
@@ -126,6 +126,59 @@ BEGIN
     );
 END
 $creator_continuous_evidence$;`;
+
+// Keep each historical attempt and its writer outcome. Only a durable exact
+// NOT_SENT proof may release the fingerprint, and only for spend-trend.
+const CREATOR_CONTINUOUS_SAFE_RETRY_SCHEMA_SQL = `
+DO $creator_continuous_retry$
+DECLARE
+  old_keys name[];
+  scope_columns smallint[];
+  retry_index constant text := 'creator_continuous_auto_attempt_unreleased_v3';
+  attempts constant regclass := 'creator_continuous_auto_budget_attempts'::regclass;
+BEGIN
+  SELECT ARRAY[
+      (SELECT attnum FROM pg_attribute WHERE attrelid=attempts AND attname='client_id' AND NOT attisdropped),
+      (SELECT attnum FROM pg_attribute WHERE attrelid=attempts AND attname='campaign_id' AND NOT attisdropped),
+      (SELECT attnum FROM pg_attribute WHERE attrelid=attempts AND attname='baseline_fingerprint' AND NOT attisdropped)
+    ]::smallint[] INTO scope_columns;
+  IF EXISTS (SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+    WHERE i.indrelid=attempts AND c.relname=retry_index AND i.indisunique AND i.indisvalid AND i.indisready
+      AND i.indkey::text=array_to_string(scope_columns,' ')
+      AND pg_get_expr(i.indpred,i.indrelid)='(NOT retry_released)') THEN RETURN; END IF;
+  LOCK TABLE creator_continuous_auto_budget_sessions, creator_continuous_auto_budget_attempts IN ACCESS EXCLUSIVE MODE;
+  IF EXISTS (SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+    WHERE i.indrelid=attempts AND c.relname=retry_index AND i.indisunique AND i.indisvalid AND i.indisready
+      AND i.indkey::text=array_to_string(scope_columns,' ')
+      AND pg_get_expr(i.indpred,i.indrelid)='(NOT retry_released)') THEN RETURN; END IF;
+  SELECT array_agg(conname) INTO old_keys FROM pg_constraint
+    WHERE conrelid=attempts AND convalidated AND contype='u' AND conkey=scope_columns;
+  IF cardinality(old_keys) IS DISTINCT FROM 1
+    OR EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid=attempts AND attname='retry_released' AND NOT attisdropped) THEN
+    RAISE EXCEPTION 'Unrecognized Creator continuous retry constraints';
+  END IF;
+  ALTER TABLE creator_continuous_auto_budget_attempts ADD COLUMN retry_released boolean NOT NULL DEFAULT false
+    CONSTRAINT creator_continuous_auto_attempt_retry_scope_v3 CHECK (NOT retry_released OR evidence_mode='spend-trend');
+  IF to_regclass('creator_web_budget_operations') IS NOT NULL THEN
+    UPDATE creator_continuous_auto_budget_attempts a SET retry_released=true
+    FROM creator_continuous_auto_budget_sessions s, creator_web_budget_operations w
+    WHERE a.session_id=s.session_id AND a.client_id='punpan_020' AND s.client_id=a.client_id
+      AND a.evidence_mode='spend-trend' AND s.evidence_mode=a.evidence_mode AND a.live_session_id IS NULL
+      AND s.campaign_id=a.campaign_id AND s.baseline_fingerprint=a.baseline_fingerprint
+      AND s.baseline_budget_minor=a.baseline_budget_minor AND s.status='STOPPED'
+      AND s.last_outcome='NOT_SENT' AND s.stop_reason='NOT_SENT' AND s.operation_id IS NULL
+      AND w.operation_id=a.operation_id AND w.owner_id=s.owner_id AND w.client_id=a.client_id AND w.campaign_id=a.campaign_id
+      AND w.policy_revision=s.policy_revision AND w.mode='live' AND w.source='auto' AND w.status='NOT_SENT'
+      AND w.current_budget_minor=a.baseline_budget_minor AND w.fingerprint=a.baseline_fingerprint
+      AND w.target_budget_minor=a.target_budget_minor AND w.observed_budget_minor IS NULL AND w.observed_fingerprint IS NULL;
+  ELSIF EXISTS (SELECT 1 FROM creator_continuous_auto_budget_attempts) THEN
+    RAISE EXCEPTION 'Creator continuous retry writer ledger missing';
+  END IF;
+  CREATE UNIQUE INDEX creator_continuous_auto_attempt_unreleased_v3
+    ON creator_continuous_auto_budget_attempts (client_id,campaign_id,baseline_fingerprint) WHERE NOT retry_released;
+  EXECUTE format('ALTER TABLE creator_continuous_auto_budget_attempts DROP CONSTRAINT %I',old_keys[1]);
+END
+$creator_continuous_retry$;`;
 
 type Runner = ReturnType<CreatorWebBudgetDatabase["createQueryRunner"]>;
 function rows(value: unknown): Record<string, unknown>[] {
@@ -234,6 +287,7 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
     async ensureSchema() { await run(async runner => {
       await runner.query(CREATOR_CONTINUOUS_AUTO_BUDGET_SCHEMA_SQL);
       await runner.query(CREATOR_CONTINUOUS_SPEND_TREND_SCHEMA_SQL);
+      await runner.query(CREATOR_CONTINUOUS_SAFE_RETRY_SCHEMA_SQL);
     }); },
     async getActive() {
       // Includes stopped sessions whose already reserved operation still needs reconciliation.
@@ -251,7 +305,7 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
          authorized_at,native_auto_off_attested,no_concurrent_changes_attested,evidence_mode)
         SELECT $1::uuid,'punpan_020',$2,$3,$4,$5,$6,$7,date_trunc('milliseconds',clock_timestamp()),$8,$9,$10
         WHERE NOT EXISTS (SELECT 1 FROM creator_continuous_auto_budget_attempts
-          WHERE client_id='punpan_020' AND campaign_id=$3 AND baseline_fingerprint=$6)
+          WHERE client_id='punpan_020' AND campaign_id=$3 AND baseline_fingerprint=$6 AND (NOT retry_released OR $10<>'spend-trend'))
         ON CONFLICT DO NOTHING RETURNING *`,
       [input.sessionId, input.ownerId, input.campaignId, input.policyRevision, input.baselineBudgetMinor,
         input.baselineFingerprint, input.liveSessionId, input.nativeAutoOffAttested, input.noConcurrentChangesAttested,
@@ -268,7 +322,7 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
         SET baseline_budget_minor=$9,baseline_fingerprint=$10,updated_at=clock_timestamp()
         WHERE ${EXACT} AND s.evidence_mode='spend-trend' AND s.status='ACTIVE' AND s.operation_id IS NULL
           AND NOT EXISTS (SELECT 1 FROM creator_continuous_auto_budget_attempts a WHERE a.client_id=s.client_id
-            AND a.campaign_id=s.campaign_id AND a.baseline_fingerprint=$10)
+            AND a.campaign_id=s.campaign_id AND a.baseline_fingerprint=$10 AND NOT a.retry_released)
           AND NOT EXISTS (SELECT 1 FROM creator_web_budget_operations w WHERE w.client_id=s.client_id
             AND (w.status='OUTCOME_UNKNOWN' OR (w.status='PROCESSING' AND (w.mode='live' OR w.expires_at > clock_timestamp()))))
         RETURNING s.*`, [...args(session), next.budgetMinor, next.fingerprint])));
@@ -288,6 +342,9 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
           FROM ${SESSION} s
           WHERE ${EXACT} AND EXISTS (SELECT 1 FROM creator_web_budget_operations w WHERE ${EXACT_WEB_OP}
             AND w.target_budget_minor=$10 AND w.status='PREPARED' AND w.expires_at > clock_timestamp())
+          AND (s.evidence_mode='spend-trend' OR NOT EXISTS (
+            SELECT 1 FROM creator_continuous_auto_budget_attempts a WHERE a.client_id=s.client_id AND a.campaign_id=s.campaign_id
+              AND a.baseline_fingerprint=s.baseline_fingerprint))
           ON CONFLICT DO NOTHING RETURNING operation_id`, input));
         if (attempt.length !== 1) return null;
         const reserved = one(await runner.query(`UPDATE ${SESSION} s SET operation_id=$9::uuid,
@@ -319,7 +376,7 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
           last_verified_at=date_trunc('milliseconds',clock_timestamp()),updated_at=clock_timestamp()
         WHERE ${EXACT} AND s.operation_id=$9::uuid
           AND NOT EXISTS (SELECT 1 FROM creator_continuous_auto_budget_attempts a WHERE a.client_id=s.client_id
-            AND a.campaign_id=s.campaign_id AND a.baseline_fingerprint=$11)
+            AND a.campaign_id=s.campaign_id AND a.baseline_fingerprint=$11 AND (NOT a.retry_released OR s.evidence_mode<>'spend-trend'))
           AND EXISTS (SELECT 1 FROM creator_web_budget_operations w WHERE ${EXACT_WEB_OP}
             AND w.target_budget_minor=$10 AND w.observed_budget_minor=$10
             AND w.observed_fingerprint=$11 AND w.status='APPLIED_VERIFIED')
@@ -327,12 +384,34 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
     },
     async settleNotSent(session: CreatorContinuousAutoBudgetSession, operationId: string) {
       if (!validSession(session) || !identifier(operationId, WEB_BUDGET_OPERATION_ID)) return null;
-      return run(async runner => one(await runner.query(`UPDATE ${SESSION} s SET status='STOPPED',operation_id=NULL,
-        last_outcome='NOT_SENT',stop_reason=COALESCE(s.stop_reason,'NOT_SENT'),updated_at=clock_timestamp()
-        WHERE ${EXACT} AND s.operation_id=$9::uuid
-          AND EXISTS (SELECT 1 FROM creator_web_budget_operations w WHERE ${EXACT_WEB_OP}
-            AND (w.status='NOT_SENT' OR (w.status='PREPARED' AND w.expires_at <= clock_timestamp())))
-        RETURNING s.*`, [...args(session), operationId])));
+      return run(async runner => {
+        const input = [...args(session), operationId];
+        const pending = one(await runner.query(`SELECT s.* FROM ${SESSION} s
+          WHERE ${EXACT} AND s.operation_id=$9::uuid FOR UPDATE`, input));
+        if (!pending) return null;
+        if (pending.status === "ACTIVE" && pending.evidenceMode === "spend-trend") {
+          const released = rows(await runner.query(`UPDATE creator_continuous_auto_budget_attempts a SET retry_released=true
+            FROM ${SESSION} s, creator_web_budget_operations w
+            WHERE ${EXACT} AND s.operation_id=$9::uuid AND ${EXACT_WEB_OP}
+              AND w.status='NOT_SENT' AND w.observed_budget_minor IS NULL AND w.observed_fingerprint IS NULL
+              AND a.operation_id=s.operation_id AND a.session_id=s.session_id AND a.client_id=s.client_id
+              AND a.campaign_id=s.campaign_id AND a.evidence_mode='spend-trend' AND a.baseline_fingerprint=s.baseline_fingerprint
+              AND a.baseline_budget_minor=s.baseline_budget_minor AND a.target_budget_minor=w.target_budget_minor AND NOT a.retry_released
+            RETURNING a.operation_id`, input));
+          if (released.length === 1) {
+            const resumed = one(await runner.query(`UPDATE ${SESSION} s SET operation_id=NULL,last_outcome='NOT_SENT',
+              updated_at=clock_timestamp() WHERE ${EXACT} AND s.status='ACTIVE' AND s.operation_id=$9::uuid RETURNING s.*`, input));
+            if (!resumed) throw new Error("CREATOR_CONTINUOUS_AUTO_RETRY_MISMATCH");
+            return resumed;
+          }
+        }
+        return one(await runner.query(`UPDATE ${SESSION} s SET status='STOPPED',operation_id=NULL,
+          last_outcome='NOT_SENT',stop_reason=COALESCE(s.stop_reason,'NOT_SENT'),updated_at=clock_timestamp()
+          WHERE ${EXACT} AND s.operation_id=$9::uuid
+            AND EXISTS (SELECT 1 FROM creator_web_budget_operations w WHERE ${EXACT_WEB_OP}
+              AND (w.status='NOT_SENT' OR (w.status='PREPARED' AND w.expires_at <= clock_timestamp())))
+          RETURNING s.*`, input));
+      });
     },
     async stop(ownerId: number, sessionId: string, reason: CreatorContinuousAutoBudgetStopReason = "OPERATOR_STOPPED") {
       if (!positive(ownerId) || !identifier(sessionId, WEB_BUDGET_OPERATION_ID) || !stopReasonValid(reason)) return null;

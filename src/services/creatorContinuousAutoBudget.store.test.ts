@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { PGlite } from "@electric-sql/pglite";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  CREATOR_CONTINUOUS_AUTO_BUDGET_SCHEMA_SQL, createCreatorContinuousAutoBudgetStore, type CreatorContinuousAutoBudgetArmInput,
+  CREATOR_CONTINUOUS_AUTO_BUDGET_SCHEMA_SQL, CREATOR_CONTINUOUS_SPEND_TREND_SCHEMA_SQL,
+  createCreatorContinuousAutoBudgetStore, type CreatorContinuousAutoBudgetArmInput,
   type CreatorContinuousAutoBudgetSession,
 } from "./creatorContinuousAutoBudget.store";
 import { createCreatorWebBudgetStore } from "./creatorWebBudget.store";
@@ -233,5 +234,81 @@ describe("Ppan continuous Auto session", () => {
     const pending = operation(adopted);
     await h.web.create(pending); await h.sessions.reserve(adopted, pending.operationId, pending.targetBudgetMinor);
     expect(await h.sessions.adoptBaseline(adopted, { ...next, fingerprint: NEXT })).toBeNull();
+  });
+
+  it("releases only an exact durable NOT_SENT attempt, then permits a new operation while keeping its audit row", async () => {
+    const h = setup(); await h.web.ensureSchema(); await h.sessions.ensureSchema();
+    const s = (await h.sessions.arm(trendArm()))!, first = operation(s), second = operation(s);
+    await h.web.create(first); await h.web.create(second);
+    await h.sessions.reserve(s, first.operationId, first.targetBudgetMinor);
+    expect(await h.sessions.reserve(s, second.operationId, second.targetBudgetMinor)).toBeNull();
+    await h.web.reserve(s.ownerId, first.operationId, "live");
+    expect(await h.sessions.settleNotSent(s, first.operationId)).toBeNull();
+    await h.web.finish(s.ownerId, first.operationId, { status: "NOT_SENT", observedBudgetMinor: null, reason: "BUDGET_AUTO_PREFLIGHT" });
+    expect(await h.sessions.settleNotSent(s, first.operationId)).toMatchObject({ status: "ACTIVE", operationId: null,
+      lastOutcome: "NOT_SENT", stopReason: null, baselineFingerprint: BEFORE });
+    expect(await h.sessions.isReserved(s, first.operationId)).toBe(false);
+    expect(await h.sessions.reserve(s, first.operationId, first.targetBudgetMinor)).toBeNull();
+    expect(await h.sessions.reserve(s, second.operationId, second.targetBudgetMinor))
+      .toMatchObject({ operationId: second.operationId });
+    expect((await h.db.query("SELECT operation_id,retry_released FROM creator_continuous_auto_budget_attempts ORDER BY reserved_at")).rows)
+      .toEqual([{ operation_id: first.operationId, retry_released: true }, { operation_id: second.operationId, retry_released: false }]);
+  });
+
+  it("does not release spend-trend expired PREPARED, uncertainty, or explicitly stopped pending operations", async () => {
+    const h = setup(); await h.web.ensureSchema(); await h.sessions.ensureSchema();
+    const expired = (await h.sessions.arm(trendArm()))!, a = operation(expired);
+    await h.web.create(a); await h.sessions.reserve(expired, a.operationId, a.targetBudgetMinor);
+    await h.db.query("UPDATE creator_web_budget_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE operation_id=$1", [a.operationId]);
+    expect(await h.sessions.settleNotSent(expired, a.operationId)).toMatchObject({ status: "STOPPED" });
+    expect(await h.sessions.arm(trendArm())).toBeNull();
+    const stopped = (await h.sessions.arm(trendArm({ baselineFingerprint: AFTER })))!, b = operation(stopped);
+    await h.web.create(b); await h.sessions.reserve(stopped, b.operationId, b.targetBudgetMinor);
+    await h.web.reserve(stopped.ownerId, b.operationId, "live");
+    await h.sessions.stop(stopped.ownerId, stopped.sessionId, "OPERATOR_STOPPED");
+    await h.web.finish(stopped.ownerId, b.operationId, { status: "NOT_SENT", observedBudgetMinor: null, reason: "BUDGET_AUTO_PREFLIGHT" });
+    expect(await h.sessions.settleNotSent(stopped, b.operationId)).toMatchObject({ status: "STOPPED", stopReason: "OPERATOR_STOPPED" });
+    const unknown = (await h.sessions.arm(trendArm({ baselineFingerprint: NEXT })))!, c = operation(unknown);
+    await h.web.create(c); await h.sessions.reserve(unknown, c.operationId, c.targetBudgetMinor);
+    await h.web.reserve(unknown.ownerId, c.operationId, "live");
+    await h.web.finish(unknown.ownerId, c.operationId, { status: "OUTCOME_UNKNOWN", observedBudgetMinor: null, reason: "UNKNOWN" });
+    await h.sessions.markUnknown(unknown, c.operationId);
+    expect(await h.sessions.settleNotSent(unknown, c.operationId)).toBeNull();
+    expect((await h.db.query("SELECT DISTINCT retry_released FROM creator_continuous_auto_budget_attempts")).rows)
+      .toEqual([{ retry_released: false }]);
+  });
+
+  it("retroactively releases only exact old spend-trend STOPPED/NOT_SENT writer proof and permits explicit re-arm", async () => {
+    const h = setup(); await h.web.ensureSchema();
+    await h.db.exec(CREATOR_CONTINUOUS_AUTO_BUDGET_SCHEMA_SQL);
+    await h.db.exec(CREATOR_CONTINUOUS_SPEND_TREND_SCHEMA_SQL);
+    const historical = [
+      { ...trendArm(), exact: true, terminal: true },
+      { ...trendArm({ baselineFingerprint: AFTER }), exact: false, terminal: true },
+      { ...trendArm({ baselineFingerprint: NEXT }), exact: true, terminal: false },
+    ];
+    for (const old of historical) {
+      const oldOp = operation(old as CreatorContinuousAutoBudgetSession, undefined, { ownerId: old.exact ? old.ownerId : old.ownerId + 1 });
+      await h.web.create(oldOp);
+      if (old.terminal) {
+        await h.web.reserve(oldOp.ownerId, oldOp.operationId, "live");
+        await h.web.finish(oldOp.ownerId, oldOp.operationId, { status: "NOT_SENT", observedBudgetMinor: null, reason: "BUDGET_AUTO_PREFLIGHT" });
+      }
+      await h.db.query(`INSERT INTO creator_continuous_auto_budget_sessions
+        (session_id,client_id,owner_id,campaign_id,live_session_id,policy_revision,baseline_budget_minor,
+          baseline_fingerprint,authorized_at,native_auto_off_attested,no_concurrent_changes_attested,evidence_mode,status,last_outcome,stop_reason)
+        VALUES ($1,'punpan_020',$2,$3,NULL,$4,$5,$6,date_trunc('milliseconds',clock_timestamp()),false,false,'spend-trend','STOPPED','NOT_SENT','NOT_SENT')`,
+      [old.sessionId, old.ownerId, old.campaignId, old.policyRevision, old.baselineBudgetMinor, old.baselineFingerprint]);
+      await h.db.query(`INSERT INTO creator_continuous_auto_budget_attempts
+        (operation_id,session_id,client_id,campaign_id,live_session_id,baseline_fingerprint,baseline_budget_minor,target_budget_minor,evidence_mode)
+        VALUES ($1,$2,'punpan_020',$3,NULL,$4,$5,$6,'spend-trend')`, [oldOp.operationId, old.sessionId, old.campaignId,
+        old.baselineFingerprint, old.baselineBudgetMinor, oldOp.targetBudgetMinor]);
+    }
+    await h.sessions.ensureSchema(); await h.sessions.ensureSchema();
+    expect((await h.db.query("SELECT retry_released FROM creator_continuous_auto_budget_attempts ORDER BY baseline_fingerprint")).rows)
+      .toEqual([{ retry_released: true }, { retry_released: false }, { retry_released: false }]);
+    expect(await h.sessions.arm(arm())).toBeNull();
+    expect(await h.sessions.arm(trendArm({ baselineFingerprint: AFTER }))).toBeNull();
+    expect(await h.sessions.arm(trendArm())).toMatchObject({ status: "ACTIVE", baselineFingerprint: BEFORE });
   });
 });

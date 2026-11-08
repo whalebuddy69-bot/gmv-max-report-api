@@ -204,8 +204,9 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
         if (!sameCap(reserved.cap, cap) || context.reportingDate !== reserved.reportingDate || context.fingerprint !== reserved.fingerprint) {
           reject("BUDGET_PRECONDITION_CHANGED", 409, "งบหรือเพดานเปลี่ยน กรุณาเปิดรายการใหม่");
         }
-        if (autoGuard && (!nativeReady(context) || cap.autoLineReady !== true || !await autoGuard(context, cap))) {
-          reject("BUDGET_AUTO_PREFLIGHT", 409, "ข้อมูลสำหรับ Auto ยังไม่พร้อม");
+        if (autoGuard) {
+          if (!nativeReady(context) || cap.autoLineReady !== true) reject(useTrend ? "PPAN_TREND_PREFLIGHT_NATIVE_OR_LINE" : "BUDGET_AUTO_PREFLIGHT", 409, "ข้อมูลสำหรับ Auto ยังไม่พร้อม");
+          if (!await autoGuard(context, cap)) reject("BUDGET_AUTO_PREFLIGHT", 409, "ข้อมูลสำหรับ Auto ยังไม่พร้อม");
         }
         if (mode() !== activeMode || !await recheckOperator() || timeMs(reserved.expiresAt) <= now().getTime()) {
           reject("BUDGET_AUTHORITY_CHANGED", 409, "สิทธิ์หรือเวลายืนยันเปลี่ยน กรุณาเปิดรายการใหม่");
