@@ -13,10 +13,11 @@ const ID = "91900000000001", OTHER = "91900000000002", OWNER = 10, TOKEN = "fixt
 const dbs: PGlite[] = [];
 afterEach(async () => { for (const db of dbs.splice(0)) await db.close(); });
 
-function fixture({ wrongIdentity = false, multi = false, mismatch = false, unknown = false, budget = 500 }: {
-  wrongIdentity?: boolean; multi?: boolean; mismatch?: boolean; unknown?: boolean; budget?: number } = {}) {
+function fixture({ wrongIdentity = false, multi = false, mismatch = false, unknown = false, budget = 500, nativeAutoEnabled = false }: {
+  wrongIdentity?: boolean; multi?: boolean; mismatch?: boolean; unknown?: boolean; budget?: number; nativeAutoEnabled?: boolean } = {}) {
   const calls: Array<{ method: string; path: string; body?: unknown }> = [];
   let operation: CampaignSwitch = "ENABLE", roi = 3.5, modified = "2025-02-15 08:00:00";
+  let otherOperation: CampaignSwitch | null = multi ? "ENABLE" : null;
   const response = (data: unknown) => Response.json({ code: 0, data });
   const fetchImpl = vi.fn(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
     const u = new URL(String(input)), method = init?.method ?? "GET", body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
@@ -35,24 +36,25 @@ function fixture({ wrongIdentity = false, multi = false, mismatch = false, unkno
     }
     expect(u.searchParams.get("advertiser_id")).toBe(B.advertiserId);
     if (u.pathname.endsWith("/gmv_max/campaign/get/")) {
-      const filter = JSON.parse(u.searchParams.get("filtering") ?? "{}"), isExact = !!filter.campaign_ids;
-      if (isExact) expect(filter.campaign_ids).toEqual([ID]);
+      const filter = JSON.parse(u.searchParams.get("filtering") ?? "{}");
       const list = [{ advertiser_id: B.advertiserId, campaign_id: ID, operation_status: operation, modify_time: modified }];
-      if (!isExact && multi) list.push({ advertiser_id: B.advertiserId, campaign_id: OTHER, operation_status: "ENABLE", modify_time: modified });
-      return response({ list, page_info: { page: 1, total_page: 1, total_number: list.length } });
+      if (otherOperation) list.push({ advertiser_id: B.advertiserId, campaign_id: OTHER, operation_status: otherOperation, modify_time: modified });
+      const matching = filter.campaign_ids ? list.filter(row => filter.campaign_ids.includes(row.campaign_id)) : list;
+      return response({ list: matching, page_info: { page: 1, total_page: 1, total_number: matching.length } });
     }
     if (u.pathname.endsWith("/campaign/gmv_max/info/")) {
-      expect(u.searchParams.get("campaign_id")).toBe(ID);
-      return response({ advertiser_id: B.advertiserId, campaign_id: ID, operation_status: operation, shopping_ads_type: "LIVE",
+      const campaignId = u.searchParams.get("campaign_id");
+      expect([ID, OTHER]).toContain(campaignId);
+      return response({ advertiser_id: B.advertiserId, campaign_id: campaignId, operation_status: campaignId === ID ? operation : otherOperation, shopping_ads_type: "LIVE",
         store_id: "0", store_authorized_bc_id: "0", deep_bid_type: "VO_MIN_ROAS", optimization_goal: "VALUE",
         identity_list: [{ identity_id: wrongIdentity ? "other" : B.identityId, identity_type: B.identityType, identity_authorized_bc_id: B.identityAuthorizedBcId }],
         budget: mismatch && calls.some(c => c.method === "POST") ? budget + 1 : budget, roas_bid: roi,
-        campaign_name: "Test Ppan", schedule_type: "FROM_NOW", schedule_start_time: "2025-02-15 07:00:00", auto_budget_enabled: false });
+        campaign_name: "Test Ppan", schedule_type: "FROM_NOW", schedule_start_time: "2025-02-15 07:00:00", auto_budget_enabled: nativeAutoEnabled });
     }
     throw new Error("unexpected GET");
   }) as typeof fetch;
   const provider = createPpanCampaignActionProvider({ fetchImpl, loadToken: async () => TOKEN, now: () => new Date("2025-02-15T10:00:00.000Z") });
-  return { provider, calls, setStatus: (s: CampaignSwitch) => { operation = s; } };
+  return { provider, calls, setStatus: (s: CampaignSwitch) => { operation = s; }, setOtherStatus: (s: CampaignSwitch | null) => { otherOperation = s; } };
 }
 
 function memory() {
@@ -94,6 +96,69 @@ describe("Ppan no-Shop Creator campaign controls", () => {
     expect((await disabled.status()).blocker).toBe("MULTIPLE_ACTIVE_CAMPAIGNS");
     const wrong = createPpanCampaignActions({ provider: fixture({ wrongIdentity: true }).provider, store, mode: () => "dry-run", readPolicy: vi.fn() });
     expect((await wrong.status()).blocker).toBe("CAMPAIGN_UNAVAILABLE");
+  });
+
+  it("reports independent modes and selects exact paused rows only when no other campaign is active", async () => {
+    const h = fixture(), store = memory(), s = createPpanCampaignActions({ provider: h.provider, store,
+      mode: action => action === "SET_ROI" ? "disabled" : action === "PAUSE" ? "live" : "dry-run", readPolicy: vi.fn() });
+    h.setOtherStatus("DISABLE");
+    expect(await s.status()).toMatchObject({ campaign: { campaignId: ID }, capabilities: { pause: true } });
+    expect(await s.status(OTHER)).toMatchObject({ campaign: null, capabilities: { setRoi: false, pause: false, resume: false } });
+    await expect(s.preview(OWNER, { campaignId: OTHER, action: "RESUME", expectedStatus: "DISABLE", expectedRoiTenths: 35 }))
+      .rejects.toMatchObject({ code: "CAMPAIGN_BASELINE_CHANGED" });
+    h.setStatus("DISABLE");
+    expect(await s.status()).toMatchObject({ campaign: null, blocker: "NO_EXACT_CAMPAIGN" });
+    expect(await s.status(OTHER)).toMatchObject({ campaign: { campaignId: OTHER, operationStatus: "DISABLE" }, mode: "live",
+      actionModes: { setRoi: "disabled", pause: "live", resume: "dry-run" }, capabilities: { setRoi: false, pause: false, resume: true, create: false } });
+    expect(await s.status("91900000000003")).toMatchObject({ campaign: null, blocker: "NO_EXACT_CAMPAIGN" });
+    expect(await s.preview(OWNER, { campaignId: OTHER, action: "RESUME", expectedStatus: "DISABLE", expectedRoiTenths: 35 }))
+      .toMatchObject({ campaignId: OTHER, mode: "dry-run", sent: false });
+    expect(store.create).not.toHaveBeenCalled();
+    expect(h.calls.every(c => c.method === "GET")).toBe(true);
+  });
+
+  it("never dispatches a prepared exact resume if another active campaign appears before confirmation", async () => {
+    const h = fixture(), store = memory();
+    h.setStatus("DISABLE");
+    h.setOtherStatus("DISABLE");
+    vi.spyOn(h.provider, "otherSpend").mockResolvedValue(100);
+    const s = createPpanCampaignActions({ provider: h.provider, store, mode: () => "live",
+      readPolicy: vi.fn(async () => ({ revision: 1, campaignCapMinor: 60_000, clientDailyCapMinor: 60_000, locked: false, readAt: "2025-02-15T10:00:00.000Z" })) });
+    const prep = await s.preview(OWNER, { campaignId: OTHER, action: "RESUME", expectedStatus: "DISABLE", expectedRoiTenths: 35 });
+    expect(prep).toMatchObject({ mode: "live", campaignId: OTHER, sent: false });
+    h.setStatus("ENABLE");
+    expect(await s.confirm(OWNER, prep.operationId!, async () => true)).toMatchObject({ campaignId: OTHER, status: "NOT_SENT", sent: false });
+    expect(h.calls.every(c => c.method === "GET")).toBe(true);
+  });
+
+  it("rechecks the complete active set again at the exact resume send boundary", async () => {
+    const h = fixture(), store = memory();
+    h.setStatus("DISABLE");
+    h.setOtherStatus("DISABLE");
+    vi.spyOn(h.provider, "otherSpend").mockResolvedValue(100);
+    const realSend = h.provider.send;
+    const send = vi.spyOn(h.provider, "send").mockImplementation(async (...args) => {
+      // External operator enabled a different campaign after confirm's first
+      // snapshot. The exact target still reads DISABLE, so only the final
+      // full-list recheck catches the conflict.
+      h.setStatus("ENABLE");
+      return realSend(...args);
+    });
+    const s = createPpanCampaignActions({ provider: h.provider, store, mode: () => "live",
+      readPolicy: vi.fn(async () => ({ revision: 1, campaignCapMinor: 60_000, clientDailyCapMinor: 60_000, locked: false, readAt: "2025-02-15T10:00:00.000Z" })) });
+    const prep = await s.preview(OWNER, { campaignId: OTHER, action: "RESUME", expectedStatus: "DISABLE", expectedRoiTenths: 35 });
+    expect(await s.confirm(OWNER, prep.operationId!, async () => true)).toMatchObject({ campaignId: OTHER, status: "NOT_SENT", sent: false });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(h.calls.every(c => c.method === "GET")).toBe(true);
+  });
+
+  it("does not advertise exact live resume while TikTok native Auto Budget is on", async () => {
+    const h = fixture({ nativeAutoEnabled: true }); h.setStatus("DISABLE");
+    const s = createPpanCampaignActions({ provider: h.provider, store: memory(), mode: () => "live", readPolicy: vi.fn() });
+    expect(await s.status(ID)).toMatchObject({ campaign: { campaignId: ID }, capabilities: { resume: false } });
+    await expect(s.preview(OWNER, { campaignId: ID, action: "RESUME", expectedStatus: "DISABLE", expectedRoiTenths: 35 }))
+      .rejects.toMatchObject({ code: "RESUME_CAP_OR_NATIVE_AUTO_UNVERIFIED" });
+    expect(h.calls.every(c => c.method === "GET")).toBe(true);
   });
 
   it("uses exact documented, separated POSTs and double readback in mocked live mode", async () => {

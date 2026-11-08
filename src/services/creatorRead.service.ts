@@ -30,7 +30,7 @@ function scheduleIso(value: unknown): string | null {
   const iso = value.replace(" ", "T") + ".000Z", time = Date.parse(iso);
   return Number.isFinite(time) && new Date(time).toISOString() === iso ? iso : null;
 }
-function campaignSchedule(info: Row): { scheduleStartAt: string | null; scheduleEndAt: string | null } {
+export function campaignSchedule(info: Record<string, unknown>): { scheduleStartAt: string | null; scheduleEndAt: string | null } {
   const unavailable = { scheduleStartAt: null, scheduleEndAt: null };
   const start = scheduleIso(info.schedule_start_time);
   if (!start) return unavailable;

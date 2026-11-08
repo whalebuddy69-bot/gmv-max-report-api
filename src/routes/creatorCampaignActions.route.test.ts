@@ -52,4 +52,17 @@ describe("Creator campaign controls HTTP boundary", () => {
     const r = await post("/confirm", { operationId: OP, confirmed: true });
     expect(await r.json()).toEqual({ authorized: true });
   });
+
+  it("authorizes only a numeric exact campaign status path and never treats GET as a command", async () => {
+    const h = await fixture();
+    expect((await fetch(`${h.url}/status/${ID}`)).status).toBe(401);
+    expect((await fetch(`${h.url}/status/${ID}`, { headers: { Authorization: "Bearer non-admin" } })).status).toBe(403);
+    expect((await fetch(`${h.url}/status/${ID}?client=srihiw`, { headers: auth })).status).toBe(400);
+    expect((await fetch(`${h.url}/status/not-a-campaign`, { headers: auth })).status).toBe(400);
+    expect((await fetch(`${h.url}/status/${ID}`, { headers: auth })).status).toBe(200);
+    expect(h.service.status).toHaveBeenCalledTimes(1);
+    expect(h.service.status).toHaveBeenCalledWith(ID);
+    expect(h.service.preview).not.toHaveBeenCalled();
+    expect(h.service.confirm).not.toHaveBeenCalled();
+  });
 });

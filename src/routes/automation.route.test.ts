@@ -51,22 +51,23 @@ afterEach(async () => {
 });
 
 async function start(options: { viewerIds?: string; snapshot?: () => Promise<unknown>;
-  performance?: () => Promise<unknown>; now?: () => Date;
+  performance?: () => Promise<unknown>; campaignDay?: () => Promise<unknown>; now?: () => Date;
   extraConfig?: string; verifiedExtras?: AutomationCreatorReadAdapter[] } = {}) {
   const readSnapshot = vi.fn(options.snapshot ?? (async () => observed));
   const readPerformance = vi.fn(options.performance ?? (async () => ({ state: "available", observedAt: PERFORMANCE_OBSERVED_AT, series: [
     { hour: "08:00", spendMinor: 123, gmvMinor: null, orders: 0, roi: null, liveViews: 55, secret: PRIVATE_MARKER },
     { hour: "07:00", spendMinor: null, gmvMinor: 600, orders: 3, roi: 1.5, liveViews: null },
   ] })));
+  const readCampaignDay = vi.fn(options.campaignDay ?? (async () => null));
   let allowlist = options.viewerIds ?? "27";
   const app = express();
-  app.use("/automation", createAutomationRouter({ viewerIds: () => allowlist, readSnapshot, readPerformance,
+  app.use("/automation", createAutomationRouter({ viewerIds: () => allowlist, readSnapshot, readPerformance, readCampaignDay,
     configuredExtraClients: () => options.extraConfig, verifiedExtras: () => options.verifiedExtras ?? [],
     now: options.now ?? (() => NOW) }));
   server = await new Promise<Server>(resolve => { const instance = app.listen(0, "127.0.0.1", () => resolve(instance)); });
   const { port } = server.address() as { port: number };
   const url = `http://127.0.0.1:${port}/automation`;
-  return { url, readSnapshot, readPerformance, setAllowlist: (next: string) => { allowlist = next; } };
+  return { url, readSnapshot, readPerformance, readCampaignDay, setAllowlist: (next: string) => { allowlist = next; } };
 }
 
 function extraAdapter(snapshot: unknown = { ...observed, clientId: EXTRA.clientId, binding: EXTRA_BINDING,
@@ -79,6 +80,43 @@ function extraAdapter(snapshot: unknown = { ...observed, clientId: EXTRA.clientI
 }
 
 describe("private Creator Automation read routes", () => {
+  it("serves a read-only list of exact scoped today campaigns, including verified closed rows", async () => {
+    const paused = { campaignId: EXTRA_CAMPAIGN, campaignName: "Paused Synthetic", operationStatus: "DISABLE", dailyBudgetMinor: 20000,
+      targetRoi: 3, spendMinor: 400, gmvMinor: 1000, activityToday: true, roi: 999, scheduleStartAt: null, scheduleEndAt: null,
+      secret: PRIVATE_MARKER };
+    const h = await start({ campaignDay: async () => ({ reportingDate: REPORTING_DATE, observedAt: OBSERVED_AT, coverage: "complete",
+      campaigns: [paused, { ...paused, campaignId: FAKE_CAMPAIGN_ID, campaignName: "Active Synthetic", operationStatus: "ENABLE",
+        activityToday: false, spendMinor: null, gmvMinor: null }] }) });
+    const path = `${h.url}/campaigns/punpan_020`;
+    expect((await fetch(path)).status).toBe(401);
+    expect((await fetch(path, { headers: { Authorization: "Bearer fixture-admin" } })).status).toBe(403);
+    expect((await fetch(`${path}?campaignId=${EXTRA_CAMPAIGN}`, { headers: OWNER_HEADER })).status).toBe(400);
+    expect((await fetch(path, { method: "POST", headers: OWNER_HEADER })).status).toBe(405);
+    expect((await fetch(`${h.url}/campaigns/other-account`, { headers: OWNER_HEADER })).status).toBe(404);
+    expect(h.readCampaignDay).not.toHaveBeenCalled();
+    const res = await fetch(path, { headers: OWNER_HEADER });
+    const raw = await res.text();
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(raw).not.toContain(PRIVATE_MARKER);
+    expect(JSON.parse(raw)).toMatchObject({ schemaVersion: 1, clientId: "punpan_020", coverage: "complete", reportingDate: REPORTING_DATE,
+      campaigns: [{ campaignId: FAKE_CAMPAIGN_ID, roi: null }, { campaignId: EXTRA_CAMPAIGN, roi: 2.5 }] });
+    expect(h.readCampaignDay.mock.calls).toEqual([[]]);
+    expect(h.readSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("does not fall back to Ppan history for another registered Creator without verified access", async () => {
+    const h = await start({ extraConfig: JSON.stringify([EXTRA]) });
+    const res = await fetch(`${h.url}/campaigns/${EXTRA.clientId}`, { headers: OWNER_HEADER });
+    expect(await res.json()).toMatchObject({ clientId: EXTRA.clientId, reportingDate: REPORTING_DATE, coverage: "unavailable", observedAt: null, campaigns: [] });
+    expect(h.readCampaignDay).not.toHaveBeenCalled();
+  });
+
+  it("drops stale or wrong-day observations instead of showing yesterday's campaign as current", async () => {
+    const h = await start({ campaignDay: async () => ({ reportingDate: "2026-10-14", observedAt: "2026-10-14T02:05:15.000Z", coverage: "complete", campaigns: [] }) });
+    const res = await fetch(`${h.url}/campaigns/punpan_020`, { headers: OWNER_HEADER });
+    expect(await res.json()).toMatchObject({ reportingDate: REPORTING_DATE, coverage: "unavailable", observedAt: null, campaigns: [] });
+  });
+
   it("accepts only an explicit list of positive user IDs", () => {
     expect([...parseAutomationViewerIds("27, 42")]).toEqual([27, 42]);
     for (const invalid of [undefined, "", "*", "27,", "27,42e0", "0", "27, 00042", "-42", "27,9007199254740992"])

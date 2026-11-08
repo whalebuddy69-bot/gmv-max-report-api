@@ -33,6 +33,7 @@ export type AutomationCreatorReadAdapter = Readonly<{
   binding: AutomationCreatorBinding;
   readSnapshot: () => Promise<unknown>;
   readPerformance: (scope: AutomationPerformanceScope) => Promise<unknown>;
+  readCampaignDay?: () => Promise<unknown>;
 }>;
 export type AutomationCreatorReadEntry = Readonly<{
   creator: AutomationCreator;
@@ -129,7 +130,7 @@ export function createAutomationReadRegistry({ extraConfig, ppan, verifiedExtras
   const primary: AutomationCreatorReadEntry = {
     creator: PPAN_AUTOMATION_CREATOR,
     adapter: { clientId: PPAN_AUTOMATION_CREATOR.clientId, binding: CREATOR_BINDING,
-      readSnapshot: ppan.readSnapshot, readPerformance: ppan.readPerformance },
+      readSnapshot: ppan.readSnapshot, readPerformance: ppan.readPerformance, readCampaignDay: ppan.readCampaignDay },
     accessReason: "upstream-unavailable",
   };
   return [primary, ...parseExtraAutomationClients(extraConfig).map((creator): AutomationCreatorReadEntry => {

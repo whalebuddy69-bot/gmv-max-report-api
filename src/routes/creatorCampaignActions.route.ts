@@ -69,6 +69,11 @@ export function createPpanCampaignActionsRouter({ service, viewerIds, operatorId
     try { res.json(await fn(req, req.user!.sub)); } catch (error) { next(error); }
   };
   router.get("/status", onlyGet, handle(() => service.status()));
+  router.get("/status/:campaignId", onlyGet, handle(req => {
+    const campaignId = req.params.campaignId;
+    if (typeof campaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(campaignId)) throw bad();
+    return service.status(campaignId);
+  }));
   router.post("/preview", onlyJson, json, handle((req, owner) => {
     const value = obj(req.body), a = value.action;
     if ((a !== "SET_ROI" && a !== "PAUSE" && a !== "RESUME") ||

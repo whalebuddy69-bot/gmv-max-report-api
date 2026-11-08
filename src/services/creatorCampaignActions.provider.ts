@@ -117,10 +117,19 @@ export function createPpanCampaignActionProvider({ loadToken, fetchImpl = fetch,
       roiTargetTenths, budgetMinor, scheduleOpen, nativeAutoOff, fixedFingerprint, observedAt: at.toISOString(),
       fingerprint: hash([fixedFingerprint, row.modified, row.status, roiTargetTenths]) };
   }
-  async function find(preferredPausedId?: string | null) {
+  async function find(preferredPausedId?: string | null, options?: { exact?: boolean }) {
+    if (options?.exact && !hasId(preferredPausedId)) return unavailable();
     const key = await token(), campaigns = await list(key), active = campaigns.filter(c => c.status === "ENABLE");
     if (active.length > 1) throw new CampaignActionError("MULTIPLE_ACTIVE_CAMPAIGNS", 409, "มีหลายแคมเปญเปิดอยู่ จึงไม่เลือกแทนคุณ");
     const paused = campaigns.filter(c => c.status === "DISABLE");
+    if (options?.exact) {
+      // Never resume a selected paused campaign when another campaign is enabled.
+      // The full advertiser list is intentionally required here, even for an exact ID.
+      const selected = active.length > 0
+        ? active.find(c => c.campaignId === preferredPausedId)
+        : paused.find(c => c.campaignId === preferredPausedId);
+      return selected ? snapshot(key, selected) : null;
+    }
     const row = active[0] ?? (preferredPausedId ? paused.find(c => c.campaignId === preferredPausedId) : undefined) ?? (paused.length === 1 ? paused[0] : undefined);
     return row ? snapshot(key, row) : null;
   }

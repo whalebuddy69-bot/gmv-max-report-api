@@ -1,8 +1,9 @@
 import { Router } from "express";
 import type { ErrorRequestHandler, Request, Response } from "express";
 import { requireAuth } from "../middleware/auth";
-import { bangkokDay, CreatorReadError, createCreatorReader } from "../services/creatorRead.service";
+import { bangkokDay, CREATOR_BINDING, CreatorReadError, createCreatorReader } from "../services/creatorRead.service";
 import { createCreatorAutomationPerformance } from "../services/creatorAutomationPerformance.service";
+import { CREATOR_DAY_MAX_ROWS, createCreatorCampaignDayReader, type CreatorCampaignDay, type CreatorCampaignDayRow } from "../services/creatorCampaignDay.service";
 import { createAutomationReadRegistry, parseExtraAutomationClients, parseVerifiedAutomationBindings,
   PPAN_AUTOMATION_CREATOR, validAutomationClientId } from "../services/creatorAutomationRegistry.service";
 import type { AutomationAccessReason, AutomationCreator, AutomationCreatorReadAdapter, AutomationCreatorReadEntry,
@@ -13,6 +14,7 @@ import { loadCreatorToken } from "./creatorRead.route";
 
 const MAX_SNAPSHOT_AGE_MS = 30_000;
 const MAX_PERFORMANCE_AGE_MS = 190_000; // 3m server cache plus bounded provider fetch allowance.
+const MAX_CAMPAIGN_DAY_AGE_MS = 35_000;
 const MAX_VIEWERS = 100;
 const VIEWER_WINDOW_MS = 60_000;
 const VIEWER_REQUEST_LIMIT = 24;
@@ -23,6 +25,7 @@ type AutomationRouteDependencies = {
   viewerIds: () => string | undefined;
   readSnapshot: () => Promise<unknown>;
   readPerformance: (scope: AutomationPerformanceScope) => Promise<unknown>;
+  readCampaignDay?: () => Promise<unknown>;
   configuredExtraClients?: () => string | undefined;
   verifiedExtras?: () => readonly AutomationCreatorReadAdapter[];
   pendingReason?: (creator: AutomationCreator) => AutomationAccessReason | undefined;
@@ -108,13 +111,40 @@ function verifyPerformance(raw: unknown, reportingDate: string, now: Date): Perf
   return { observedAt: raw.observedAt, series: points.sort((a, b) => a.hour.localeCompare(b.hour)) };
 }
 
-export function createAutomationRouter({ viewerIds, readSnapshot, readPerformance, configuredExtraClients, verifiedExtras,
+function verifyCampaignDay(raw: unknown, now: Date): CreatorCampaignDay {
+  const reportingDate = bangkokDay(now);
+  const unavailable: CreatorCampaignDay = { reportingDate, observedAt: null, coverage: "unavailable", campaigns: [] };
+  if (!record(raw) || raw.reportingDate !== reportingDate || (raw.coverage !== "complete" && raw.coverage !== "partial") ||
+    !freshObservationTime(raw.observedAt, reportingDate, now, MAX_CAMPAIGN_DAY_AGE_MS) ||
+    !Array.isArray(raw.campaigns) || raw.campaigns.length > CREATOR_DAY_MAX_ROWS) return unavailable;
+  const campaigns: CreatorCampaignDayRow[] = [], seen = new Set<string>();
+  for (const campaign of raw.campaigns) {
+    if (!record(campaign) || typeof campaign.campaignId !== "string" || !/^[1-9]\d{5,30}$/.test(campaign.campaignId) || seen.has(campaign.campaignId) ||
+      typeof campaign.activityToday !== "boolean" || !nullableInteger(campaign.spendMinor) || !nullableInteger(campaign.gmvMinor) ||
+      !nullableInteger(campaign.dailyBudgetMinor) || campaign.dailyBudgetMinor === 0 || !nullableRatio(campaign.targetRoi) ||
+      (campaign.operationStatus !== "ENABLE" && campaign.operationStatus !== "DISABLE" && campaign.operationStatus !== "DELETE") ||
+      (campaign.operationStatus !== "ENABLE" && !campaign.activityToday)) return unavailable;
+    const name = typeof campaign.campaignName === "string" ? campaign.campaignName.replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, "").slice(0, 160).trim() : "";
+    const start = canonicalScheduleTime(campaign.scheduleStartAt), end = canonicalScheduleTime(campaign.scheduleEndAt);
+    const scheduleVerified = start !== null && (campaign.scheduleEndAt === null || (end !== null && end > start));
+    const roi = campaign.gmvMinor !== null && campaign.spendMinor !== null && campaign.spendMinor > 0 ? campaign.gmvMinor / campaign.spendMinor : null;
+    seen.add(campaign.campaignId);
+    campaigns.push({ campaignId: campaign.campaignId, campaignName: name || "แคมเปญ Creator", operationStatus: campaign.operationStatus,
+      dailyBudgetMinor: campaign.dailyBudgetMinor, targetRoi: campaign.targetRoi, spendMinor: campaign.spendMinor, gmvMinor: campaign.gmvMinor,
+      roi, activityToday: campaign.activityToday, scheduleStartAt: scheduleVerified ? start : null, scheduleEndAt: scheduleVerified ? end : null });
+  }
+  campaigns.sort((a, b) => Number(b.operationStatus === "ENABLE") - Number(a.operationStatus === "ENABLE") ||
+    b.campaignId.length - a.campaignId.length || b.campaignId.localeCompare(a.campaignId));
+  return { reportingDate, observedAt: raw.observedAt, coverage: raw.coverage, campaigns };
+}
+
+export function createAutomationRouter({ viewerIds, readSnapshot, readPerformance, readCampaignDay, configuredExtraClients, verifiedExtras,
   pendingReason, now = () => new Date() }: AutomationRouteDependencies) {
   const router = Router();
   let windowStart = -Infinity;
   const viewerRequests = new Map<number, number>();
   const registry = () => createAutomationReadRegistry({ extraConfig: configuredExtraClients?.(),
-    ppan: { readSnapshot, readPerformance }, verifiedExtras: verifiedExtras?.(), pendingReason });
+    ppan: { readSnapshot, readPerformance, readCampaignDay }, verifiedExtras: verifiedExtras?.(), pendingReason });
 
   router.use((_req, res, next) => {
     res.set("Cache-Control", "no-store").vary("Authorization");
@@ -212,6 +242,22 @@ export function createAutomationRouter({ viewerIds, readSnapshot, readPerformanc
     } catch (error) { next(error); }
   });
 
+  router.all("/campaigns/:clientId", async (req, res, next) => {
+    try {
+      if (!fixedGet(req, res)) return;
+      const { clientId } = req.params;
+      const entry = validAutomationClientId(clientId) ? registry().find(candidate => candidate.creator.clientId === clientId) : undefined;
+      if (!entry) {
+        res.status(404).json({ error: { code: "CREATOR_NOT_CONFIGURED", message: "ไม่พบ Creator ในรายการ Automation" } });
+        return;
+      }
+      let raw: unknown;
+      try { raw = await entry.adapter?.readCampaignDay?.(); } catch { /* Do not expose provider or credential errors. */ }
+      const checked = now();
+      res.json({ schemaVersion: 1, checkedAt: checked.toISOString(), clientId, ...verifyCampaignDay(raw, checked) });
+    } catch (error) { next(error); }
+  });
+
   // Unlike the generic report error handler, this private boundary never echoes an upstream/database exception.
   const safeError: ErrorRequestHandler = (error, _req, res, next) => {
     if (res.headersSent) { next(error); return; }
@@ -227,6 +273,7 @@ export function createAutomationRouter({ viewerIds, readSnapshot, readPerformanc
 
 const creatorSnapshot = createCreatorReader({ loadToken: loadCreatorToken });
 const creatorPerformance = createCreatorAutomationPerformance({ loadToken: loadCreatorToken });
+const creatorCampaignDay = createCreatorCampaignDayReader({ loadToken: loadCreatorToken }, CREATOR_BINDING);
 const creatorReadEnabled = () => process.env.CREATOR_READ_ENABLED === "true";
 const configuredExtraClients = () => process.env.CREATOR_AUTOMATION_EXTRA_READ_CLIENTS;
 const configuredVerifiedBindings = () => process.env.CREATOR_AUTOMATION_VERIFIED_READ_BINDINGS;
@@ -249,4 +296,5 @@ export const automationRouter = createAutomationRouter({
     : configuredVerifiedBindings() ? "identity-unverified" : "needs-authorization",
   readSnapshot: () => creatorReadEnabled() ? creatorSnapshot() : Promise.resolve(null),
   readPerformance: scope => creatorReadEnabled() ? creatorPerformance(scope) : Promise.resolve(null),
+  readCampaignDay: () => creatorReadEnabled() ? creatorCampaignDay() : Promise.resolve(null),
 });

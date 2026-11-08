@@ -27,8 +27,11 @@ export function configuredPpanCampaignActionMode(action: CampaignAction, env: No
 export function createPpanCampaignActions({ provider, store, mode, readPolicy, now = () => new Date() }:
   { provider: ReturnType<typeof createPpanCampaignActionProvider>; store: ReturnType<typeof createPpanCampaignActionStore>;
     mode: (action: CampaignAction) => Mode; readPolicy: () => Promise<WebBudgetPolicy>; now?: () => Date }) {
-  const list: CampaignAction[] = ["SET_ROI", "PAUSE", "RESUME"];
-  const find = async () => provider.find(await store.lastPausedId().catch(() => null));
+  const find = async (campaignId?: string) => {
+    if (campaignId === undefined) return provider.find(await store.lastPausedId().catch(() => null));
+    const exact = await provider.find(campaignId, { exact: true });
+    return exact?.campaignId === campaignId ? exact : null;
+  };
   const lookup = async (ownerId: number, operationId: string) => {
     const row = await store.get(ownerId, operationId);
     if (!row) throw new CampaignActionError("CAMPAIGN_OPERATION_NOT_FOUND", 404, "ไม่พบรายการของบัญชีนี้");
@@ -47,23 +50,27 @@ export function createPpanCampaignActions({ provider, store, mode, readPolicy, n
       BigInt(campaign.budgetMinor) + BigInt(others) <= BigInt(policy.clientDailyCapMinor);
   }
   return {
-    async status() {
-      const overall: Mode = list.some(a => mode(a) === "live") ? "live" : list.some(a => mode(a) === "dry-run") ? "dry-run" : "disabled";
-      const disabled = { clientId: "punpan_020" as const, mode: overall, campaign: null, capabilities: { setRoi: false, pause: false, resume: false, create: false } };
+    async status(campaignId?: string) {
+      const actionModes = { setRoi: mode("SET_ROI"), pause: mode("PAUSE"), resume: mode("RESUME") };
+      const modes = Object.values(actionModes);
+      const overall: Mode = modes.includes("live") ? "live" : modes.includes("dry-run") ? "dry-run" : "disabled";
+      const disabled = { clientId: "punpan_020" as const, mode: overall, actionModes, campaign: null, capabilities: { setRoi: false, pause: false, resume: false, create: false } };
       if (overall === "disabled") return { ...disabled, blocker: "MODE_DISABLED" };
       try {
-        const row = await find();
+        const row = await find(campaignId);
         if (!row) return { ...disabled, blocker: "NO_EXACT_CAMPAIGN" };
         const blocker = overall === "live" ? await store.findBlocker() : null;
-        const allowed = (a: CampaignAction) => changes(row, a) && mode(a) !== "disabled" && (mode(a) !== "live" || blocker === null);
+        const allowed = (a: CampaignAction, actionMode: Mode) => changes(row, a) && actionMode !== "disabled" &&
+          (actionMode !== "live" || (blocker === null && (a !== "RESUME" || campaignId === undefined || row.nativeAutoOff)));
         return { ...disabled, campaign: publicCampaign(row), blocker,
-          capabilities: { setRoi: allowed("SET_ROI"), pause: allowed("PAUSE"), resume: allowed("RESUME"), create: false } };
+          capabilities: { setRoi: allowed("SET_ROI", actionModes.setRoi), pause: allowed("PAUSE", actionModes.pause),
+            resume: allowed("RESUME", actionModes.resume), create: false } };
       } catch (e) { return { ...disabled, blocker: e instanceof CampaignActionError && e.code === "MULTIPLE_ACTIVE_CAMPAIGNS" ? e.code : "CAMPAIGN_UNAVAILABLE" }; }
     },
     async preview(ownerId: number, input: CampaignPreviewInput) {
       const actionMode = mode(input.action);
       if (actionMode === "disabled") return unready("MODE_DISABLED", "ยังไม่ได้เปิดเครื่องมือจัดการแคมเปญ");
-      const row = await find();
+      const row = await find(input.campaignId);
       if (!row || row.campaignId !== input.campaignId || row.operationStatus !== input.expectedStatus || row.roiTargetTenths !== input.expectedRoiTenths) {
         return unready("CAMPAIGN_BASELINE_CHANGED", "แคมเปญหรือข้อมูลล่าสุดเปลี่ยน กรุณาเปิดใหม่และตรวจอีกครั้ง");
       }
@@ -100,7 +107,7 @@ export function createPpanCampaignActions({ provider, store, mode, readPolicy, n
       let dispatched = false;
       let outcome: Awaited<ReturnType<typeof provider.send>> = "NOT_SENT";
       try {
-        const exact = await find();
+        const exact = await find(row.campaignId);
         const valid = (x: CampaignActionSnapshot | null): x is CampaignActionSnapshot => !!x && x.campaignId === row.campaignId &&
           x.fingerprint === row.fingerprint && x.operationStatus === row.before.status && x.roiTargetTenths === row.before.roiTenths && changes(x, row.action);
         if (valid(exact)) {
@@ -108,7 +115,7 @@ export function createPpanCampaignActions({ provider, store, mode, readPolicy, n
           outcome = await provider.send(exact, row.action, row.after, async () => {
             if (mode(row.action) !== "live" || Date.parse(row.expiresAt) <= now().getTime()) return false;
             if (row.action === "RESUME") {
-              const latest = await find();
+              const latest = await find(row.campaignId);
               if (!valid(latest) || !await withinResumeCap(latest)) return false;
             }
             return mode(row.action) === "live" && await recheckOperator() && await store.canDispatch(ownerId, operationId);
