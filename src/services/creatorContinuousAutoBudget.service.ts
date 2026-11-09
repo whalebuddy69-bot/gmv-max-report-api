@@ -12,8 +12,8 @@ type Sessions = ReturnType<typeof createCreatorContinuousAutoBudgetStore>;
 type Session = NonNullable<Awaited<ReturnType<Sessions["getLatest"]>>>;
 type EvidenceMode = ContinuousEvidence;
 type ArmInput = { expectedCampaignId: string; expectedBudgetMinor: number; expectedPolicyRevision: number } & (
-  { expectedLiveSessionId: string | null; nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: typeof LIVE_ROOM_SPEND_TREND; autoDetectLive?: true } |
-  { evidenceMode: "spend-trend"; expectedLiveSessionId?: never; nativeAutoOff?: never; noConcurrentChanges?: never; autoDetectLive?: never });
+  { expectedLiveSessionId: string | null; nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: typeof LIVE_ROOM_SPEND_TREND; autoDetectLive?: true; allowExhaustedRecovery?: true } |
+  { evidenceMode: "spend-trend"; expectedLiveSessionId?: never; nativeAutoOff?: never; noConcurrentChanges?: never; autoDetectLive?: never; allowExhaustedRecovery?: never });
 type Mode = "disabled" | "shadow" | "live";
 const unavailable = () => new WebBudgetError("AUTO_BUDGET_NOT_READY", 409, "ข้อมูลสำหรับเปิด Auto ยังไม่ครบ จึงยังไม่ส่งคำสั่งจริง");
 const CLIENT = "punpan_020" as const;
@@ -35,6 +35,15 @@ function spendReady(ctx: WebBudgetContext, at: Date, after?: string | null) {
     bangkokDay(new Date(watermark)) === ctx.reportingDate && (!after || watermark > instant(after));
 }
 const verifiedEnded = (ctx: WebBudgetRoomEvidence) => ctx.deliveryVerified === true && ctx.liveDeliveryState === "NOT_LIVE";
+function confirmedExhaustion(ctx: WebBudgetContext, priorIncrease: boolean) {
+  // This is the exact campaign's delivery state, never advertiser balance.
+  if (ctx.campaignDeliveryStatus === "CAMPAIGN_BUDGET_EXHAUSTED") {
+    // After a verified increase, a lingering provider flag may still refer
+    // to the old amount. The new amount must actually be used up.
+    return ctx.spendMinor >= ctx.budgetMinor || (!priorIncrease && ctx.spendMinor * 5 >= ctx.budgetMinor * 4);
+  }
+  return ctx.campaignDeliveryStatus === "ENABLED" && ctx.spendMinor >= ctx.budgetMinor;
+}
 function verifiedDetectedRoom<T extends WebBudgetRoomEvidence>(ctx: T, at: Date): ctx is T & { liveSessionId: string; liveSessionStartedAt: string } {
   const launch = instant(ctx.liveSessionStartedAt);
   return hasRoom(ctx) && Number.isFinite(launch) && launch <= at.getTime();
@@ -109,7 +118,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     previewCreatorAutoBudget({ now: at, context: ctx, policy, rounding: roundingFor(evidence) });
   // Deliberately process-local. A restart or incomplete read requires a fresh
   // pair of minute polls; an old qualifying sample never survives a restart.
-  let pulse: { key: string; at: number; spend: number; roomSpend?: number } | undefined;
+  let pulse: { key: string; at: number; spend: number; roomSpend?: number; exhausted: boolean } | undefined;
   function observeTrend(row: Session, ctx: WebBudgetContext) {
     const timestamp = instant(ctx.observedAt), anchor = Math.max(instant(row.authorizedAt), row.lastVerifiedAt ? instant(row.lastVerifiedAt) : 0);
     const roomSpend = row.autoDetectLive ? ctx.roomSpendMinor : undefined;
@@ -122,9 +131,20 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     const previous = pulse, gap = previous ? timestamp - previous.at : NaN;
     if (previous?.key === key && gap >= 0 && gap < 40_000 && ctx.spendMinor >= previous.spend &&
       (!row.autoDetectLive || (roomSpend ?? -1) >= (previous.roomSpend ?? Infinity))) return null;
-    pulse = { key, at: timestamp, spend: ctx.spendMinor, roomSpend };
-    return previous?.key === key && gap >= 40_000 && gap <= 95_000 && ctx.spendMinor > previous.spend &&
-      (!row.autoDetectLive || (roomSpend ?? -1) > (previous.roomSpend ?? Infinity)) ? previous : null;
+    const exhausted = row.allowExhaustedRecovery === true && confirmedExhaustion(ctx, row.lastVerifiedAt !== null);
+    pulse = { key, at: timestamp, spend: ctx.spendMinor, roomSpend, exhausted };
+    if (previous?.key !== key || gap < 40_000 || gap > 95_000) return null;
+    if (ctx.spendMinor > previous.spend && (!row.autoDetectLive || (roomSpend ?? -1) > (previous.roomSpend ?? Infinity))) {
+      return { ...previous, kind: "rising" as const };
+    }
+    // Full-budget recovery is not the ordinary 80% trigger. Two fresh,
+    // same-day reads must both verify exhaustion of this campaign budget;
+    // real, nondecreasing cost for its same verified room corroborates it.
+    if (row.autoDetectLive && row.allowExhaustedRecovery && previous.exhausted && exhausted && ctx.spendMinor >= previous.spend &&
+      (previous.roomSpend ?? 0) > 0 && (roomSpend ?? -1) >= (previous.roomSpend ?? Infinity)) {
+      return { ...previous, kind: "exhausted" as const };
+    }
+    return null;
   }
   async function read(campaignId: string, evidence: EvidenceMode, expectedLiveSessionId?: string, autoDetectLive?: true) {
     if (autoDetectLive && !adapters.readScheduledLiveContext) throw unavailable();
@@ -154,7 +174,8 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     const ownStatus = own?.status === "ACTIVE" ? (own.operationId ? "SENDING" : "ARMED") : own?.status;
     const continuousSession = own && ownStatus ? { sessionId: own.sessionId, status: ownStatus,
       startedAt: own.authorizedAt, reason: own.stopReason ?? (own.lastOutcome === "OUTCOME_UNKNOWN" ? own.lastOutcome : null),
-      ...(waiting(own) ? { waitingForLive: true as const } : {}), ...(own.autoDetectLive ? { autoDetectLive: true as const } : {}) } : null;
+      ...(waiting(own) ? { waitingForLive: true as const } : {}), ...(own.autoDetectLive ? { autoDetectLive: true as const } : {}),
+      ...(own.allowExhaustedRecovery ? { allowExhaustedRecovery: true as const } : {}) } : null;
     const base = { clientId, strategy: "continuous" as const, mode: currentMode, grant: null, continuousSession,
       ...(evidence !== "verified-room" ? { evidenceMode: evidence } : {}),
       canStop: !!own && own.status !== "STOPPED" };
@@ -185,7 +206,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
           if (boundRoom && verdict.status === "WOULD_INCREASE" && !reasons.length) reasons.push("SPEND_TREND_PENDING");
           return { ...base, evidenceMode: LIVE_ROOM_SPEND_TREND,
             canArm: canRequest && canStart(context, policy, fenced, at, LIVE_ROOM_SPEND_TREND) && !await legacyBusy(), blockers: reasons,
-            preview: { status: verdict.status, autoDetectLive: true as const, campaignId: campaign, currentBudgetMinor: context.budgetMinor,
+            preview: { status: verdict.status, autoDetectLive: true as const, allowExhaustedRecovery: true as const, campaignId: campaign, currentBudgetMinor: context.budgetMinor,
               liveSessionId: context.liveSessionId, liveSessionStartedAt: context.liveSessionStartedAt, spendMinor: context.spendMinor, policyRevision: policy.revision,
               thresholdMinor: Number((BigInt(context.budgetMinor) * 8n + 9n) / 10n), targetBudgetMinor: verdict.status === "WOULD_INCREASE" ? verdict.targetBudgetMinor : null,
               projectedClientSpendMinor: verdict.status === "WOULD_INCREASE" ? verdict.projectedClientSpendMinor : null, observedAt: context.observedAt } };
@@ -199,7 +220,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
         return { ...base, evidenceMode: LIVE_ROOM_SPEND_TREND, canArm: canRequest && !reasons.length && !await legacyBusy(), blockers: reasons,
           preview: { ...(matched ? { status: "LIVE_WAITING_FOR_SPEND", liveSessionId: matched.liveSessionId, liveSessionStartedAt: matched.liveSessionStartedAt }
             : { status: "WAITING_FOR_LIVE", waitingForLive: true as const, liveSessionId: null }),
-            autoDetectLive: true as const, campaignId: campaign, currentBudgetMinor: context.budgetMinor, spendMinor: null,
+            autoDetectLive: true as const, allowExhaustedRecovery: true as const, campaignId: campaign, currentBudgetMinor: context.budgetMinor, spendMinor: null,
             policyRevision: policy.revision, thresholdMinor: Number((BigInt(context.budgetMinor) * 8n + 9n) / 10n), targetBudgetMinor: null,
             projectedClientSpendMinor: null, observedAt: context.observedAt } };
       }
@@ -243,9 +264,11 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     const evidence = input.evidenceMode === LIVE_ROOM_SPEND_TREND ? LIVE_ROOM_SPEND_TREND : evidenceMode();
     const trend = input.evidenceMode === "spend-trend";
     const autoDetectLive = input.autoDetectLive === true;
+    const allowExhaustedRecovery = input.allowExhaustedRecovery === true;
     const wait = input.expectedLiveSessionId === null && evidence === LIVE_ROOM_SPEND_TREND && canWaitForLive();
     if (!allowedEvidence(evidence) || !supportsContinuousEvidence(clientId, evidence) || !WEB_BUDGET_CAMPAIGN_ID.test(input.expectedCampaignId) ||
       (input.autoDetectLive !== undefined && (!autoDetectLive || evidence !== LIVE_ROOM_SPEND_TREND || !canAutoDetect())) ||
+      (input.allowExhaustedRecovery !== undefined && (!allowExhaustedRecovery || !autoDetectLive)) ||
       input.evidenceMode !== (evidence === "verified-room" ? undefined : evidence) ||
       (trend ? input.expectedLiveSessionId !== undefined || input.nativeAutoOff !== undefined || input.noConcurrentChanges !== undefined
         : (!wait && (typeof input.expectedLiveSessionId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(input.expectedLiveSessionId))) ||
@@ -270,7 +293,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       ...(trend ? { evidenceMode: "spend-trend" as const, liveSessionId: null, nativeAutoOffAttested: false as const, noConcurrentChangesAttested: false as const }
         : { ...(evidence === LIVE_ROOM_SPEND_TREND ? { evidenceMode: evidence } : {}), liveSessionId: input.expectedLiveSessionId,
           nativeAutoOffAttested: true as const, noConcurrentChangesAttested: true as const,
-          ...(autoDetectLive ? { autoDetectLive: true as const } : {}) }) });
+          ...(autoDetectLive ? { autoDetectLive: true as const } : {}), ...(allowExhaustedRecovery ? { allowExhaustedRecovery: true as const } : {}) }) });
     if (!row) throw new WebBudgetError("AUTO_BUDGET_SESSION_EXISTS", 409, "มีรอบ Auto หรือรายการที่ยังต้องตรวจสอบอยู่แล้ว");
     return { sessionId: row.sessionId, startedAt: row.authorizedAt, ...(wait ? { waitingForLive: true as const } : {}) };
   }
@@ -435,11 +458,13 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
         async (latest, latestPolicy) => {
           const nowAt = now(), decision = preview(latest, latestPolicy, nowAt, evidence);
           const sameRoom = hasRoom(latest) && latest.liveSessionId === current.liveSessionId;
-          const rising = previousSpend !== null && latest.reportingDate === context.reportingDate &&
-            instant(latest.observedAt) >= instant(context.observedAt) && latest.spendMinor > previousSpend.spend &&
-            (!autoDetect || (verifiedDetectedRoom(latest, nowAt) && latest.liveSessionStartedAt === context.liveSessionStartedAt &&
-              (latest.roomSpendMinor ?? -1) > (previousSpend.roomSpend ?? Infinity) && (latest.roomSpendMinor ?? -1) >= (context.roomSpendMinor ?? Infinity)));
-          const signal = trend ? rising : sameRoom && (!roomTrend || (rising && latest.spendMinor >= context.spendMinor));
+          const sameSampleScope = previousSpend !== null && latest.reportingDate === context.reportingDate &&
+            instant(latest.observedAt) >= instant(context.observedAt) && (!autoDetect || (verifiedDetectedRoom(latest, nowAt) &&
+              latest.liveSessionStartedAt === context.liveSessionStartedAt && (latest.roomSpendMinor ?? -1) >= (context.roomSpendMinor ?? Infinity)));
+          const qualified = sameSampleScope && (previousSpend.kind === "exhausted"
+            ? current.allowExhaustedRecovery === true && autoDetect && confirmedExhaustion(latest, current.lastVerifiedAt !== null) && latest.spendMinor >= context.spendMinor
+            : latest.spendMinor > previousSpend.spend && (!autoDetect || (latest.roomSpendMinor ?? -1) > (previousSpend.roomSpend ?? Infinity)));
+          const signal = trend ? qualified : sameRoom && (!roomTrend || (qualified && latest.spendMinor >= context.spendMinor));
           const same = latest.campaignId === current.campaignId && latest.budgetMinor === current.baselineBudgetMinor &&
             latest.fingerprint === current.baselineFingerprint && latestPolicy.revision === current.policyRevision;
           const eligible = decision.status === "WOULD_INCREASE" && decision.targetBudgetMinor === verdict.targetBudgetMinor &&

@@ -162,7 +162,9 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
       throw new WebBudgetError("AUTO_BUDGET_NOT_CONFIGURED", 404, "ยังไม่ได้ตั้งค่า Auto สำหรับ Creator นี้");
     }
     const roomFields = [...base, "expectedLiveSessionId", "nativeAutoOff", "noConcurrentChanges", "evidenceMode"];
-    const newDetection = fields(value, [...roomFields, "autoDetectLive"]) && value.autoDetectLive === true;
+    const exhaustedRecovery = fields(value, [...roomFields, "autoDetectLive", "allowExhaustedRecovery"]) &&
+      value.autoDetectLive === true && value.allowExhaustedRecovery === true;
+    const newDetection = exhaustedRecovery || fields(value, [...roomFields, "autoDetectLive"]) && value.autoDetectLive === true;
     const roomInput = fields(value, roomFields) || newDetection;
     if (continuous && (isVerifiedRoomCreator(firstSegment(req)) || firstSegment(req) === "nnshop5719" ||
       roomInput && value.evidenceMode === LIVE_ROOM_SPEND_TREND)) {
@@ -175,7 +177,8 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
       return continuous.arm(id, { expectedCampaignId: value.expectedCampaignId, expectedLiveSessionId: value.expectedLiveSessionId,
         expectedBudgetMinor: value.expectedBudgetMinor, expectedPolicyRevision: value.expectedPolicyRevision,
         evidenceMode: LIVE_ROOM_SPEND_TREND, nativeAutoOff: true, noConcurrentChanges: true,
-        ...(newDetection ? { autoDetectLive: true as const } : {}) }, () => recheck(req, id));
+        ...(newDetection ? { autoDetectLive: true as const } : {}),
+        ...(exhaustedRecovery ? { allowExhaustedRecovery: true as const } : {}) }, () => recheck(req, id));
     }
     if (continuous && !isVerifiedRoomCreator(firstSegment(req)) && fields(value, [...base, "evidenceMode"]) && value.evidenceMode === "spend-trend") {
       if (typeof value.expectedCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedCampaignId)

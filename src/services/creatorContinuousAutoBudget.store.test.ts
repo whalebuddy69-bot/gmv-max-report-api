@@ -153,7 +153,8 @@ describe("Ppan continuous Auto session", () => {
     await sessions.ensureSchema();
     const draft = arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, liveSessionId: null });
     const old = (await sessions.arm(draft))!;
-    await h.db.exec(`ALTER TABLE ${table} DROP CONSTRAINT creator_ashop_cauto_session_auto_detect_v5, DROP COLUMN auto_detect_live`);
+    await h.db.exec(`ALTER TABLE ${table} DROP CONSTRAINT creator_ashop_cauto_session_exhausted_recovery_v6, DROP COLUMN allow_exhausted_recovery,
+      DROP CONSTRAINT creator_ashop_cauto_session_auto_detect_v5, DROP COLUMN auto_detect_live`);
     await sessions.ensureSchema(); await sessions.ensureSchema();
     expect(await sessions.getActive()).toEqual(old);
     expect((await h.db.query(`SELECT auto_detect_live FROM ${table} WHERE session_id=$1`, [old.sessionId])).rows)
@@ -183,6 +184,39 @@ describe("Ppan continuous Auto session", () => {
     }
   }, 30_000);
 
+  it("keeps existing auto-detect authority unchanged and only binds explicitly armed exhausted recovery", async () => {
+    const h = setup(), table = "creator_bubpa_cauto_auto_budget_sessions";
+    const sessions = createCreatorContinuousAutoBudgetStore(h.database, "bubpa_shop189");
+    await sessions.ensureSchema();
+    const draft = arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, liveSessionId: null, autoDetectLive: true });
+    const old = (await sessions.arm(draft))!;
+    await h.db.exec(`ALTER TABLE ${table} DROP CONSTRAINT creator_bubpa_cauto_session_exhausted_recovery_v6, DROP COLUMN allow_exhausted_recovery`);
+    await sessions.ensureSchema(); await sessions.ensureSchema();
+    expect(await sessions.getActive()).toEqual(old);
+    expect((await h.db.query(`SELECT auto_detect_live, allow_exhausted_recovery FROM ${table} WHERE session_id=$1`, [old.sessionId])).rows)
+      .toEqual([{ auto_detect_live: true, allow_exhausted_recovery: false }]);
+    expect(await sessions.bindLiveSession({ ...old, allowExhaustedRecovery: true }, ROOM)).toBeNull();
+    expect(await sessions.bindLiveSession(old, ROOM)).toEqual({ ...old, liveSessionId: ROOM });
+    await sessions.stop(old.ownerId, old.sessionId);
+
+    expect(await sessions.arm(arm({ allowExhaustedRecovery: true }))).toBeNull();
+    expect(await sessions.arm(trendArm({ allowExhaustedRecovery: true }))).toBeNull();
+    expect(await sessions.arm(arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, allowExhaustedRecovery: true }))).toBeNull();
+    const recoveryDraft = { ...draft, sessionId: randomUUID(), allowExhaustedRecovery: true as const };
+    expect(await sessions.arm({ ...recoveryDraft, nativeAutoOffAttested: false })).toBeNull();
+    expect(await sessions.arm({ ...recoveryDraft, noConcurrentChangesAttested: false })).toBeNull();
+    const current = (await sessions.arm(recoveryDraft))!;
+    expect(current).toMatchObject({ ...recoveryDraft, status: "ACTIVE" });
+    await expect(h.db.query(`UPDATE ${table} SET auto_detect_live=false WHERE session_id=$1`, [current.sessionId]))
+      .rejects.toMatchObject({ code: "23514" });
+    const { allowExhaustedRecovery: _dropped, ...missingAuthority } = current;
+    expect(await sessions.bindLiveSession(missingAuthority, ROOM)).toBeNull();
+    expect(await sessions.bindLiveSession(current, ROOM)).toEqual({ ...current, liveSessionId: ROOM });
+    expect(await sessions.stop(current.ownerId, current.sessionId)).toMatchObject({ status: "STOPPED", allowExhaustedRecovery: true });
+    expect(await sessions.arm(arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true, allowExhaustedRecovery: true })))
+      .toMatchObject({ liveSessionId: ROOM, autoDetectLive: true, allowExhaustedRecovery: true, status: "ACTIVE" });
+  });
+
   it("migrates Ppan and Srihiw in place, keeping each legacy pending send and requiring a room for new hybrid attempts", async () => {
     const h = setup();
     for (const id of ["punpan_020", "srihiw"] as const) {
@@ -209,8 +243,9 @@ describe("Ppan continuous Auto session", () => {
       await sessions.ensureSchema(); await sessions.ensureSchema();
       const pending = (await sessions.getActive())!;
       expect(pending).toMatchObject({ ...old, status: "ACTIVE", operationId: pendingId });
-      expect((await h.db.query(`SELECT * FROM ${table}`)).rows).toEqual([{ ...before, auto_detect_live: false }]);
+      expect((await h.db.query(`SELECT * FROM ${table}`)).rows).toEqual([{ ...before, auto_detect_live: false, allow_exhausted_recovery: false }]);
       expect(pending.autoDetectLive).toBeUndefined();
+      expect(pending.allowExhaustedRecovery).toBeUndefined();
       await expect(h.db.query(`UPDATE ${table} SET auto_detect_live=true WHERE session_id=$1`, [old.sessionId]))
         .rejects.toMatchObject({ code: "23514" });
       expect((await h.db.query(`SELECT operation_id,live_session_id,evidence_mode,retry_released FROM ${attempts}`)).rows)

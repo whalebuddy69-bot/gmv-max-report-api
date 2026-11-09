@@ -164,6 +164,19 @@ describe("Automation web budget HTTP boundary", () => {
     expect(h.bubpaRoom.status).toHaveBeenLastCalledWith(true, 27);
   });
 
+  it("accepts exhausted recovery only with explicit auto-detect consent and both attestations", async () => {
+    const h = await start({ withContinuous: true, withVerifiedContinuous: true });
+    const payload = { expectedCampaignId: PREPARE.expectedCampaignId, expectedBudgetMinor: PREPARE.expectedBudgetMinor,
+      expectedPolicyRevision: 2, expectedLiveSessionId: null, nativeAutoOff: true, noConcurrentChanges: true,
+      evidenceMode: "verified-room-spend-trend", autoDetectLive: true, allowExhaustedRecovery: true };
+    expect((await h.post("/bubpa_shop189/auto/arm", JSON.stringify(payload))).status).toBe(200);
+    expect(h.bubpaRoom.arm).toHaveBeenCalledWith(27, payload, expect.any(Function));
+    for (const change of [{ autoDetectLive: undefined }, { allowExhaustedRecovery: false }, { noConcurrentChanges: false }]) {
+      expect((await h.post("/bubpa_shop189/auto/arm", JSON.stringify({ ...payload, ...change }))).status).toBe(400);
+    }
+    expect(h.bubpaRoom.arm).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps Srihiw continuous arm isolated and Ppan diagnostics limited to operators", async () => {
     const h = await start({ withContinuous: true, withSrihiwContinuous: true });
     const payload = { expectedCampaignId: PREPARE.expectedCampaignId, expectedBudgetMinor: PREPARE.expectedBudgetMinor,

@@ -39,6 +39,7 @@ export interface WebBudgetRoomEvidence {
 export interface WebBudgetContext extends WebBudgetCampaignEvidence, WebBudgetRoomEvidence {
   spendMinor: number; aggregateSpendMinor: number;
   providerSpendObservedAt?: string | null;
+  campaignDeliveryStatus?: "ENABLED" | "CAMPAIGN_BUDGET_EXHAUSTED" | "OTHER";
 }
 export type WebAutoBudgetProof = { previousBudgetMinor: number; targetBudgetMinor: number; rounding?: "floor-satang" };
 export type WebBudgetAuthorization = { nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: typeof LIVE_ROOM_SPEND_TREND; autoDetectLive?: true }

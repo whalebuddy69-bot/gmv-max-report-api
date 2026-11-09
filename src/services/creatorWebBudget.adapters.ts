@@ -4,7 +4,7 @@ import type { AutomationVerifiedCreatorBinding } from "./creatorAutomationRegist
 import { configuredCreatorScheduledAutoLive, configuredCreatorWebBudgetMode, configuredCreatorSpendTrendLive, creatorBudgetPolicyPath,
   allowsScheduledCreatorAuto, isExtraCreatorBudgetScope, isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND, type CreatorBudgetScope } from "./creatorBudgetScope";
 import { createCreatorVerifiedLiveRoomReader } from "./creatorVerifiedLiveRoom.service";
-import { WEB_BUDGET_MAX_MINOR, WebBudgetError, type WebBudgetAdapters, type WebBudgetPreArmContext, type WebBudgetRoomEvidence,
+import { WEB_BUDGET_MAX_MINOR, WebBudgetError, type WebBudgetAdapters, type WebBudgetContext, type WebBudgetPreArmContext, type WebBudgetRoomEvidence,
   type WebBudgetSource } from "./creatorWebBudget.service";
 
 const POLICY_ORIGIN = "https://whale-buddy-ads-control-plane.onrender.com/internal/automation";
@@ -17,8 +17,9 @@ const MAX_BODY = 1_048_576;
 
 type Data = Record<string, unknown>;
 type Native = "DISABLED" | "UNKNOWN" | "ENABLED" | "CONFLICT";
+type CampaignListObservation = { stamp: string; campaignDeliveryStatus?: WebBudgetContext["campaignDeliveryStatus"] };
 type Sample = { budgetMinor: number; stamp: string; unchanged: string; fingerprint: string; native: Native;
-  scheduleStartAt: string; scheduleEndAt: string | null };
+  scheduleStartAt: string; scheduleEndAt: string | null; campaignDeliveryStatus?: WebBudgetContext["campaignDeliveryStatus"] };
 type Policy = Awaited<ReturnType<WebBudgetAdapters["readPolicy"]>>;
 
 function unverified(): never { throw new Error("WEB_BUDGET_ADAPTER_UNVERIFIED"); }
@@ -27,6 +28,12 @@ function opt(x: unknown): Data { return x == null ? {} : object(x); }
 function nonnegative(x: unknown): x is number { return Number.isSafeInteger(x) && Number(x) >= 0; }
 function positive(x: unknown): x is number { return nonnegative(x) && x > 0; }
 function noShop(x: unknown) { return x == null || x === "" || x === "0"; }
+function campaignDeliveryStatus(value: unknown): WebBudgetContext["campaignDeliveryStatus"] {
+  if (value === undefined) return undefined;
+  if (value === "CAMPAIGN_STATUS_ENABLE") return "ENABLED";
+  if (value === "CAMPAIGN_STATUS_BUDGET_EXCEED") return "CAMPAIGN_BUDGET_EXHAUSTED";
+  return "OTHER";
+}
 function validIso(x: unknown): x is string {
   return typeof x === "string" && Number.isFinite(Date.parse(x)) && new Date(x).toISOString() === x;
 }
@@ -196,13 +203,13 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     if (path === INFO) url.searchParams.set("campaign_id", campaignId);
     else {
       url.searchParams.set("filtering", JSON.stringify({ gmv_max_promotion_types: ["LIVE_GMV_MAX"], campaign_ids: [campaignId] }));
-      url.searchParams.set("fields", JSON.stringify(["advertiser_id", "campaign_id", "operation_status", "modify_time"]));
+      url.searchParams.set("fields", JSON.stringify(["advertiser_id", "campaign_id", "operation_status", "modify_time", "secondary_status"]));
       url.searchParams.set("page", "1"); url.searchParams.set("page_size", "100");
     }
     return getTikTokData(url, accessToken);
   }
 
-  async function exactCampaignStamp(campaignId: string, accessToken: string, allowInactive = false): Promise<string | null> {
+  async function exactCampaignList(campaignId: string, accessToken: string, allowInactive = false): Promise<CampaignListObservation | null> {
     const list = await providerGet(LIST, campaignId, accessToken);
     const page = object(list.page_info);
     if (!Array.isArray(list.list) || page.page !== 1 || (allowInactive &&
@@ -214,7 +221,8 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     if (row.advertiser_id !== binding.advertiserId || row.campaign_id !== campaignId) unverified();
     if (allowInactive && (row.operation_status === "DISABLE" || row.operation_status === "DELETE")) return null;
     if (row.operation_status !== "ENABLE" || !secondsStamp(row.modify_time)) unverified();
-    return row.modify_time;
+    const delivery = campaignDeliveryStatus(row.secondary_status);
+    return { stamp: row.modify_time, ...(delivery === undefined ? {} : { campaignDeliveryStatus: delivery }) };
   }
 
   async function sample(campaignId: string, accessToken: string, { preArmStamp, strictIdentity = false }: {
@@ -245,10 +253,13 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     const { budget, modify_time: _, ...untouched } = data;
     const budgetMinor = minor(budget);
     if (!positive(budgetMinor)) unverified();
-    const stamp = preArmStamp ?? await exactCampaignStamp(campaignId, accessToken);
-    if (stamp === null) unverified();
+    const listed: CampaignListObservation | null = preArmStamp === undefined ? await exactCampaignList(campaignId, accessToken) : { stamp: preArmStamp };
+    if (listed === null) unverified();
+    const { stamp, campaignDeliveryStatus: delivery } = listed;
     const native = nativeState(data), unchanged = hash(untouched);
-    return { budgetMinor, stamp, unchanged, native, fingerprint: hash([budgetMinor, stamp, unchanged]), scheduleStartAt, scheduleEndAt };
+    // Delivery is provider-derived and can change without any campaign edit.
+    return { budgetMinor, stamp, unchanged, native, fingerprint: hash([budgetMinor, stamp, unchanged]), scheduleStartAt, scheduleEndAt,
+      ...(delivery === undefined ? {} : { campaignDeliveryStatus: delivery }) };
   }
 
   async function verifyAdvertiser(accessToken: string) {
@@ -271,8 +282,8 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
   async function preArmContext(expectedCampaignId: string, accessToken: string, startedAt: string): Promise<WebBudgetPreArmContext | null> {
     const reportingDate = bangkokDay(new Date(startedAt));
     await verifyAdvertiser(accessToken);
-    const stamp = await exactCampaignStamp(expectedCampaignId, accessToken, true);
-    const live = stamp === null ? null : await sample(expectedCampaignId, accessToken, { preArmStamp: stamp });
+    const listed = await exactCampaignList(expectedCampaignId, accessToken, true);
+    const live = listed === null ? null : await sample(expectedCampaignId, accessToken, { preArmStamp: listed.stamp });
     const observed = now();
     if (!fresh(startedAt, observed.getTime(), 20_000) || bangkokDay(observed) !== reportingDate) unverified();
     if (!live || (live.scheduleEndAt !== null && Date.parse(live.scheduleEndAt) <= observed.getTime())) return null;
@@ -323,7 +334,8 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
       { deliveryVerified: false, liveDeliveryState: "UNKNOWN" as const, liveSessionId: null };
     return { campaignId: expectedCampaignId, reportingDate: raw.reportingDate as string, observedAt: raw.observedAt,
       budgetMinor: live.budgetMinor, spendMinor: c.spendMinor, aggregateSpendMinor: quality.aggregateSpendMinor,
-      fingerprint: live.fingerprint, nativeAutoState: live.native, providerSpendObservedAt: null, ...room, sample: live };
+      fingerprint: live.fingerprint, nativeAutoState: live.native, providerSpendObservedAt: null,
+      ...(live.campaignDeliveryStatus === undefined ? {} : { campaignDeliveryStatus: live.campaignDeliveryStatus }), ...room, sample: live };
   }
 
   async function readScheduledLiveContext(expectedCampaignId: string, expectedLiveSessionId?: string, autoDetectLive?: true) {

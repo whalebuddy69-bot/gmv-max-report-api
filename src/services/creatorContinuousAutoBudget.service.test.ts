@@ -117,8 +117,8 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
     legacyBusy, evidenceMode: () => evidence, ...(scheduled ? { scheduledLive: () => mode === "live" } : {}), observeTick: observe, now });
   return { service, sessions, discover, dispatch, ledger, adapters, legacyBusy, writes, lineOutbox, observe, readContext: () => context,
     armWaiting: () => service.arm(OWNER, { ...CONFIRM, expectedLiveSessionId: null, evidenceMode: LIVE_ROOM_SPEND_TREND }, async () => true),
-    armDetecting: (room: string | null) => service.arm(OWNER, { ...CONFIRM, expectedLiveSessionId: room,
-      evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true }, async () => true),
+    armDetecting: (room: string | null, allowExhaustedRecovery?: true) => service.arm(OWNER, { ...CONFIRM, expectedLiveSessionId: room,
+      evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true, ...(allowExhaustedRecovery ? { allowExhaustedRecovery } : {}) }, async () => true),
     setPolicy: (changes: Partial<WebBudgetPolicy>) => { policy = { ...policy, ...changes }; },
     nextReservedSpend: (spend: number) => { nextReservedSpend = spend; },
     arm: () => service.arm(OWNER, evidence === "spend-trend" ? { expectedCampaignId: CAMPAIGN, expectedBudgetMinor: ORIGINAL_BUDGET,
@@ -132,6 +132,55 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
 }
 
 describe("Ppan continuous budget automation", () => {
+  it.each([
+    ["ENABLED", ORIGINAL_BUDGET], ["CAMPAIGN_BUDGET_EXHAUSTED", ORIGINAL_BUDGET - 1_000],
+  ] as const)("recovers from two flat reads when %s verifies the budget is exhausted", async (campaignDeliveryStatus, spendMinor) => {
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, "bubpa_shop189", true, true);
+    f.refresh(0, { liveSessionStartedAt: "2026-11-07T13:00:00.000Z", campaignDeliveryStatus,
+      spendMinor, aggregateSpendMinor: spendMinor, roomSpendMinor: spendMinor - 10 });
+    await f.armDetecting(ROOM, true);
+    expect(await f.service.status(true, OWNER, "summary")).toMatchObject({ continuousSession: { allowExhaustedRecovery: true } });
+    f.refresh(60_000); await f.service.tick();
+    expect(f.dispatch).not.toHaveBeenCalled();
+    f.refresh(60_000); await f.service.tick();
+    expect(f.writes).toEqual([780_000]);
+    expect(f.lineOutbox.size).toBe(1);
+    f.refresh(60_000); await f.service.tick();
+    f.refresh(60_000); await f.service.tick();
+    expect(f.writes).toEqual([780_000]); // not another increase from stale exhaustion of the old amount
+    f.refresh(60_000, { spendMinor: 780_000, aggregateSpendMinor: 780_000, roomSpendMinor: 779_900 }); await f.service.tick();
+    f.refresh(60_000); await f.service.tick();
+    expect(f.writes).toEqual([780_000, 936_000]);
+  });
+
+  it.each([
+    { name: "flat 80% alone", spend: ORIGINAL_THRESHOLD, status: "ENABLED", optIn: true },
+    { name: "insufficient account balance or a different delivery state", spend: ORIGINAL_BUDGET, status: "OTHER", optIn: true },
+    { name: "an older consent without recovery", spend: ORIGINAL_BUDGET, status: "CAMPAIGN_BUDGET_EXHAUSTED", optIn: undefined },
+    { name: "out-of-budget flag before 80%", spend: ORIGINAL_THRESHOLD - 1, status: "CAMPAIGN_BUDGET_EXHAUSTED", optIn: true },
+  ] as const)("never recovers based on $name", async ({ spend, status, optIn }) => {
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, "bubpa_shop189", true, true);
+    f.refresh(0, { liveSessionStartedAt: "2026-11-07T13:00:00.000Z", campaignDeliveryStatus: status,
+      spendMinor: spend, aggregateSpendMinor: spend, roomSpendMinor: spend - 10 });
+    await f.armDetecting(ROOM, optIn);
+    f.refresh(60_000); await f.service.tick();
+    f.refresh(60_000); await f.service.tick();
+    expect(f.ledger.create).not.toHaveBeenCalled();
+    expect(f.dispatch).not.toHaveBeenCalled();
+  });
+
+  it("does not recover if exact LIVE proof or headroom under the daily ceiling is lost", async () => {
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, "bubpa_shop189", true, true);
+    f.refresh(0, { liveSessionStartedAt: "2026-11-07T13:00:00.000Z", campaignDeliveryStatus: "CAMPAIGN_BUDGET_EXHAUSTED",
+      spendMinor: ORIGINAL_BUDGET, aggregateSpendMinor: ORIGINAL_BUDGET, roomSpendMinor: ORIGINAL_BUDGET - 10 });
+    await f.armDetecting(ROOM, true);
+    f.refresh(60_000); await f.service.tick();
+    f.refresh(60_000, { deliveryVerified: false, liveDeliveryState: "UNKNOWN" }); await f.service.tick();
+    expect(f.ledger.create).not.toHaveBeenCalled();
+    f.refresh(60_000, { deliveryVerified: true, liveDeliveryState: "LIVE", aggregateSpendMinor: 1_100_000 }); await f.service.tick();
+    f.refresh(60_000); await f.service.tick();
+    expect(f.ledger.create).not.toHaveBeenCalled();
+  });
   it.each(["punpan_020", "srihiw", "nnshop5719", "ashopbytheta", "myushop4", "bubpa_shop189"] as const)(
     "can explicitly link %s's existing LIVE even before the spend row arrives", async client => {
       const f = fixture("live", client === "punpan_020" || client === "srihiw" ? "spend-trend" : LIVE_ROOM_SPEND_TREND, client, true, true);

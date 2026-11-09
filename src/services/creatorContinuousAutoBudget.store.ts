@@ -25,6 +25,7 @@ export interface CreatorContinuousAutoBudgetArmInput {
   nativeAutoOffAttested: boolean;
   noConcurrentChangesAttested: boolean;
   autoDetectLive?: true;
+  allowExhaustedRecovery?: true;
 }
 export interface CreatorContinuousAutoBudgetSession extends CreatorContinuousAutoBudgetArmInput {
   clientId: CreatorContinuousAutoBudgetClient;
@@ -325,6 +326,36 @@ BEGIN
 END
 $creator_continuous_auto_detect$;`;
 
+// Recovery is a separate opt-in. A deployment never converts an existing
+// armed or historical row into authority to increase a stopped spend stream.
+const CREATOR_CONTINUOUS_EXHAUSTED_RECOVERY_SCHEMA_SQL = `
+DO $creator_continuous_exhausted_recovery$
+DECLARE
+  sessions constant regclass := 'creator_continuous_auto_budget_sessions'::regclass;
+  expected_guard constant text := '((NOT allow_exhausted_recovery) OR (auto_detect_live AND (evidence_mode = ''${LIVE_ROOM_SPEND_TREND}''::text) AND native_auto_off_attested AND no_concurrent_changes_attested))';
+  current_guard text;
+  column_present boolean;
+  valid_column boolean;
+BEGIN
+  FOR pass IN 1..2 LOOP
+    SELECT true, a.atttypid='boolean'::regtype AND a.attnotnull AND pg_get_expr(d.adbin,d.adrelid)='false'
+      INTO column_present,valid_column
+      FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+      WHERE a.attrelid=sessions AND a.attname='allow_exhausted_recovery' AND NOT a.attisdropped;
+    SELECT pg_get_expr(conbin,conrelid) INTO current_guard FROM pg_constraint WHERE conrelid=sessions
+      AND conname='creator_continuous_session_exhausted_recovery_v6' AND convalidated AND contype='c';
+    IF valid_column AND current_guard=expected_guard THEN RETURN; END IF;
+    IF pass=1 THEN LOCK TABLE creator_continuous_auto_budget_sessions IN ACCESS EXCLUSIVE MODE; END IF;
+  END LOOP;
+  IF column_present OR current_guard IS NOT NULL THEN RAISE EXCEPTION 'Unrecognized Creator exhausted-budget recovery authority'; END IF;
+  ALTER TABLE creator_continuous_auto_budget_sessions
+    ADD COLUMN allow_exhausted_recovery boolean NOT NULL DEFAULT false,
+    ADD CONSTRAINT creator_continuous_session_exhausted_recovery_v6 CHECK (
+      NOT allow_exhausted_recovery OR (auto_detect_live AND evidence_mode='${LIVE_ROOM_SPEND_TREND}' AND native_auto_off_attested AND no_concurrent_changes_attested)
+    );
+END
+$creator_continuous_exhausted_recovery$;`;
+
 type Runner = ReturnType<CreatorWebBudgetDatabase["createQueryRunner"]>;
 function rows(value: unknown): Record<string, unknown>[] {
   if (!Array.isArray(value)) throw new Error("CREATOR_CONTINUOUS_AUTO_STORE_SHAPE");
@@ -349,6 +380,7 @@ function validArm(value: CreatorContinuousAutoBudgetArmInput | null | undefined,
     identifier(value.campaignId, WEB_BUDGET_CAMPAIGN_ID) && positive(value.policyRevision) &&
     positive(value.baselineBudgetMinor, WEB_BUDGET_MAX_MINOR) && identifier(value.baselineFingerprint, FINGERPRINT) &&
     (value.autoDetectLive === undefined || (value.autoDetectLive === true && value.evidenceMode === LIVE_ROOM_SPEND_TREND && allowsScheduledCreatorAuto(clientId))) &&
+    (value.allowExhaustedRecovery === undefined || (value.allowExhaustedRecovery === true && value.autoDetectLive === true)) &&
     (value.evidenceMode === "spend-trend"
       ? value.liveSessionId === null && value.nativeAutoOffAttested === false && value.noConcurrentChangesAttested === false
       : (value.evidenceMode === undefined || value.evidenceMode === "verified-room" || value.evidenceMode === LIVE_ROOM_SPEND_TREND) &&
@@ -381,10 +413,12 @@ function map(row: Record<string, unknown>, clientId: CreatorContinuousAutoBudget
   const value = { clientId: row.client_id, sessionId: row.session_id, ownerId: integerFromDb(row.owner_id),
     campaignId: row.campaign_id, liveSessionId: row.live_session_id, evidenceMode: row.evidence_mode, policyRevision: integerFromDb(row.policy_revision),
     ...(row.auto_detect_live === true ? { autoDetectLive: true as const } : {}),
+    ...(row.allow_exhausted_recovery === true ? { allowExhaustedRecovery: true as const } : {}),
     baselineBudgetMinor: integerFromDb(row.baseline_budget_minor),
     baselineFingerprint: row.baseline_fingerprint, nativeAutoOffAttested: row.native_auto_off_attested,
     noConcurrentChangesAttested: row.no_concurrent_changes_attested, authorizedAt, status, operationId, lastOutcome, lastVerifiedAt, stopReason };
-  if (row.evidence_mode === undefined || typeof row.auto_detect_live !== "boolean" || !validScopedSession(value as CreatorContinuousAutoBudgetSession, clientId) ||
+  if (row.evidence_mode === undefined || typeof row.auto_detect_live !== "boolean" || typeof row.allow_exhausted_recovery !== "boolean" ||
+    !validScopedSession(value as CreatorContinuousAutoBudgetSession, clientId) ||
     (status !== "ACTIVE" && status !== "BLOCKED" && status !== "STOPPED") ||
     (operationId !== null && !identifier(operationId, WEB_BUDGET_OPERATION_ID)) ||
     (lastOutcome !== null && lastOutcome !== "APPLIED_VERIFIED" && lastOutcome !== "NOT_SENT" && lastOutcome !== "OUTCOME_UNKNOWN") ||
@@ -458,6 +492,7 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
       if (roomOnly) await runner.query(CREATOR_VERIFIED_ROOM_ONLY_SCHEMA_SQL);
       if (allowsScheduledCreatorAuto(clientId)) await runner.query(roomOnly ? CREATOR_CONTINUOUS_AWAITING_LIVE_SCHEMA_SQL : CREATOR_CONTINUOUS_MIXED_EVIDENCE_SCHEMA_SQL);
       await runner.query(CREATOR_CONTINUOUS_AUTO_DETECT_SCHEMA_SQL);
+      await runner.query(CREATOR_CONTINUOUS_EXHAUSTED_RECOVERY_SCHEMA_SQL);
     }); },
     async getActive() {
       // Includes stopped sessions whose already reserved operation still needs reconciliation.
@@ -472,14 +507,14 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
       if (!validArm(input, clientId) || !supportsContinuousEvidence(clientId, input.evidenceMode ?? "verified-room")) return null;
       return run(async runner => one(await runner.query(`INSERT INTO ${SESSION}
         (session_id,client_id,owner_id,campaign_id,policy_revision,baseline_budget_minor,baseline_fingerprint,live_session_id,
-         authorized_at,native_auto_off_attested,no_concurrent_changes_attested,evidence_mode,auto_detect_live)
-        SELECT $1::uuid,'punpan_020',$2,$3,$4,$5,$6,$7,date_trunc('milliseconds',clock_timestamp()),$8,$9,$10,$11
+         authorized_at,native_auto_off_attested,no_concurrent_changes_attested,evidence_mode,auto_detect_live,allow_exhausted_recovery)
+        SELECT $1::uuid,'punpan_020',$2,$3,$4,$5,$6,$7,date_trunc('milliseconds',clock_timestamp()),$8,$9,$10,$11,$12
         WHERE NOT EXISTS (SELECT 1 FROM creator_continuous_auto_budget_attempts
           WHERE client_id='punpan_020' AND campaign_id=$3 AND baseline_fingerprint=$6 AND (NOT retry_released OR $10<>'spend-trend'))
         ON CONFLICT DO NOTHING RETURNING *`,
       [input.sessionId, input.ownerId, input.campaignId, input.policyRevision, input.baselineBudgetMinor,
         input.baselineFingerprint, input.liveSessionId, input.nativeAutoOffAttested, input.noConcurrentChangesAttested,
-        input.evidenceMode ?? "verified-room", input.autoDetectLive === true])));
+        input.evidenceMode ?? "verified-room", input.autoDetectLive === true, input.allowExhaustedRecovery === true])));
     },
     async bindLiveSession(session: CreatorContinuousAutoBudgetSession, liveSessionId: string) {
       if (!allowsScheduledCreatorAuto(clientId) || !validSession(session) || !awaitingLive(session) || session.status !== "ACTIVE" ||
@@ -491,7 +526,8 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
         WHERE ${EXACT_BASE} AND s.evidence_mode='${LIVE_ROOM_SPEND_TREND}' AND s.status='ACTIVE'
           AND s.live_session_id IS NULL AND s.operation_id IS NULL AND s.last_outcome IS NULL AND s.last_verified_at IS NULL
           AND s.native_auto_off_attested AND s.no_concurrent_changes_attested AND s.auto_detect_live=$9::boolean
-        RETURNING s.*`, [...args(session).slice(0, 7), liveSessionId, session.autoDetectLive === true])));
+          AND s.allow_exhausted_recovery=$10::boolean
+        RETURNING s.*`, [...args(session).slice(0, 7), liveSessionId, session.autoDetectLive === true, session.allowExhaustedRecovery === true])));
     },
     async adoptBaseline(session: CreatorContinuousAutoBudgetSession, next: { budgetMinor: number; fingerprint: string; policyRevision: number }) {
       if (!validSession(session) || session.evidenceMode !== "spend-trend" || session.status !== "ACTIVE" ||

@@ -26,7 +26,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
   providerResult?: "unknown" | "reject" | "roi-drift" | "reject-with-drift"; readAt?: string;
   extra?: boolean; extraLive?: boolean; extraClient?: "nnshop5719" | "ashopbytheta" | "myushop4" | "bubpa_shop189"; wrongProviderScope?: boolean;
   targetAbsent?: boolean; integrated?: Record<string, unknown>; daily?: (page: number) => unknown; currency?: string;
-  campaignInfo?: Record<string, unknown>; campaignList?: Record<string, unknown>; listedStatus?: string; timezone?: string;
+  campaignInfo?: Record<string, unknown>; campaignList?: Record<string, unknown>; listedStatus?: string; secondaryStatus?: unknown; timezone?: string;
   scheduledLive?: boolean; room?: "ONGOING" | "END"; detectRoom?: boolean; roomCost?: string | null;
   identityLive?: "ongoing" | "ended" | "missing"; now?: () => Date } = {}) {
   const calls: { host: string; path: string; method: string }[] = [];
@@ -38,7 +38,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
   const scheduledEnv = !options.scheduledLive ? {} : extra ? { CREATOR_AUTO_BUDGET_LIVE_ENABLED: "true",
     [`CREATOR_AUTO_BUDGET_${extra.clientId.toUpperCase()}_MODE`]: "live", [`CREATOR_AUTO_BUDGET_${extra.clientId.toUpperCase()}_LIVE_ENABLED`]: "true" } :
     { CREATOR_AUTO_BUDGET_LIVE_ENABLED: "true", CREATOR_AUTO_BUDGET_MODE: "live", CREATOR_AUTO_BUDGET_PPAN_CONTINUOUS_LIVE_ENABLED: "true" };
-  let budget = 2800, roi = 15, stamp = "2025-03-15 08:55:00", spend = "2100.09", otherSpend = "20.00";
+  let budget = 2800, roi = 15, stamp = "2025-03-15 08:55:00", spend = "2100.09", otherSpend = "20.00", secondaryStatus = options.secondaryStatus;
   let daily = options.daily ?? (() => ({ page_info: pageInfo(2), list: [dailyRow(CAMPAIGN), dailyRow(MISSING_CAMPAIGN, 0)] }));
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input));
@@ -93,7 +93,8 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
     }
     if (url.pathname.endsWith("/gmv_max/campaign/get/")) return Response.json({ code: 0, data: {
       page_info: { page: 1, total_page: 1, total_number: 1 }, list: [{ campaign_id: CAMPAIGN,
-        advertiser_id: options.wrongProviderScope ? CREATOR_BINDING.advertiserId : binding.advertiserId, operation_status: options.listedStatus ?? "ENABLE", modify_time: stamp }],
+        advertiser_id: options.wrongProviderScope ? CREATOR_BINDING.advertiserId : binding.advertiserId, operation_status: options.listedStatus ?? "ENABLE", modify_time: stamp,
+        ...(secondaryStatus === undefined ? {} : { secondary_status: secondaryStatus }) }],
       ...options.campaignList } });
     if (url.pathname.endsWith("/campaign/gmv_max/info/")) return Response.json({ code: 0, data: {
       advertiser_id: binding.advertiserId, campaign_id: CAMPAIGN, campaign_name: "Fixture LIVE", shopping_ads_type: "LIVE",
@@ -135,7 +136,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
         [`CREATOR_WEB_${options.extraClient.toUpperCase()}_BUDGET_LIVE_ENABLED`]: options.extraLive ? "true" : "false" } : {}),
       CREATOR_BUDGET_TEST_ENABLED: options.legacy ? "true" : "false", CREATOR_WEB_POLICY_BRIDGE_KEY: options.policyKey ?? KEY, ...scheduledEnv } });
   return { adapters, calls, queries, edit(value: number) { budget = value; stamp = "2025-03-15 08:59:30"; }, setSpend(value: string) { spend = value; },
-    setOtherSpend(value: string) { otherSpend = value; }, setDaily(value: typeof daily) { daily = value; },
+    setOtherSpend(value: string) { otherSpend = value; }, setDaily(value: typeof daily) { daily = value; }, setSecondaryStatus(value: unknown) { secondaryStatus = value; },
     async input(targetBudgetMinor = 310_000, source?: WebBudgetSource) {
       const ctx = await adapters.readContext(CAMPAIGN, source);
       return { campaignId: CAMPAIGN, reportingDate: TODAY, expectedBudgetMinor: ctx.budgetMinor, targetBudgetMinor,
@@ -143,6 +144,37 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
         source, nativeAutoOff: true as const, noConcurrentChanges: true as const, canSend: async () => true };
     }, providerPosts() { return calls.filter(c => c.host === "business-api.tiktok.com" && c.method === "POST"); } };
 }
+
+describe("exact GMV campaign delivery telemetry", () => {
+  it.each([
+    ["CAMPAIGN_STATUS_ENABLE", "ENABLED"], ["CAMPAIGN_STATUS_BUDGET_EXCEED", "CAMPAIGN_BUDGET_EXHAUSTED"],
+    ["CAMPAIGN_STATUS_TTS_ACCOUNT_BALANCE_INSUFFICIENT", "OTHER"], ["STATUS_NOT_DELIVERY", "OTHER"],
+    ["CAMPAIGN_STATUS_BUDGET_EXHAUSTED", "OTHER"], ["campaign_status_budget_exceed", "OTHER"],
+    [null, "OTHER"], ["", "OTHER"], [40001, "OTHER"],
+  ] as const)("normalizes only exact scoped provider status %j", async (secondaryStatus, expected) => {
+    const h = harness({ secondaryStatus });
+    const view = await h.adapters.readContext(CAMPAIGN, "manual");
+    expect(view.campaignDeliveryStatus).toBe(expected);
+    expect(view).not.toHaveProperty("secondary_status");
+    const listed = h.queries.find(x => x.path.endsWith("/gmv_max/campaign/get/") && x.query.filtering.includes("campaign_ids"));
+    expect(JSON.parse(listed!.query.fields)).toContain("secondary_status");
+    expect(h.providerPosts()).toHaveLength(0);
+  });
+
+  it("does not invent an absent status or include delivery changes in the budget fingerprint", async () => {
+    const h = harness();
+    const absent = await h.adapters.readContext(CAMPAIGN, "manual");
+    expect(absent).not.toHaveProperty("campaignDeliveryStatus");
+    h.setSecondaryStatus("CAMPAIGN_STATUS_ENABLE");
+    const enabled = await h.adapters.readContext(CAMPAIGN, "manual");
+    h.setSecondaryStatus("CAMPAIGN_STATUS_BUDGET_EXCEED");
+    const exhausted = await h.adapters.readContext(CAMPAIGN, "manual");
+    expect(enabled.campaignDeliveryStatus).toBe("ENABLED");
+    expect(exhausted.campaignDeliveryStatus).toBe("CAMPAIGN_BUDGET_EXHAUSTED");
+    expect(new Set([absent.fingerprint, enabled.fingerprint, exhausted.fingerprint]).size).toBe(1);
+    expect(await h.adapters.readPreArmContext!(CAMPAIGN)).not.toHaveProperty("campaignDeliveryStatus");
+  });
+});
 
 describe("exact read-only scheduled Auto context", () => {
   it.each(SCHEDULED_SCOPES)("can read an enabled future %s campaign without a spend row, room or write", async (_scope, options) => {
