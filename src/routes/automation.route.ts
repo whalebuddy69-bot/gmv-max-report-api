@@ -10,6 +10,7 @@ import { createAutomationReadRegistry, parseExtraAutomationClients, parseVerifie
 import type { AutomationAccessReason, AutomationCreator, AutomationCreatorReadAdapter, AutomationCreatorReadEntry,
   AutomationPerformanceScope } from "../services/creatorAutomationRegistry.service";
 import { createVerifiedExtraCreatorReadAdapter } from "../services/creatorAutomationExtraRead.service";
+import { createProductionLiveGmvDiscoveryScanner } from "../services/liveGmvDiscovery.service";
 import { AppError } from "../utils/errors";
 import { loadCreatorToken } from "./creatorRead.route";
 
@@ -19,11 +20,19 @@ const MAX_CAMPAIGN_DAY_AGE_MS = 35_000;
 const MAX_VIEWERS = 100;
 const VIEWER_WINDOW_MS = 60_000;
 const VIEWER_REQUEST_LIMIT = 24;
+const LIVE_DISCOVERY_ORIGIN = "https://report.whalebuddy69.com";
+const DISCOVERY_ID = /^[1-9]\d{5,30}$/;
+const DISCOVERY_STATES = new Set(["refreshing", "ready", "partial", "unavailable"]);
+const DISCOVERY_KINDS = new Set(["creator", "shop", "unknown"]);
+const DISCOVERY_DISABLED = Object.freeze({ schemaVersion: 1, state: "unavailable", checkedAt: null,
+  accountsChecked: 0, accountsTotal: 0, campaigns: [] });
 const ACTIONS = Object.freeze({ start: false, pause: false, increaseBudget: false, decreaseBudget: false, auto: false });
 
 type UnknownRecord = Record<string, unknown>;
 type AutomationRouteDependencies = {
   viewerIds: () => string | undefined;
+  discoveryOperatorIds?: () => string | undefined;
+  liveDiscovery?: { read: () => unknown; refresh: () => unknown };
   readSnapshot: () => Promise<unknown>;
   readPerformance: (scope: AutomationPerformanceScope) => Promise<unknown>;
   readCampaignDay?: () => Promise<unknown>;
@@ -56,6 +65,43 @@ function record(value: unknown): value is UnknownRecord {
 }
 function nonnegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function discoveryLabel(value: unknown, limit: number): string | null {
+  return typeof value === "string"
+    ? value.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, "").trim().slice(0, limit) || null
+    : null;
+}
+
+/** Only forward the explicitly reviewed fields. No credential, actor, or write metadata. */
+function verifiedLiveDiscovery(raw: unknown, now: Date) {
+  if (!record(raw) || raw.schemaVersion !== 1 || typeof raw.state !== "string" || !DISCOVERY_STATES.has(raw.state) ||
+    !nonnegativeInteger(raw.accountsChecked) || !nonnegativeInteger(raw.accountsTotal) || raw.accountsChecked > raw.accountsTotal ||
+    !Array.isArray(raw.campaigns) || raw.campaigns.length > 2_000) return null;
+  if (raw.checkedAt !== null && (typeof raw.checkedAt !== "string" || !Number.isFinite(Date.parse(raw.checkedAt)) ||
+    Date.parse(raw.checkedAt) > now.getTime() + 30_000 || new Date(raw.checkedAt).toISOString() !== raw.checkedAt)) return null;
+  if ((raw.state === "ready" || raw.state === "partial") && raw.checkedAt === null ||
+    raw.state === "ready" && raw.accountsChecked !== raw.accountsTotal ||
+    raw.campaigns.length > 0 && raw.checkedAt === null) return null;
+  const seen = new Set<string>();
+  const campaigns = [];
+  for (const row of raw.campaigns) {
+    if (!record(row) || typeof row.advertiserId !== "string" || !DISCOVERY_ID.test(row.advertiserId) ||
+      typeof row.campaignId !== "string" || !DISCOVERY_ID.test(row.campaignId) ||
+      (row.operationStatus !== undefined && row.operationStatus !== "ENABLE") ||
+      typeof row.kind !== "string" || !DISCOVERY_KINDS.has(row.kind)) return null;
+    const key = `${row.advertiserId}:${row.campaignId}`;
+    if (seen.has(key)) return null;
+    seen.add(key);
+    const shopId = row.kind === "shop" && typeof row.shopId === "string" && DISCOVERY_ID.test(row.shopId) ? row.shopId : null;
+    campaigns.push({ advertiserId: row.advertiserId, advertiserName: discoveryLabel(row.advertiserName, 160) ?? row.advertiserId,
+      campaignId: row.campaignId, campaignName: discoveryLabel(row.campaignName, 160) ?? "แคมเปญ LIVE GMV Max",
+      secondaryStatus: typeof row.secondaryStatus === "string" && /^[A-Z][A-Z0-9_]{0,99}$/.test(row.secondaryStatus) ? row.secondaryStatus : null,
+      kind: row.kind, tiktokUsername: row.kind !== "unknown" ? verifiedTikTokUsername(row.tiktokUsername) : null,
+      shopId, shopName: shopId ? discoveryLabel(row.shopName, 160) : null });
+  }
+  return { schemaVersion: 1, state: raw.state, checkedAt: raw.checkedAt,
+    accountsChecked: raw.accountsChecked, accountsTotal: raw.accountsTotal, campaigns };
 }
 function nullableInteger(value: unknown): value is number | null { return value === null || nonnegativeInteger(value); }
 function nullableRatio(value: unknown): value is number | null {
@@ -142,7 +188,7 @@ function verifyCampaignDay(raw: unknown, now: Date): CreatorCampaignDay {
   return { reportingDate, observedAt: raw.observedAt, coverage: raw.coverage, campaigns };
 }
 
-export function createAutomationRouter({ viewerIds, readSnapshot, readPerformance, readCampaignDay, readUsername, configuredExtraClients, verifiedExtras,
+export function createAutomationRouter({ viewerIds, discoveryOperatorIds, liveDiscovery, readSnapshot, readPerformance, readCampaignDay, readUsername, configuredExtraClients, verifiedExtras,
   pendingReason, now = () => new Date() }: AutomationRouteDependencies) {
   const router = Router();
   let windowStart = -Infinity;
@@ -185,6 +231,43 @@ export function createAutomationRouter({ viewerIds, readSnapshot, readPerformanc
     }
     return true;
   }
+
+  // Discovery reads all app-authorized ad accounts, not just the explicitly
+  // configured clients shown in the managed overview. Keep the scope separate.
+  router.all(["/live-discovery", "/live-discovery/refresh"], (req, res, next) => {
+    try {
+      const refresh = req.path === "/live-discovery/refresh";
+      if (!refresh && req.path !== "/live-discovery") {
+        res.status(404).json({ error: { code: "DISCOVERY_NOT_CONFIGURED" } });
+        return;
+      }
+      if (req.method !== (refresh ? "POST" : "GET")) {
+        res.set("Allow", refresh ? "POST" : "GET").status(405).json({ error: { code: "DISCOVERY_METHOD_DENIED" } });
+        return;
+      }
+      if (req.originalUrl.includes("?") || (refresh && (req.headers["transfer-encoding"] !== undefined ||
+        (req.headers["content-length"] !== undefined && req.headers["content-length"] !== "0") ||
+        req.body !== undefined && (!record(req.body) || Object.keys(req.body).length !== 0)))) {
+        res.status(400).json({ error: { code: "DISCOVERY_FIXED_SCOPE" } });
+        return;
+      }
+      if (!req.user || !parseAutomationViewerIds(discoveryOperatorIds?.()).has(req.user.sub) ||
+        (refresh && req.header("origin") !== LIVE_DISCOVERY_ORIGIN)) {
+        res.status(403).json({ error: { code: "DISCOVERY_ACCESS_DENIED" } });
+        return;
+      }
+      if (!liveDiscovery) {
+        res.status(404).json({ error: { code: "DISCOVERY_NOT_CONFIGURED" } });
+        return;
+      }
+      const snapshot = verifiedLiveDiscovery(refresh ? liveDiscovery.refresh() : liveDiscovery.read(), now());
+      if (!snapshot) {
+        res.status(503).json({ error: { code: "DISCOVERY_UNAVAILABLE" } });
+        return;
+      }
+      res.json(snapshot);
+    } catch (error) { next(error); }
+  });
 
   async function observe(entry: AutomationCreatorReadEntry): Promise<ObservationResult> {
     if (!entry.adapter) return { view: null, accessReason: entry.accessReason };
@@ -282,6 +365,7 @@ const creatorPerformance = createCreatorAutomationPerformance({ loadToken: loadC
 const creatorCampaignDay = createCreatorCampaignDayReader({ loadToken: loadCreatorToken }, CREATOR_BINDING);
 const creatorUsername = createCreatorIdentityUsernameReader({ loadToken: loadCreatorToken }, CREATOR_BINDING);
 const creatorReadEnabled = () => process.env.CREATOR_READ_ENABLED === "true";
+const liveGmvDiscovery = createProductionLiveGmvDiscoveryScanner();
 const configuredExtraClients = () => process.env.CREATOR_AUTOMATION_EXTRA_READ_CLIENTS;
 const configuredVerifiedBindings = () => process.env.CREATOR_AUTOMATION_VERIFIED_READ_BINDINGS;
 let cachedExtraAdapters: { metadata?: string; verified?: string; adapters: readonly AutomationCreatorReadAdapter[] } | undefined;
@@ -297,6 +381,11 @@ function verifiedExtraAdapters(): readonly AutomationCreatorReadAdapter[] {
 }
 export const automationRouter = createAutomationRouter({
   viewerIds: () => process.env.CREATOR_AUTOMATION_VIEWER_USER_IDS,
+  discoveryOperatorIds: () => process.env.CREATOR_AUTOMATION_OPERATOR_USER_IDS,
+  liveDiscovery: {
+    read: () => creatorReadEnabled() ? liveGmvDiscovery.read() : DISCOVERY_DISABLED,
+    refresh: () => creatorReadEnabled() ? liveGmvDiscovery.refresh() : DISCOVERY_DISABLED,
+  },
   configuredExtraClients,
   verifiedExtras: verifiedExtraAdapters,
   pendingReason: () => !creatorReadEnabled() ? "upstream-unavailable"

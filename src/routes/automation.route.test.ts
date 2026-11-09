@@ -52,7 +52,8 @@ afterEach(async () => {
 
 async function start(options: { viewerIds?: string; snapshot?: () => Promise<unknown>;
   performance?: () => Promise<unknown>; campaignDay?: () => Promise<unknown>; now?: () => Date;
-  username?: () => Promise<string | null>; extraConfig?: string; verifiedExtras?: AutomationCreatorReadAdapter[] } = {}) {
+  username?: () => Promise<string | null>; extraConfig?: string; verifiedExtras?: AutomationCreatorReadAdapter[];
+  discoveryOperatorIds?: string; liveDiscovery?: { read: () => unknown; refresh: () => unknown } } = {}) {
   const readSnapshot = vi.fn(options.snapshot ?? (async () => observed));
   const readPerformance = vi.fn(options.performance ?? (async () => ({ state: "available", observedAt: PERFORMANCE_OBSERVED_AT, series: [
     { hour: "08:00", spendMinor: 123, gmvMinor: null, orders: 0, roi: null, liveViews: 55, secret: PRIVATE_MARKER },
@@ -64,6 +65,7 @@ async function start(options: { viewerIds?: string; snapshot?: () => Promise<unk
   const app = express();
   app.use("/automation", createAutomationRouter({ viewerIds: () => allowlist, readSnapshot, readPerformance, readCampaignDay, readUsername,
     configuredExtraClients: () => options.extraConfig, verifiedExtras: () => options.verifiedExtras ?? [],
+    discoveryOperatorIds: () => options.discoveryOperatorIds, liveDiscovery: options.liveDiscovery,
     now: options.now ?? (() => NOW) }));
   server = await new Promise<Server>(resolve => { const instance = app.listen(0, "127.0.0.1", () => resolve(instance)); });
   const { port } = server.address() as { port: number };
@@ -81,6 +83,47 @@ function extraAdapter(snapshot: unknown = { ...observed, clientId: EXTRA.clientI
 }
 
 describe("private Creator Automation read routes", () => {
+  it("requires explicit permission and fixed origin/method for broad LIVE discovery without changing managed access", async () => {
+    const sample = { schemaVersion: 1, state: "ready", checkedAt: OBSERVED_AT, accountsChecked: 2, accountsTotal: 2,
+      campaigns: [{ advertiserId: EXTRA.advertiserId, advertiserName: "Demo account", campaignId: EXTRA_CAMPAIGN,
+        campaignName: "Demo LIVE", operationStatus: "ENABLE", kind: "shop", shopId: "7888888888888", shopName: "Demo shop",
+        secondaryStatus: "CAMPAIGN_STATUS_ENABLE", tiktokUsername: "demo.live", secret: PRIVATE_MARKER }], token: PRIVATE_MARKER };
+    const read = vi.fn(() => sample);
+    const refresh = vi.fn(() => ({ ...sample, state: "refreshing" }));
+    const h = await start({ viewerIds: "27,42", discoveryOperatorIds: "27", liveDiscovery: { read, refresh } });
+    const getUrl = `${h.url}/live-discovery`, postUrl = `${getUrl}/refresh`;
+    const trusted = { ...OWNER_HEADER, Origin: "https://report.whalebuddy69.com" };
+    expect((await fetch(getUrl)).status).toBe(401);
+    expect((await fetch(getUrl, { headers: { Authorization: "Bearer fixture-admin" } })).status).toBe(403);
+    expect((await fetch(`${h.url}/overview`, { headers: { Authorization: "Bearer fixture-admin" } })).status).toBe(200);
+    expect((await fetch(`${getUrl}?advertiserId=123456`, { headers: OWNER_HEADER })).status).toBe(400);
+    expect((await fetch(postUrl, { method: "POST", headers: OWNER_HEADER })).status).toBe(403);
+    expect((await fetch(postUrl, { headers: trusted })).status).toBe(405);
+    expect((await fetch(postUrl, { method: "POST", headers: { ...trusted, "Content-Type": "application/json" }, body: '{"advertiserId":"123456"}' })).status).toBe(400);
+    expect(read).not.toHaveBeenCalled();
+    expect(refresh).not.toHaveBeenCalled();
+    const res = await fetch(getUrl, { headers: OWNER_HEADER });
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const body = await res.text();
+    expect(body).not.toContain(PRIVATE_MARKER);
+    expect(JSON.parse(body)).toMatchObject({ state: "ready", accountsChecked: 2,
+      campaigns: [{ advertiserId: EXTRA.advertiserId, campaignId: EXTRA_CAMPAIGN, tiktokUsername: "demo.live", shopName: "Demo shop" }] });
+    expect((await fetch(postUrl, { method: "POST", headers: trusted }).then(x => x.json())).state).toBe("refreshing");
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed on duplicate or non-enabled rows in broad LIVE discovery", async () => {
+    const row = { advertiserId: EXTRA.advertiserId, campaignId: EXTRA_CAMPAIGN, kind: "creator" };
+    const snapshot = { schemaVersion: 1, state: "ready", checkedAt: OBSERVED_AT, accountsChecked: 1, accountsTotal: 1, campaigns: [row, row] };
+    const read = vi.fn(() => snapshot);
+    const h = await start({ discoveryOperatorIds: "27", liveDiscovery: { read, refresh: read } });
+    const path = `${h.url}/live-discovery`;
+    expect((await fetch(path, { headers: OWNER_HEADER })).status).toBe(503);
+    read.mockReturnValueOnce({ ...snapshot, campaigns: [{ ...row, operationStatus: "DISABLE" } as typeof row] });
+    expect((await fetch(path, { headers: OWNER_HEADER })).status).toBe(503);
+  });
+
   it("serves a read-only list of exact scoped today campaigns, including verified closed rows", async () => {
     const paused = { campaignId: EXTRA_CAMPAIGN, campaignName: "Paused Synthetic", operationStatus: "DISABLE", dailyBudgetMinor: 20000,
       targetRoi: 3, spendMinor: 400, gmvMinor: 1000, skuOrders: 2, liveViews: 0, activityToday: true, roi: 999, scheduleStartAt: null, scheduleEndAt: null,

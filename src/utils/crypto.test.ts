@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { decryptSecret, encryptSecret } from "./crypto";
+import { decryptSecret, decryptSecretBatch, encryptSecret } from "./crypto";
 
 describe("encryptSecret / decryptSecret round-trip", () => {
   beforeAll(() => {
@@ -22,5 +22,9 @@ describe("encryptSecret / decryptSecret round-trip", () => {
     expect(a).not.toBe(b);
     expect(decryptSecret(a)).toBe("same-plaintext");
     expect(decryptSecret(b)).toBe("same-plaintext");
+  });
+
+  it("decrypts a read-only batch with the same key and rejects malformed entries individually", async () => {
+    await expect(decryptSecretBatch([encryptSecret("one"), "invalid", encryptSecret("two")])).resolves.toEqual(["one", null, "two"]);
   });
 });
