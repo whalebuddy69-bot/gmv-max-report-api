@@ -53,7 +53,8 @@ afterEach(async () => {
 async function start(options: { viewerIds?: string; snapshot?: () => Promise<unknown>;
   performance?: () => Promise<unknown>; campaignDay?: () => Promise<unknown>; now?: () => Date;
   username?: () => Promise<string | null>; extraConfig?: string; verifiedExtras?: AutomationCreatorReadAdapter[];
-  discoveryOperatorIds?: string; liveDiscovery?: { read: () => unknown; refresh: () => unknown } } = {}) {
+  discoveryOperatorIds?: string; liveDiscovery?: { read: () => unknown; refresh: () => unknown };
+  monitor?: Parameters<typeof createAutomationRouter>[0]["monitor"] } = {}) {
   const readSnapshot = vi.fn(options.snapshot ?? (async () => observed));
   const readPerformance = vi.fn(options.performance ?? (async () => ({ state: "available", observedAt: PERFORMANCE_OBSERVED_AT, series: [
     { hour: "08:00", spendMinor: 123, gmvMinor: null, orders: 0, roi: null, liveViews: 55, secret: PRIVATE_MARKER },
@@ -65,7 +66,7 @@ async function start(options: { viewerIds?: string; snapshot?: () => Promise<unk
   const app = express();
   app.use("/automation", createAutomationRouter({ viewerIds: () => allowlist, readSnapshot, readPerformance, readCampaignDay, readUsername,
     configuredExtraClients: () => options.extraConfig, verifiedExtras: () => options.verifiedExtras ?? [],
-    discoveryOperatorIds: () => options.discoveryOperatorIds, liveDiscovery: options.liveDiscovery,
+    discoveryOperatorIds: () => options.discoveryOperatorIds, liveDiscovery: options.liveDiscovery, monitor: options.monitor,
     now: options.now ?? (() => NOW) }));
   server = await new Promise<Server>(resolve => { const instance = app.listen(0, "127.0.0.1", () => resolve(instance)); });
   const { port } = server.address() as { port: number };
@@ -83,6 +84,42 @@ function extraAdapter(snapshot: unknown = { ...observed, clientId: EXTRA.clientI
 }
 
 describe("private Creator Automation read routes", () => {
+  it("lets only the originating admin operator confirm an exact discovered Creator, and grants no ad actions", async () => {
+    const admin = { Authorization: "Bearer fixture-admin", Origin: "https://report.whalebuddy69.com", "Content-Type": "application/json" };
+    const row = { advertiserId: EXTRA.advertiserId, campaignId: EXTRA_CAMPAIGN, kind: "creator", tiktokUsername: "demo.live" };
+    const snapshot = { schemaVersion: 1, state: "ready", checkedAt: OBSERVED_AT, accountsChecked: 1, accountsTotal: 1, campaigns: [row] };
+    const clientId = `mon_${EXTRA.advertiserId}`;
+    const binding = { ...EXTRA_BINDING, tiktokAccountId: null };
+    const adapter = { ...extraAdapter({ ...observed, clientId, binding }), clientId, binding };
+    let enrolled = false;
+    const entries = vi.fn(async () => enrolled ? [{ creator: { ...EXTRA, clientId, displayName: "@demo.live", tiktokAccountId: null,
+      monitoringOnly: true as const }, adapter, accessReason: "upstream-unavailable" as const }] : []);
+    const enroll = vi.fn(async () => { enrolled = true; return "created" as const; });
+    const h = await start({ viewerIds: "27,42", discoveryOperatorIds: "27,42", liveDiscovery: { read: () => snapshot, refresh: () => snapshot },
+      monitor: { available: () => true, entries, enroll } });
+    const body = { advertiserId: EXTRA.advertiserId, campaignId: EXTRA_CAMPAIGN, expectedUsername: "demo.live" };
+    const submit = (data: unknown, headers = admin) => fetch(`${h.url}/live-discovery/enroll`, { method: "POST", headers, body: JSON.stringify(data) });
+    expect((await submit(body, { ...admin, Authorization: OWNER_HEADER.Authorization })).status).toBe(403);
+    expect((await submit(body, { ...admin, Origin: "https://example.invalid" })).status).toBe(403);
+    expect((await submit({ ...body, auto: true })).status).toBe(400);
+    expect((await submit({ ...body, expectedUsername: "other.handle" })).status).toBe(409);
+    expect((await submit({ ...body, campaignId: FAKE_CAMPAIGN_ID })).status).toBe(409);
+    expect(enroll).not.toHaveBeenCalled();
+    const discovery = await fetch(`${h.url}/live-discovery`, { headers: admin }).then(r => r.json());
+    expect(discovery.canAddCreators).toBe(true);
+    const result = await submit(body);
+    expect(result.status).toBe(201);
+    expect(await result.json()).toEqual({ clientId, advertiserId: EXTRA.advertiserId });
+    expect(enroll.mock.calls).toEqual([[42, body]]);
+    const ownerOverview = await fetch(`${h.url}/overview`, { headers: admin }).then(r => r.json());
+    expect(ownerOverview.clients[1]).toMatchObject({ clientId, monitoringOnly: true, tiktokAccountId: null, tiktokAccountIdVerified: false,
+      capMinor: null, actions: { start: false, pause: false, increaseBudget: false, decreaseBudget: false, auto: false } });
+    const otherOverview = await fetch(`${h.url}/overview`, { headers: OWNER_HEADER }).then(r => r.json());
+    expect(otherOverview.clients.map((x: { clientId: string }) => x.clientId)).toEqual(["punpan_020"]);
+    expect((await fetch(`${h.url}/campaigns/${clientId}`, { headers: OWNER_HEADER })).status).toBe(404);
+    expect(entries.mock.calls).toEqual([[42]]);
+  });
+
   it("requires explicit permission and fixed origin/method for broad LIVE discovery without changing managed access", async () => {
     const sample = { schemaVersion: 1, state: "ready", checkedAt: OBSERVED_AT, accountsChecked: 2, accountsTotal: 2,
       campaigns: [{ advertiserId: EXTRA.advertiserId, advertiserName: "Demo account", campaignId: EXTRA_CAMPAIGN,

@@ -1,4 +1,4 @@
-import type { CreatorReadBinding, CreatorReadDependencies } from "./creatorRead.service";
+import type { CreatorMonitoringBinding, CreatorReadDependencies } from "./creatorRead.service";
 
 const endpoint = "https://business-api.tiktok.com/open_api/v1.3/identity/info/";
 const successTtlMs = 5 * 60_000, failureTtlMs = 30_000, maxBytes = 256 * 1024;
@@ -28,7 +28,7 @@ async function boundedJson(response: Response): Promise<unknown> {
 
 /** Dashboard-only metadata. Never used as a campaign, token, or write scope. */
 export function createCreatorIdentityUsernameReader({ loadToken, fetchImpl = fetch, now = () => new Date() }: CreatorReadDependencies,
-  configured: CreatorReadBinding) {
+  configured: CreatorMonitoringBinding) {
   const binding = Object.freeze({ ...configured });
   let cache: { checkedAt: number; username: string | null } | undefined;
   let inFlight: Promise<string | null> | undefined;
@@ -46,7 +46,7 @@ export function createCreatorIdentityUsernameReader({ loadToken, fetchImpl = fet
     const data = payload.data, identity = payload.data.identity_info;
     if (identity.identity_id !== binding.identityId || identity.identity_type !== binding.identityType ||
       identity.identity_authorized_bc_id !== binding.identityAuthorizedBcId ||
-      (identity.tiktok_account_id !== undefined && identity.tiktok_account_id !== binding.tiktokAccountId) ||
+      (binding.tiktokAccountId !== null && identity.tiktok_account_id !== undefined && identity.tiktok_account_id !== binding.tiktokAccountId) ||
       (identity.advertiser_id !== undefined && identity.advertiser_id !== binding.advertiserId) ||
       (data.advertiser_id !== undefined && data.advertiser_id !== binding.advertiserId)) return null;
     const username = verifiedTikTokUsername(identity.username);

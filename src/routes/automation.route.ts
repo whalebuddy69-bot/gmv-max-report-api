@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { json, Router } from "express";
 import type { ErrorRequestHandler, Request, Response } from "express";
 import { requireAuth } from "../middleware/auth";
 import { bangkokDay, CREATOR_BINDING, CreatorReadError, createCreatorReader } from "../services/creatorRead.service";
@@ -11,6 +11,8 @@ import type { AutomationAccessReason, AutomationCreator, AutomationCreatorReadAd
   AutomationPerformanceScope } from "../services/creatorAutomationRegistry.service";
 import { createVerifiedExtraCreatorReadAdapter } from "../services/creatorAutomationExtraRead.service";
 import { createProductionLiveGmvDiscoveryScanner } from "../services/liveGmvDiscovery.service";
+import { createCreatorMonitorRuntime } from "../services/creatorMonitor.runtime";
+import type { CreatorMonitorCandidate } from "../services/creatorMonitorProof.service";
 import { AppError } from "../utils/errors";
 import { loadCreatorToken } from "./creatorRead.route";
 
@@ -21,6 +23,7 @@ const MAX_VIEWERS = 100;
 const VIEWER_WINDOW_MS = 60_000;
 const VIEWER_REQUEST_LIMIT = 24;
 const LIVE_DISCOVERY_ORIGIN = "https://report.whalebuddy69.com";
+const MAX_ENROLL_SNAPSHOT_AGE_MS = 15 * 60_000;
 const DISCOVERY_ID = /^[1-9]\d{5,30}$/;
 const DISCOVERY_STATES = new Set(["refreshing", "ready", "partial", "unavailable"]);
 const DISCOVERY_KINDS = new Set(["creator", "shop", "unknown"]);
@@ -32,7 +35,9 @@ type UnknownRecord = Record<string, unknown>;
 type AutomationRouteDependencies = {
   viewerIds: () => string | undefined;
   discoveryOperatorIds?: () => string | undefined;
-  liveDiscovery?: { read: () => unknown; refresh: () => unknown };
+  liveDiscovery?: { read: () => unknown; refresh: () => unknown; snapshot?: () => unknown };
+  monitor?: { available(): boolean; entries(owner: number): Promise<AutomationCreatorReadEntry[]>;
+    enroll(owner: number, candidate: CreatorMonitorCandidate): Promise<"created" | "existing" | "conflict" | "limit"> };
   readSnapshot: () => Promise<unknown>;
   readPerformance: (scope: AutomationPerformanceScope) => Promise<unknown>;
   readCampaignDay?: () => Promise<unknown>;
@@ -188,13 +193,25 @@ function verifyCampaignDay(raw: unknown, now: Date): CreatorCampaignDay {
   return { reportingDate, observedAt: raw.observedAt, coverage: raw.coverage, campaigns };
 }
 
-export function createAutomationRouter({ viewerIds, discoveryOperatorIds, liveDiscovery, readSnapshot, readPerformance, readCampaignDay, readUsername, configuredExtraClients, verifiedExtras,
+export function createAutomationRouter({ viewerIds, discoveryOperatorIds, liveDiscovery, monitor, readSnapshot, readPerformance, readCampaignDay, readUsername, configuredExtraClients, verifiedExtras,
   pendingReason, now = () => new Date() }: AutomationRouteDependencies) {
   const router = Router();
   let windowStart = -Infinity;
   const viewerRequests = new Map<number, number>();
+  const enrollRequests = new Map<number, number>(), enrollInFlight = new Set<number>();
   const registry = () => createAutomationReadRegistry({ extraConfig: configuredExtraClients?.(),
     ppan: { readSnapshot, readPerformance, readCampaignDay, readUsername }, verifiedExtras: verifiedExtras?.(), pendingReason });
+  function monitorOwner(req: Request): number | null {
+    return monitor?.available() && req.user?.role === "admin" && parseAutomationViewerIds(discoveryOperatorIds?.()).has(req.user.sub)
+      ? req.user.sub : null;
+  }
+  async function requestRegistry(req: Request): Promise<readonly AutomationCreatorReadEntry[]> {
+    const base = registry(), owner = monitorOwner(req);
+    if (owner === null || !monitor) return base;
+    const entries = await monitor.entries(owner).catch(() => []);
+    return [...base, ...entries.filter(entry => !base.some(item => item.creator.clientId === entry.creator.clientId ||
+      item.creator.advertiserId === entry.creator.advertiserId))];
+  }
 
   router.use((_req, res, next) => {
     res.set("Cache-Control", "no-store").vary("Authorization");
@@ -209,7 +226,7 @@ export function createAutomationRouter({ viewerIds, discoveryOperatorIds, liveDi
       return;
     }
     const time = now().getTime();
-    if (time < windowStart || time - windowStart >= VIEWER_WINDOW_MS) { windowStart = time; viewerRequests.clear(); }
+    if (time < windowStart || time - windowStart >= VIEWER_WINDOW_MS) { windowStart = time; viewerRequests.clear(); enrollRequests.clear(); }
     if (viewerRequests.size >= MAX_VIEWERS) for (const id of viewerRequests.keys()) if (!allowed.has(id)) viewerRequests.delete(id);
     const count = (viewerRequests.get(viewer) ?? 0) + 1;
     if (count > VIEWER_REQUEST_LIMIT) {
@@ -265,8 +282,49 @@ export function createAutomationRouter({ viewerIds, discoveryOperatorIds, liveDi
         res.status(503).json({ error: { code: "DISCOVERY_UNAVAILABLE" } });
         return;
       }
-      res.json(snapshot);
+      res.json({ ...snapshot, ...(monitorOwner(req) === null ? {} : { canAddCreators: true }) });
     } catch (error) { next(error); }
+  });
+
+  router.all("/live-discovery/enroll", (req, res, next) => {
+    if (req.method !== "POST") { res.set("Allow", "POST").status(405).json({ error: { code: "DISCOVERY_METHOD_DENIED" } }); return; }
+    if (monitorOwner(req) === null || req.header("origin") !== LIVE_DISCOVERY_ORIGIN) {
+      res.status(403).json({ error: { code: "MONITOR_ACCESS_DENIED" } }); return;
+    }
+    if (req.originalUrl.includes("?") || !req.is("application/json")) {
+      res.status(400).json({ error: { code: "MONITOR_INVALID_REQUEST" } }); return;
+    }
+    next();
+  }, json({ limit: "1kb", inflate: false }), async (req, res) => {
+    const owner = monitorOwner(req);
+    if (owner === null || !monitor || !liveDiscovery) { res.status(403).json({ error: { code: "MONITOR_ACCESS_DENIED" } }); return; }
+    const input: unknown = req.body;
+    if (!record(input) || Object.keys(input).length !== 3 || typeof input.advertiserId !== "string" || !DISCOVERY_ID.test(input.advertiserId) ||
+      typeof input.campaignId !== "string" || !DISCOVERY_ID.test(input.campaignId) || typeof input.expectedUsername !== "string" ||
+      !verifiedTikTokUsername(input.expectedUsername)) { res.status(400).json({ error: { code: "MONITOR_INVALID_REQUEST" } }); return; }
+    const { advertiserId, campaignId, expectedUsername } = input;
+    const clientId = `mon_${advertiserId}`;
+    if (registry().some(({ creator }) => creator.advertiserId === advertiserId || creator.clientId === clientId)) {
+      res.status(409).json({ error: { code: "MONITOR_ALREADY_CONFIGURED" } }); return;
+    }
+    const checked = now();
+    const discovery = verifiedLiveDiscovery(liveDiscovery.snapshot ? liveDiscovery.snapshot() : liveDiscovery.read(), checked);
+    if (!discovery?.checkedAt || discovery.state === "unavailable" || checked.getTime() - Date.parse(discovery.checkedAt) > MAX_ENROLL_SNAPSHOT_AGE_MS ||
+      !discovery.campaigns.some(row => row.advertiserId === advertiserId && row.campaignId === campaignId && row.kind === "creator" &&
+        row.shopId === null && row.tiktokUsername === expectedUsername)) {
+      res.status(409).json({ error: { code: "MONITOR_REFRESH_REQUIRED" } }); return;
+    }
+    if ((enrollRequests.get(owner) ?? 0) >= 4 || enrollInFlight.has(owner) || enrollInFlight.size >= 2) {
+      res.set("Retry-After", "60").status(429).json({ error: { code: "MONITOR_RATE_LIMITED" } }); return;
+    }
+    enrollRequests.set(owner, (enrollRequests.get(owner) ?? 0) + 1);
+    enrollInFlight.add(owner);
+    try {
+      const result = await monitor.enroll(owner, { advertiserId, campaignId, expectedUsername });
+      if (result === "created" || result === "existing") res.status(result === "created" ? 201 : 200).json({ clientId, advertiserId });
+      else res.status(409).json({ error: { code: result === "limit" ? "MONITOR_LIMIT" : "MONITOR_IDENTITY_CONFLICT" } });
+    } catch { res.status(503).json({ error: { code: "MONITOR_VERIFICATION_UNAVAILABLE" } }); }
+    finally { enrollInFlight.delete(owner); }
   });
 
   async function observe(entry: AutomationCreatorReadEntry): Promise<ObservationResult> {
@@ -294,10 +352,11 @@ export function createAutomationRouter({ viewerIds, discoveryOperatorIds, liveDi
   router.all("/overview", async (req, res, next) => {
     try {
       if (!fixedGet(req, res)) return;
-      const clients = await Promise.all(registry().map(async entry => {
+      const clients = await Promise.all((await requestRegistry(req)).map(async entry => {
         const [{ view, accessReason }, tiktokUsername] = await Promise.all([observe(entry),
           Promise.resolve().then(() => entry.adapter?.readUsername?.()).then(verifiedTikTokUsername).catch(() => null)]);
-        return { ...entry.creator, tiktokAccountIdVerified: entry.creator.clientId === PPAN_AUTOMATION_CREATOR.clientId,
+        return { ...entry.creator, tiktokAccountIdVerified: entry.creator.clientId === PPAN_AUTOMATION_CREATOR.clientId ||
+          ("monitoringOnly" in entry.creator && entry.creator.tiktokAccountId !== null),
           tiktokUsername,
           access: view ? "verified" : "unavailable", ...(accessReason ? { accessReason } : {}),
           observedAt: view?.observedAt ?? null, reportingDate: view?.reportingDate ?? null,
@@ -311,7 +370,7 @@ export function createAutomationRouter({ viewerIds, discoveryOperatorIds, liveDi
     try {
       if (!fixedGet(req, res)) return;
       const clientId = req.params.clientId ?? PPAN_AUTOMATION_CREATOR.clientId;
-      const entry = validAutomationClientId(clientId) ? registry().find(candidate => candidate.creator.clientId === clientId) : undefined;
+      const entry = validAutomationClientId(clientId) ? (await requestRegistry(req)).find(candidate => candidate.creator.clientId === clientId) : undefined;
       if (!entry) {
         res.status(404).json({ error: { code: "CREATOR_NOT_CONFIGURED", message: "ไม่พบ Creator ในรายการ Automation" } });
         return;
@@ -335,7 +394,7 @@ export function createAutomationRouter({ viewerIds, discoveryOperatorIds, liveDi
     try {
       if (!fixedGet(req, res)) return;
       const { clientId } = req.params;
-      const entry = validAutomationClientId(clientId) ? registry().find(candidate => candidate.creator.clientId === clientId) : undefined;
+      const entry = validAutomationClientId(clientId) ? (await requestRegistry(req)).find(candidate => candidate.creator.clientId === clientId) : undefined;
       if (!entry) {
         res.status(404).json({ error: { code: "CREATOR_NOT_CONFIGURED", message: "ไม่พบ Creator ในรายการ Automation" } });
         return;
@@ -354,6 +413,9 @@ export function createAutomationRouter({ viewerIds, discoveryOperatorIds, liveDi
       res.status(401).json({ error: { code: "AUTH_FAILED", message: "กรุณาเข้าสู่ระบบใหม่เพื่อดู Automation" } });
       return;
     }
+    if ((error as { type?: string } | null)?.type === "entity.too.large" || (error as { type?: string } | null)?.type === "entity.parse.failed") {
+      res.status(400).json({ error: { code: "MONITOR_INVALID_REQUEST" } }); return;
+    }
     res.status(503).json({ error: { code: "AUTOMATION_UNAVAILABLE", message: "Automation ยังไม่พร้อมให้ดูข้อมูล" } });
   };
   router.use(safeError);
@@ -366,6 +428,8 @@ const creatorCampaignDay = createCreatorCampaignDayReader({ loadToken: loadCreat
 const creatorUsername = createCreatorIdentityUsernameReader({ loadToken: loadCreatorToken }, CREATOR_BINDING);
 const creatorReadEnabled = () => process.env.CREATOR_READ_ENABLED === "true";
 const liveGmvDiscovery = createProductionLiveGmvDiscoveryScanner();
+const creatorMonitor = createCreatorMonitorRuntime(advertiserId => liveGmvDiscovery.credentialSourceFor(advertiserId));
+export const initializeCreatorMonitor = () => creatorMonitor.initialize();
 const configuredExtraClients = () => process.env.CREATOR_AUTOMATION_EXTRA_READ_CLIENTS;
 const configuredVerifiedBindings = () => process.env.CREATOR_AUTOMATION_VERIFIED_READ_BINDINGS;
 let cachedExtraAdapters: { metadata?: string; verified?: string; adapters: readonly AutomationCreatorReadAdapter[] } | undefined;
@@ -385,7 +449,9 @@ export const automationRouter = createAutomationRouter({
   liveDiscovery: {
     read: () => creatorReadEnabled() ? liveGmvDiscovery.read() : DISCOVERY_DISABLED,
     refresh: () => creatorReadEnabled() ? liveGmvDiscovery.refresh() : DISCOVERY_DISABLED,
+    snapshot: () => creatorReadEnabled() ? liveGmvDiscovery.snapshot() : DISCOVERY_DISABLED,
   },
+  monitor: creatorMonitor,
   configuredExtraClients,
   verifiedExtras: verifiedExtraAdapters,
   pendingReason: () => !creatorReadEnabled() ? "upstream-unavailable"

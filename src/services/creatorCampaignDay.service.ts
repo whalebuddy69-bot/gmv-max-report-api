@@ -1,4 +1,4 @@
-import { bangkokDay, campaignSchedule, minor, type CreatorReadBinding, type CreatorReadDependencies } from "./creatorRead.service";
+import { bangkokDay, campaignSchedule, minor, type CreatorMonitoringBinding, type CreatorReadDependencies } from "./creatorRead.service";
 
 const BASE = "https://business-api.tiktok.com/open_api/v1.3";
 const LIST = "/gmv_max/campaign/get/", REPORT = "/gmv_max/report/get/", INFO = "/campaign/gmv_max/info/", ADVERTISER = "/advertiser/info/";
@@ -57,7 +57,7 @@ const campaignName = (name: unknown, token: string): string => typeof name === "
 /** Read-only today view. Request code provides neither campaign IDs nor advertiser identity. */
 export function createCreatorCampaignDayReader({ loadToken, fetchImpl = fetch, now = () => new Date(),
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
-}: CreatorReadDependencies, configured: CreatorReadBinding) {
+}: CreatorReadDependencies, configured: CreatorMonitoringBinding) {
   const binding = Object.freeze({ ...configured });
   let cached: { at: number; value: CreatorCampaignDay } | undefined;
   let inFlight: { day: string; promise: Promise<CreatorCampaignDay> } | undefined;
@@ -152,7 +152,7 @@ export function createCreatorCampaignDayReader({ loadToken, fetchImpl = fetch, n
         if (!absentShop(info.store_id) || !absentShop(info.store_authorized_bc_id) || !absentShop(identity.store_id) || !absentShop(identity.identity_authorized_shop_id) ||
           identity.identity_id !== binding.identityId || identity.identity_type !== binding.identityType ||
           identity.identity_authorized_bc_id !== binding.identityAuthorizedBcId ||
-          (info.tiktok_account_id !== undefined && info.tiktok_account_id !== binding.tiktokAccountId)) unverified();
+          (binding.tiktokAccountId !== null && info.tiktok_account_id !== undefined && info.tiktok_account_id !== binding.tiktokAccountId)) unverified();
         const before = listed?.items.get(id);
         if (before !== undefined && before !== info.operation_status) complete = false;
         const metrics = reported?.items.get(id) ?? { spendMinor: null, gmvMinor: null, skuOrders: null, liveViews: null, activityToday: false };

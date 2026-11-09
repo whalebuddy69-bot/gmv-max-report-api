@@ -80,6 +80,10 @@ export interface CreatorReadBinding {
   readonly identityAuthorizedBcId: string;
 }
 
+// Numeric TikTok account ID is display metadata for monitoring; never use this
+// nullable type in the writer or in the existing static binding parsers.
+export type CreatorMonitoringBinding = Omit<CreatorReadBinding, "tiktokAccountId"> & { readonly tiktokAccountId: string | null };
+
 /** Existing Ppan bridge and budget callers cannot supply an alternate binding. */
 export function createCreatorReader(dependencies: CreatorReadDependencies) {
   return createReader(dependencies, "punpan_020", CREATOR_BINDING, false);
@@ -103,9 +107,18 @@ export function createExtraCreatorReader(dependencies: CreatorReadDependencies, 
   return createReader(dependencies, clientId, Object.freeze({ advertiserId, tiktokAccountId, identityId, identityType, identityAuthorizedBcId }), true);
 }
 
+export function createMonitoredCreatorReader(dependencies: CreatorReadDependencies, clientId: string, binding: CreatorMonitoringBinding) {
+  if (!/^mon_[1-9]\d{5,30}$/.test(clientId) || clientId !== `mon_${binding.advertiserId}` ||
+    !accountId(binding.advertiserId) || binding.advertiserId === CREATOR_BINDING.advertiserId ||
+    binding.identityType !== "BC_AUTH_TT" || binding.identityAuthorizedBcId !== CREATOR_BINDING.identityAuthorizedBcId ||
+    !/^[A-Za-z0-9_-]{6,100}$/.test(binding.identityId) || /^0+$/.test(binding.identityId) ||
+    (binding.tiktokAccountId !== null && !accountId(binding.tiktokAccountId))) throw new CreatorReadError("CREATOR_MONITOR_BINDING_UNVERIFIED");
+  return createReader(dependencies, clientId, Object.freeze({ ...binding }), true, false, true);
+}
+
 /** Cache belongs to this one immutable client binding and is never financial truth. */
 function createReader({ loadToken, fetchImpl = fetch, now = () => new Date(), sleep = ms => new Promise(r => setTimeout(r, ms)) }: CreatorReadDependencies,
-  clientId: string, binding: CreatorReadBinding, verifyAdvertiser: boolean, manualPpanZero = false) {
+  clientId: string, binding: CreatorMonitoringBinding, verifyAdvertiser: boolean, manualPpanZero = false, monitorOnly = false) {
   let cached: { at: number; value: Row } | undefined;
   let inFlight: Promise<Row> | undefined;
   async function read(): Promise<Row> {
@@ -185,6 +198,8 @@ function createReader({ loadToken, fetchImpl = fetch, now = () => new Date(), sl
       || !Array.isArray(info.identity_list) || info.identity_list.length !== 1
       || info.identity_list[0]?.identity_id !== binding.identityId || info.identity_list[0].identity_type !== binding.identityType
       || info.identity_list[0].identity_authorized_bc_id !== binding.identityAuthorizedBcId
+      || (monitorOnly && binding.tiktokAccountId !== null &&
+        [info.tiktok_account_id, info.identity_list[0].tiktok_account_id].some(value => value !== undefined && value !== binding.tiktokAccountId))
       || !noShop(info.identity_list[0].store_id) || !noShop(info.identity_list[0].identity_authorized_shop_id)) throw new CreatorReadError("CREATOR_IDENTITY_BINDING_UNVERIFIED");
     if (typeof info.roas_bid !== "number" || !Number.isFinite(info.roas_bid) || info.roas_bid <= 0) throw new CreatorReadError("ROI_TARGET_UNVERIFIED");
     const budget = minor(info.budget);
@@ -237,7 +252,7 @@ function createReader({ loadToken, fetchImpl = fetch, now = () => new Date(), sl
       // separate explicit provider zero and a complete account-wide baseline.
       if (target === undefined) {
         if (!manualPpanZero) throw new CreatorReadError("TARGET_SPEND_UNAVAILABLE");
-        await verifyPpanManualZero(get, binding, date, campaignId, spendByCampaign);
+        await verifyPpanManualZero(get, CREATOR_BINDING, date, campaignId, spendByCampaign);
         target = 0;
       }
       base.campaign.spendMinor = target;

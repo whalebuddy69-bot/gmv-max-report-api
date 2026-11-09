@@ -18,7 +18,7 @@ const SAFE_HANDLE = /^[A-Za-z0-9_.]{1,24}$/;
 type Data = Record<string, unknown>;
 type Query = Record<string, string | number | object>;
 type Credential = { advertiserId: string; token: string };
-type Scope = { advertiserId: string; advertiserName: string; token: string; locallyBound: boolean };
+type Scope = { advertiserId: string; advertiserName: string; token: string; locallyBound: boolean; credentialAdvertiserId: string };
 export type LiveGmvDiscoveryCampaign = {
   advertiserId: string; advertiserName: string; campaignId: string; campaignName: string;
   secondaryStatus: string | null; kind: "creator" | "shop" | "unknown";
@@ -66,6 +66,7 @@ async function parseResponse(response: Response): Promise<Data> {
 export function createLiveGmvDiscoveryScanner({ appId, appSecret, loadCredentials, fetchImpl = fetch, now = Date.now,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), enrich = enrichLiveDiscoveryCampaign }: Dependencies) {
   let cached = unavailable(null), pending: Promise<LiveGmvDiscoverySnapshot> | undefined;
+  let credentialSources = new Map<string, string>();
   let lastStarted = -Infinity, cooldownUntil = -Infinity;
 
   async function scanOnce(): Promise<LiveGmvDiscoverySnapshot> {
@@ -136,11 +137,12 @@ export function createLiveGmvDiscoveryScanner({ appId, appSecret, loadCredential
         // OAuth-only advertiser IDs are allowed only using this exact token which just listed them.
         for (const [advertiserId, advertiserName] of grant) {
           const prior = accounts.get(advertiserId), locallyBound = local.has(advertiserId);
-          if (!prior || (!prior.locallyBound && locallyBound)) accounts.set(advertiserId, { advertiserId, advertiserName, token, locallyBound });
+          if (!prior || (!prior.locallyBound && locallyBound)) accounts.set(advertiserId, { advertiserId, advertiserName, token, locallyBound,
+            credentialAdvertiserId: locallyBound ? advertiserId : [...local].sort()[0] });
         }
       } catch { partial = true; }
     }
-    if (!grantsChecked) return unavailable(new Date(now()).toISOString());
+    if (!grantsChecked) { credentialSources = new Map(); return unavailable(new Date(now()).toISOString()); }
 
     const candidates: { scope: Scope; row: LiveGmvDiscoveryCampaign }[] = [];
     let accountsChecked = 0;
@@ -214,6 +216,7 @@ export function createLiveGmvDiscoveryScanner({ appId, appSecret, loadCredential
           shopName: kind === "shop" ? label(verified.shopName, 160) : null });
       } catch { partial = true; campaigns.push(row); }
     }
+    credentialSources = new Map(candidates.map(({ scope }) => [scope.advertiserId, scope.credentialAdvertiserId]));
     return { schemaVersion: 1, state: partial || stopped ? "partial" : "ready", checkedAt: new Date(now()).toISOString(),
       accountsChecked, accountsTotal: accounts.size, campaigns };
   }
@@ -223,7 +226,7 @@ export function createLiveGmvDiscoveryScanner({ appId, appSecret, loadCredential
     const at = now(), checkedAt = cached.checkedAt ? Date.parse(cached.checkedAt) : -Infinity;
     if (pending || at < cooldownUntil || at - lastStarted < COOLDOWN_MS || (!force && at - checkedAt < CACHE_MS)) return;
     lastStarted = at;
-    pending = Promise.resolve().then(scanOnce).catch(() => unavailable(new Date(now()).toISOString()))
+    pending = Promise.resolve().then(scanOnce).catch(() => { credentialSources = new Map(); return unavailable(new Date(now()).toISOString()); })
       .then(result => { cached = result; return result; }).finally(() => {
         cooldownUntil = Math.max(cooldownUntil, now() + 45_000);
         pending = undefined;
@@ -231,10 +234,26 @@ export function createLiveGmvDiscoveryScanner({ appId, appSecret, loadCredential
   }
   return {
     snapshot,
+    // Server-only provenance for a newly confirmed monitor; no token or source
+    // ID is sent to the browser. The enrollment independently rechecks OAuth.
+    credentialSourceFor(advertiserId: string) { return credentialSources.get(advertiserId); },
     read() { begin(false); return snapshot(); },
     refresh() { begin(true); return snapshot(); },
     async scan() { begin(true); return pending ?? cached; },
   };
+}
+
+/** Revalidate an OAuth-only target using only the server's proven credential source. */
+export async function verifyLiveDiscoveryGrant(advertiserId: string, token: string, fetchImpl: typeof fetch = fetch) {
+  if (!id(advertiserId) || !SAFE_TOKEN.test(token) || config.tiktokOAuth.appId !== CREATOR_APP_ID || !config.tiktokOAuth.appSecret)
+    throw new Error("MONITOR_CREDENTIAL_UNVERIFIED");
+  const url = new URL(BASE + OAUTH);
+  url.searchParams.set("app_id", config.tiktokOAuth.appId);
+  url.searchParams.set("secret", config.tiktokOAuth.appSecret);
+  const data = await parseResponse(await fetchImpl(url, { method: "GET", redirect: "error", signal: AbortSignal.timeout(6_000),
+    headers: { "Access-Token": token, Accept: "application/json", "Cache-Control": "no-cache" } }));
+  if (!Array.isArray(data.list) || data.list.length > 1_000 ||
+    data.list.filter(row => record(row) && row.advertiser_id === advertiserId).length !== 1) throw new Error("MONITOR_CREDENTIAL_UNVERIFIED");
 }
 
 export function createProductionLiveGmvDiscoveryScanner() {

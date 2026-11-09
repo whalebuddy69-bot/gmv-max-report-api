@@ -1,4 +1,4 @@
-import { CREATOR_BINDING } from "./creatorRead.service";
+import { CREATOR_BINDING, type CreatorMonitoringBinding } from "./creatorRead.service";
 
 const MAX_EXTRAS = 8;
 const MAX_RAW_LENGTH = 4_096;
@@ -30,14 +30,14 @@ export type AutomationVerifiedCreatorBinding = AutomationCreatorBinding & Readon
 export type AutomationPerformanceScope = { campaignId: string; reportingDate: string };
 export type AutomationCreatorReadAdapter = Readonly<{
   clientId: string;
-  binding: AutomationCreatorBinding;
+  binding: CreatorMonitoringBinding;
   readSnapshot: () => Promise<unknown>;
   readPerformance: (scope: AutomationPerformanceScope) => Promise<unknown>;
   readCampaignDay?: () => Promise<unknown>;
   readUsername?: () => Promise<string | null>;
 }>;
 export type AutomationCreatorReadEntry = Readonly<{
-  creator: AutomationCreator;
+  creator: AutomationCreator | (Omit<AutomationCreator, "tiktokAccountId"> & { tiktokAccountId: string | null; monitoringOnly: true });
   adapter: AutomationCreatorReadAdapter | null;
   accessReason: AutomationAccessReason;
 }>;

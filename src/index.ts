@@ -5,7 +5,7 @@ import fs from "fs/promises";
 import { config } from "./config";
 import { AppDataSource } from "./db/dataSource";
 import { analyticsRouter } from "./routes/analytics.route";
-import { automationRouter } from "./routes/automation.route";
+import { automationRouter, initializeCreatorMonitor } from "./routes/automation.route";
 import { authRouter } from "./routes/auth.route";
 import { oauthRouter } from "./routes/oauth.route";
 import { usersRouter } from "./routes/users.route";
@@ -35,6 +35,7 @@ app.use(
 // Dedicated auth/origin and a bounded request parser, before the general JSON parser.
 app.use("/automation/budget", creatorWebBudget.router);
 app.use("/automation/campaign", ppanCampaignActions.router);
+app.use("/automation", automationRouter);
 app.use(express.json());
 
 app.get("/health", (_req, res) => {
@@ -44,7 +45,6 @@ app.get("/health", (_req, res) => {
 // web app (JWT)
 app.use("/auth", authRouter);
 app.use("/analytics", analyticsRouter);
-app.use("/automation", automationRouter);
 app.use("/users", usersRouter);
 
 // TikTok OAuth redirect (no auth)
@@ -91,6 +91,7 @@ async function main(): Promise<void> {
   await creatorBudgetTest.initialize();
   await creatorWebBudget.initialize();
   await ppanCampaignActions.initialize();
+  await initializeCreatorMonitor();
   await fs.mkdir(config.reportOutputDir, { recursive: true });
 
   app.listen(config.port, () => {
