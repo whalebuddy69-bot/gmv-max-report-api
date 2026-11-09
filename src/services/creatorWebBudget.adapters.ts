@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { bangkokDay, CREATOR_BINDING, createCreatorReader, createExtraCreatorReader, createPpanManualBudgetReader, minor } from "./creatorRead.service";
 import type { AutomationVerifiedCreatorBinding } from "./creatorAutomationRegistry.service";
-import { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode, configuredCreatorSpendTrendLive, creatorBudgetPolicyPath,
+import { configuredCreatorScheduledAutoLive, configuredCreatorWebBudgetMode, configuredCreatorSpendTrendLive, creatorBudgetPolicyPath,
   allowsScheduledCreatorAuto, isExtraCreatorBudgetScope, isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND, type CreatorBudgetScope } from "./creatorBudgetScope";
 import { createCreatorVerifiedLiveRoomReader } from "./creatorVerifiedLiveRoom.service";
 import { WEB_BUDGET_MAX_MINOR, WebBudgetError, type WebBudgetAdapters, type WebBudgetPreArmContext, type WebBudgetSource } from "./creatorWebBudget.service";
@@ -216,18 +216,21 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     return row.modify_time;
   }
 
-  async function sample(campaignId: string, accessToken: string, preArmStamp?: string): Promise<Sample> {
+  async function sample(campaignId: string, accessToken: string, { preArmStamp, strictIdentity = false }: {
+    preArmStamp?: string; strictIdentity?: boolean;
+  } = {}): Promise<Sample> {
     const data = await providerGet(INFO, campaignId, accessToken);
+    const verifyRoomIdentity = isVerifiedRoomCreator(clientId) || strictIdentity || preArmStamp !== undefined;
     if (data.advertiser_id !== binding.advertiserId || data.campaign_id !== campaignId ||
       data.shopping_ads_type !== "LIVE" || data.operation_status !== "ENABLE" || data.store_id !== "0" ||
-      data.store_authorized_bc_id !== "0" || ((!extraBinding || isVerifiedRoomCreator(clientId)) && data.tiktok_account_id !== undefined && data.tiktok_account_id !== binding.tiktokAccountId) ||
+      data.store_authorized_bc_id !== "0" || ((!extraBinding || verifyRoomIdentity) && data.tiktok_account_id !== undefined && data.tiktok_account_id !== binding.tiktokAccountId) ||
       !Array.isArray(data.identity_list) || data.identity_list.length !== 1 ||
       data.optimization_goal !== "VALUE" || data.deep_bid_type !== "VO_MIN_ROAS" ||
       typeof data.roas_bid !== "number" || !Number.isFinite(data.roas_bid) || data.roas_bid <= 0) unverified();
     const identity = object(data.identity_list[0]);
     if (identity.identity_id !== binding.identityId || identity.identity_type !== binding.identityType ||
       identity.identity_authorized_bc_id !== binding.identityAuthorizedBcId ||
-      (isVerifiedRoomCreator(clientId) && identity.tiktok_account_id !== undefined && identity.tiktok_account_id !== binding.tiktokAccountId) ||
+      (verifyRoomIdentity && identity.tiktok_account_id !== undefined && identity.tiktok_account_id !== binding.tiktokAccountId) ||
       !noShop(identity.store_id) || !noShop(identity.identity_authorized_shop_id)) unverified();
     const at = now().getTime();
     const start = data.schedule_start_time, end = data.schedule_end_time;
@@ -247,11 +250,7 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     return { budgetMinor, stamp, unchanged, native, fingerprint: hash([budgetMinor, stamp, unchanged]), scheduleStartAt, scheduleEndAt };
   }
 
-  async function readPreArmContext(expectedCampaignId: string): Promise<WebBudgetPreArmContext | null> {
-    if (!extraBinding || !allowsScheduledCreatorAuto(clientId) || env.CREATOR_READ_ENABLED !== "true" ||
-      typeof expectedCampaignId !== "string" || !ID.test(expectedCampaignId)) unverified();
-    const startedAt = now().toISOString(), reportingDate = bangkokDay(new Date(startedAt));
-    const accessToken = await token();
+  async function verifyAdvertiser(accessToken: string) {
     const url = new URL(TIKTOK + "/advertiser/info/");
     url.searchParams.set("advertiser_ids", JSON.stringify([binding.advertiserId]));
     url.searchParams.set("fields", JSON.stringify(["advertiser_id", "currency", "timezone"]));
@@ -260,8 +259,16 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
       !Array.isArray(metadata.list) || metadata.list.length !== 1) unverified();
     const advertiser = object(metadata.list[0]);
     if (advertiser.advertiser_id !== binding.advertiserId || advertiser.currency !== "THB" || advertiser.timezone !== "Asia/Bangkok") unverified();
+  }
+
+  async function readPreArmContext(expectedCampaignId: string): Promise<WebBudgetPreArmContext | null> {
+    if (!allowsScheduledCreatorAuto(clientId) || env.CREATOR_READ_ENABLED !== "true" ||
+      typeof expectedCampaignId !== "string" || !ID.test(expectedCampaignId)) unverified();
+    const startedAt = now().toISOString(), reportingDate = bangkokDay(new Date(startedAt));
+    const accessToken = await token();
+    await verifyAdvertiser(accessToken);
     const stamp = await exactCampaignStamp(expectedCampaignId, accessToken, true);
-    const live = stamp === null ? null : await sample(expectedCampaignId, accessToken, stamp);
+    const live = stamp === null ? null : await sample(expectedCampaignId, accessToken, { preArmStamp: stamp });
     const observed = now();
     if (!fresh(startedAt, observed.getTime(), 20_000) || bangkokDay(observed) !== reportingDate) unverified();
     if (!live || (live.scheduleEndAt !== null && Date.parse(live.scheduleEndAt) <= observed.getTime())) return null;
@@ -270,7 +277,11 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
       fingerprint: live.fingerprint, nativeAutoState: live.native, scheduleStartAt: live.scheduleStartAt, scheduleEndAt: live.scheduleEndAt };
   }
 
-  async function context(expectedCampaignId: string, accessToken: string, source?: WebBudgetSource) {
+  async function context(expectedCampaignId: string, accessToken: string, source?: WebBudgetSource, forceRoom = false) {
+    if (forceRoom && (!allowsScheduledCreatorAuto(clientId) || source === "manual")) unverified();
+    // The pinned pilot's default reader skips advertiser metadata; a new
+    // room-based path explicitly proves the timezone used by the room report.
+    if (forceRoom && !extraBinding) await verifyAdvertiser(accessToken);
     const deps = { loadToken: async () => accessToken, fetchImpl, now, sleep };
     const read = extraBinding ? createExtraCreatorReader(deps, clientId, extraBinding)
       : source === "manual" ? createPpanManualBudgetReader(deps) : createCreatorReader(deps);
@@ -278,12 +289,12 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     const c = object(raw.campaign), quality = object(raw.quality);
     if (c.campaignId !== expectedCampaignId || quality.aggregateSpendComplete !== true ||
       !nonnegative(c.spendMinor) || !nonnegative(quality.aggregateSpendMinor) || quality.aggregateSpendMinor < c.spendMinor) unverified();
-    const live = await sample(expectedCampaignId, accessToken);
+    const live = await sample(expectedCampaignId, accessToken, { strictIdentity: forceRoom });
     const at = now();
     if (raw.reportingDate !== bangkokDay(at) || !fresh(raw.observedAt, at.getTime(), 25_000) || c.dailyBudgetMinor !== live.budgetMinor) unverified();
     // Room evidence is separate from the spend read. Do not manufacture a
     // provider spend watermark or equate an enabled campaign with a LIVE.
-    const room = isVerifiedRoomCreator(clientId) && source !== "manual" ? await readRoom({ advertiserId: binding.advertiserId,
+    const room = forceRoom || (isVerifiedRoomCreator(clientId) && source !== "manual") ? await readRoom({ advertiserId: binding.advertiserId,
       campaignId: expectedCampaignId, accessToken, reportingDate: raw.reportingDate }) :
       { deliveryVerified: false, liveDeliveryState: "UNKNOWN" as const, liveSessionId: null };
     return { campaignId: expectedCampaignId, reportingDate: raw.reportingDate as string, observedAt: raw.observedAt,
@@ -291,9 +302,16 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
       fingerprint: live.fingerprint, nativeAutoState: live.native, providerSpendObservedAt: null, ...room, sample: live };
   }
 
+  async function readScheduledLiveContext(expectedCampaignId: string) {
+    if (!allowsScheduledCreatorAuto(clientId) || env.CREATOR_READ_ENABLED !== "true" ||
+      typeof expectedCampaignId !== "string" || !ID.test(expectedCampaignId)) unverified();
+    const { sample: _, ...result } = await context(expectedCampaignId, await token(), undefined, true);
+    return result;
+  }
+
   return {
     async readPolicy() { return checkedPolicy(await policyRequest(""), now()); },
-    ...(allowsScheduledCreatorAuto(clientId) ? { readPreArmContext } : {}),
+    ...(allowsScheduledCreatorAuto(clientId) ? { readPreArmContext, readScheduledLiveContext } : {}),
     async acquireLease(operationId, revision, autoBudget) {
       if (!UUID.test(operationId) || !positive(revision)) unverified();
       if (autoBudget) {
@@ -331,7 +349,7 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
           BigInt(input.targetBudgetMinor) === BigInt(input.expectedBudgetMinor) * 6n / 5n &&
           (clientId === "punpan_020" || BigInt(input.expectedBudgetMinor) * 6n % 5n === 0n)
           : input.nativeAutoOff === true && input.noConcurrentChanges === true && (roomTrend ?
-            isVerifiedRoomCreator(clientId) && input.source === "auto" && configuredCreatorAutoBudgetMode(env, clientId) === "live" &&
+            input.source === "auto" && configuredCreatorScheduledAutoLive(env, clientId) &&
             positive(input.expectedBudgetMinor) && positive(input.targetBudgetMinor) &&
             BigInt(input.targetBudgetMinor) * 5n === BigInt(input.expectedBudgetMinor) * 6n :
             input.evidenceMode === undefined && !(input.source === "auto" && isVerifiedRoomCreator(clientId)));
@@ -341,12 +359,13 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
           !positive(input.campaignCapMinor) || !positive(input.clientDailyCapMinor) || input.targetBudgetMinor > input.campaignCapMinor ||
           !/^[a-f0-9]{64}$/.test(input.fingerprint) || !validIso(input.notAfter)) unverified();
         const accessToken = await token();
-        const latest = await context(input.campaignId, accessToken, input.evidenceMode === undefined ? input.source : undefined);
+        const latest = await context(input.campaignId, accessToken, input.evidenceMode === undefined ? input.source : undefined, roomTrend);
         const before = latest.sample;
         if (await input.canSend(latest) !== true) unverified();
         const at = now();
         if ((input.evidenceMode === "spend-trend" && !configuredCreatorSpendTrendLive(env, clientId)) || bangkokDay(at) !== input.reportingDate || latest.reportingDate !== input.reportingDate ||
-          (roomTrend && (configuredCreatorAutoBudgetMode(env, clientId) !== "live" || latest.deliveryVerified !== true || latest.liveDeliveryState !== "LIVE" || !latest.liveSessionId)) ||
+          (roomTrend && (!configuredCreatorScheduledAutoLive(env, clientId) || latest.deliveryVerified !== true ||
+            latest.liveDeliveryState !== "LIVE" || !latest.liveSessionId || !validIso(latest.liveSessionStartedAt))) ||
           Date.parse(input.notAfter) - at.getTime() < 10_000 || !fresh(latest.observedAt, at.getTime(), 25_000) ||
           before.budgetMinor !== input.expectedBudgetMinor || before.fingerprint !== input.fingerprint ||
           !["DISABLED", "UNKNOWN"].includes(before.native) || input.targetBudgetMinor <= latest.spendMinor ||
@@ -364,8 +383,8 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
         const data = opt(result.data);
         if ((data.campaign_id !== undefined && data.campaign_id !== input.campaignId) ||
           (data.advertiser_id !== undefined && data.advertiser_id !== binding.advertiserId)) unverified();
-        const first = await sample(input.campaignId, accessToken);
-        const second = await sample(input.campaignId, accessToken);
+        const first = await sample(input.campaignId, accessToken, { strictIdentity: roomTrend });
+        const second = await sample(input.campaignId, accessToken, { strictIdentity: roomTrend });
         if (first.budgetMinor !== input.targetBudgetMinor || second.budgetMinor !== input.targetBudgetMinor ||
           first.unchanged !== before.unchanged || second.fingerprint !== first.fingerprint) unverified();
         return { outcome: "APPLIED_VERIFIED", observedBudgetMinor: second.budgetMinor, observedFingerprint: second.fingerprint };

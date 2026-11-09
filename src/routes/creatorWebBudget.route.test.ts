@@ -129,17 +129,21 @@ describe("Automation web budget HTTP boundary", () => {
     expect(h.autoService.arm).not.toHaveBeenCalled();
   });
 
-  it("permits waiting-for-LIVE authorization only in the two selected Creator scopes", async () => {
-    const h = await start({ withContinuous: true, withVerifiedContinuous: true });
+  it("permits waiting-for-LIVE for continuous registered scopes without falling through to a legacy grant", async () => {
+    const h = await start({ withContinuous: true, withVerifiedContinuous: true, withSrihiwContinuous: true });
     const payload = { expectedCampaignId: PREPARE.expectedCampaignId, expectedBudgetMinor: PREPARE.expectedBudgetMinor,
       expectedPolicyRevision: 2, expectedLiveSessionId: null, nativeAutoOff: true, noConcurrentChanges: true, evidenceMode: "verified-room-spend-trend" };
     expect((await h.post("/ashopbytheta/auto/arm", JSON.stringify(payload))).status).toBe(200);
     expect((await h.post("/bubpa_shop189/auto/arm", JSON.stringify(payload))).status).toBe(200);
-    expect((await h.post("/myushop4/auto/arm", JSON.stringify(payload))).status).toBe(400);
-    expect((await h.post("/auto/arm", JSON.stringify(payload))).status).toBe(400);
+    expect((await h.post("/myushop4/auto/arm", JSON.stringify(payload))).status).toBe(200);
+    expect((await h.post("/srihiw/auto/arm", JSON.stringify(payload))).status).toBe(200);
+    expect((await h.post("/auto/arm", JSON.stringify(payload))).status).toBe(200);
+    expect((await h.post("/nnshop5719/auto/arm", JSON.stringify(payload))).status).toBe(400);
     expect(h.shopRoom.arm).toHaveBeenCalledWith(27, payload, expect.any(Function));
     expect(h.bubpaRoom.arm).toHaveBeenCalledWith(27, payload, expect.any(Function));
-    expect(h.myuRoom.arm).not.toHaveBeenCalled();
+    expect(h.myuRoom.arm).toHaveBeenCalledWith(27, payload, expect.any(Function));
+    expect(h.sriAuto.arm).toHaveBeenCalledWith(27, payload, expect.any(Function));
+    expect(h.continuous.arm).toHaveBeenCalledWith(27, payload, expect.any(Function));
   });
 
   it("keeps Srihiw continuous arm isolated and Ppan diagnostics limited to operators", async () => {

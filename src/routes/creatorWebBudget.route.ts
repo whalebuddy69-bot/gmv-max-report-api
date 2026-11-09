@@ -26,7 +26,7 @@ function badInput(): never { throw new WebBudgetError("BUDGET_INPUT_INVALID", 40
 type BudgetService = ReturnType<typeof createCreatorWebBudgetService>;
 type AutoService = ReturnType<typeof createCreatorAutoBudgetService>;
 type ContinuousAutoService = ReturnType<typeof createCreatorContinuousAutoBudgetService>;
-export type ScopedCreatorBudgetServices = Partial<Record<ExtraCreatorBudgetScope, { service: BudgetService; autoService?: AutoService; continuousAutoService?: ContinuousAutoService }>>;
+export type ScopedCreatorBudgetServices = Partial<Record<ExtraCreatorBudgetScope, { service: BudgetService; autoService?: AutoService; continuousAutoService?: ContinuousAutoService; activeLegacy?: () => Promise<boolean> }>>;
 
 export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, capEditor, autoService, continuousAutoService, autoDiagnostics, extraScopes = {}, extraConfigured = () => true, now = Date.now }: {
   viewerIds: () => string | undefined; operatorIds: () => string | undefined;
@@ -143,8 +143,10 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
     if (!autoDiagnostics) throw new WebBudgetError("AUTO_DIAGNOSTICS_UNAVAILABLE", 503, "สถานะรอบตรวจยังไม่พร้อม");
     return autoDiagnostics(id);
   }));
-  router.get(AUTO_STATUS_PATHS, get, handle((req, id) => {
-    const auto = continuousFor(req) ?? autoFor(req);
+  router.get(AUTO_STATUS_PATHS, get, handle(async (req, id) => {
+    const selected = firstSegment(req);
+    const legacyInUse = selected === "nnshop5719" && await configuredExtra(selected)?.activeLegacy?.();
+    const auto = legacyInUse ? autoFor(req) : continuousFor(req) ?? autoFor(req);
     return req.originalUrl.includes("?") ? auto.status(canOperate(id), id, "summary") : auto.status(canOperate(id), id);
   }));
   router.post(scopedPaths("/auto/arm"), onlyOperator, onlyJson, json, handle((req, id) => {
@@ -154,12 +156,13 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
     if (isVerifiedRoomCreator(firstSegment(req)) && !continuous) {
       throw new WebBudgetError("AUTO_BUDGET_NOT_CONFIGURED", 404, "ยังไม่ได้ตั้งค่า Auto สำหรับ Creator นี้");
     }
-    if (continuous && isVerifiedRoomCreator(firstSegment(req))) {
+    if (continuous && (isVerifiedRoomCreator(firstSegment(req)) || firstSegment(req) === "nnshop5719" ||
+      fields(value, [...base, "expectedLiveSessionId", "nativeAutoOff", "noConcurrentChanges", "evidenceMode"]) && value.evidenceMode === LIVE_ROOM_SPEND_TREND)) {
       if (!fields(value, [...base, "expectedLiveSessionId", "nativeAutoOff", "noConcurrentChanges", "evidenceMode"]) ||
         value.evidenceMode !== LIVE_ROOM_SPEND_TREND || value.nativeAutoOff !== true || value.noConcurrentChanges !== true ||
         typeof value.expectedCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedCampaignId) ||
         !(typeof value.expectedLiveSessionId === "string" && WEB_BUDGET_CAMPAIGN_ID.test(value.expectedLiveSessionId) ||
-          value.expectedLiveSessionId === null && allowsScheduledCreatorAuto(firstSegment(req))) ||
+          value.expectedLiveSessionId === null && (firstSegment(req) === "auto" || allowsScheduledCreatorAuto(firstSegment(req)))) ||
         !safeAmount(value.expectedBudgetMinor) || !safeAmount(value.expectedPolicyRevision)) badInput();
       return continuous.arm(id, { expectedCampaignId: value.expectedCampaignId, expectedLiveSessionId: value.expectedLiveSessionId,
         expectedBudgetMinor: value.expectedBudgetMinor, expectedPolicyRevision: value.expectedPolicyRevision,

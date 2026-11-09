@@ -6,7 +6,7 @@ export type CreatorBudgetScope = "punpan_020" | ExtraCreatorBudgetScope;
 export const VERIFIED_ROOM_CREATOR_IDS = ["ashopbytheta", "myushop4", "bubpa_shop189"] as const;
 export type VerifiedRoomCreator = (typeof VERIFIED_ROOM_CREATOR_IDS)[number];
 export type LegacyAutoBudgetScope = "punpan_020" | "srihiw" | "nnshop5719" | "ashopbytheta";
-export type ContinuousCreatorBudgetScope = "punpan_020" | "srihiw" | VerifiedRoomCreator;
+export type ContinuousCreatorBudgetScope = CreatorBudgetScope;
 export const LIVE_ROOM_SPEND_TREND = "verified-room-spend-trend" as const;
 export type ContinuousEvidence = "verified-room" | "spend-trend" | typeof LIVE_ROOM_SPEND_TREND;
 
@@ -14,8 +14,8 @@ export function isVerifiedRoomCreator(id: unknown): id is VerifiedRoomCreator {
   return typeof id === "string" && (VERIFIED_ROOM_CREATOR_IDS as readonly string[]).includes(id);
 }
 
-export function allowsScheduledCreatorAuto(id: unknown): id is "ashopbytheta" | "bubpa_shop189" {
-  return id === "ashopbytheta" || id === "bubpa_shop189";
+export function allowsScheduledCreatorAuto(id: unknown): id is ContinuousCreatorBudgetScope {
+  return isContinuousCreatorBudgetScope(id);
 }
 
 export function isLegacyAutoBudgetScope(id: unknown): id is LegacyAutoBudgetScope {
@@ -23,13 +23,14 @@ export function isLegacyAutoBudgetScope(id: unknown): id is LegacyAutoBudgetScop
 }
 
 export function isContinuousCreatorBudgetScope(id: unknown): id is ContinuousCreatorBudgetScope {
-  return id === "punpan_020" || id === "srihiw" || isVerifiedRoomCreator(id);
+  return id === "punpan_020" || isExtraCreatorBudgetScope(id);
 }
 
 export function supportsContinuousEvidence(id: ContinuousCreatorBudgetScope, evidence: ContinuousEvidence) {
+  if (evidence === LIVE_ROOM_SPEND_TREND) return allowsScheduledCreatorAuto(id);
   if (id === "punpan_020") return evidence === "verified-room" || evidence === "spend-trend";
   if (id === "srihiw") return evidence === "spend-trend";
-  return isVerifiedRoomCreator(id) && evidence === LIVE_ROOM_SPEND_TREND;
+  return false;
 }
 
 const SCOPES = Object.freeze({
@@ -89,4 +90,16 @@ export function configuredCreatorSpendTrendLive(env: NodeJS.ProcessEnv = process
   const flag = clientId === "punpan_020" ? "CREATOR_AUTO_BUDGET_PPAN_SPEND_TREND_LIVE_ENABLED" :
     clientId === "srihiw" ? "CREATOR_AUTO_BUDGET_SRIHIW_SPEND_TREND_LIVE_ENABLED" : null;
   return flag !== null && env[flag] === "true" && configuredCreatorWebBudgetMode(env, clientId) === "live";
+}
+
+/** This adds a safe activation path, not a new live-write authorization. */
+export function configuredCreatorScheduledAutoLive(env: NodeJS.ProcessEnv, id: CreatorBudgetScope) {
+  if (!allowsScheduledCreatorAuto(id)) return false;
+  if (configuredCreatorSpendTrendLive(env, id)) return true;
+  // NN's new scheduler can be approved separately without enabling the
+  // shared legacy one-shot switch or touching any other Creator's authority.
+  if (id === "nnshop5719" && env.CREATOR_AUTO_BUDGET_NNSHOP5719_SCHEDULED_LIVE_ENABLED === "true" &&
+    configuredCreatorWebBudgetMode(env, id) === "live") return true;
+  if (configuredCreatorAutoBudgetMode(env, id) !== "live") return false;
+  return id !== "punpan_020" || env.CREATOR_AUTO_BUDGET_PPAN_CONTINUOUS_LIVE_ENABLED === "true";
 }

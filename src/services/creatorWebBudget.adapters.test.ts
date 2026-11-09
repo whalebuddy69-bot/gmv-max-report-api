@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import { CREATOR_BINDING } from "./creatorRead.service";
 import { createCreatorWebBudgetAdapters, createCreatorWebCapAdapters } from "./creatorWebBudget.adapters";
 import type { WebBudgetSource } from "./creatorWebBudget.service";
-import { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode, configuredPpanSpendTrendLive, creatorBudgetPolicyPath, type CreatorBudgetScope } from "./creatorBudgetScope";
+import { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode, configuredPpanSpendTrendLive, creatorBudgetPolicyPath,
+  LIVE_ROOM_SPEND_TREND, type CreatorBudgetScope } from "./creatorBudgetScope";
 
 const NOW = "2025-03-15T09:00:00.000Z", TODAY = "2025-03-15", CAMPAIGN = "1234567890123456";
 const OTHER_CAMPAIGN = "1234567890123457", MISSING_CAMPAIGN = "1234567890123458";
+const ROOM = "1234567890123459";
 const OP = "5035df00-1801-4d02-8051-01affbbefdc9", KEY = "p".repeat(43), TOKEN = "synthetic-tiktok-adapter-key";
 const LEASE_END = "2025-03-15T09:00:55.000Z";
 const policy = { schemaVersion: 1, clientId: "punpan_020", revision: 4, campaignCapMinor: 600_000,
@@ -16,19 +18,25 @@ const dailyRow = (campaignId: string, cost: unknown = "0.00", dimensions = {}) =
   dimensions: { campaign_id: campaignId, stat_time_day: `${TODAY} 00:00:00`, store_id: "0", ...dimensions }, metrics: { cost },
 });
 const pageInfo = (count: number, page = 1, pages = 1) => ({ page, total_page: pages, total_number: count });
+const SCHEDULED_SCOPES = [["punpan_020", {}], ["srihiw", { extra: true }], ["nnshop5719", { extraClient: "nnshop5719" }],
+  ["ashopbytheta", { extraClient: "ashopbytheta" }], ["myushop4", { extraClient: "myushop4" }],
+  ["bubpa_shop189", { extraClient: "bubpa_shop189" }]] as const;
 
 function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: boolean; spendTrend?: boolean; sriTrend?: boolean; legacy?: boolean; policyKey?: string;
   providerResult?: "unknown" | "reject" | "roi-drift" | "reject-with-drift"; readAt?: string;
   extra?: boolean; extraLive?: boolean; extraClient?: "nnshop5719" | "ashopbytheta" | "myushop4" | "bubpa_shop189"; wrongProviderScope?: boolean;
   targetAbsent?: boolean; integrated?: Record<string, unknown>; daily?: (page: number) => unknown; currency?: string;
   campaignInfo?: Record<string, unknown>; campaignList?: Record<string, unknown>; listedStatus?: string; timezone?: string;
-  now?: () => Date } = {}) {
+  scheduledLive?: boolean; room?: "ONGOING" | "END"; now?: () => Date } = {}) {
   const calls: { host: string; path: string; method: string }[] = [];
   const queries: { path: string; query: Record<string, string> }[] = [];
   const extra = options.extraClient ? { ...SRIHIW, clientId: options.extraClient,
     advertiserId: options.extraClient === "nnshop5719" ? "1234567890198768" : "1234567890198769",
     identityId: `synthetic-${options.extraClient}-identity` } : options.extra ? SRIHIW : undefined;
   const binding = extra ?? CREATOR_BINDING;
+  const scheduledEnv = !options.scheduledLive ? {} : extra ? { CREATOR_AUTO_BUDGET_LIVE_ENABLED: "true",
+    [`CREATOR_AUTO_BUDGET_${extra.clientId.toUpperCase()}_MODE`]: "live", [`CREATOR_AUTO_BUDGET_${extra.clientId.toUpperCase()}_LIVE_ENABLED`]: "true" } :
+    { CREATOR_AUTO_BUDGET_LIVE_ENABLED: "true", CREATOR_AUTO_BUDGET_MODE: "live", CREATOR_AUTO_BUDGET_PPAN_CONTINUOUS_LIVE_ENABLED: "true" };
   let budget = 2800, roi = 15, stamp = "2025-03-15 08:55:00", spend = "2100.09", otherSpend = "20.00";
   let daily = options.daily ?? (() => ({ page_info: pageInfo(2), list: [dailyRow(CAMPAIGN), dailyRow(MISSING_CAMPAIGN, 0)] }));
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -89,9 +97,15 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
       expect(method).toBe("GET");
       expect(headers.get("Cache-Control")).toBe("no-cache");
       expect(url.searchParams.get("store_ids")).toBe('["0"]');
-      expect(url.searchParams.get("filtering")).toBe('{"gmv_max_promotion_types":["LIVE"],"campaign_statuses":["STATUS_ALL"]}');
       expect(url.searchParams.get("start_date")).toBe(TODAY);
       expect(url.searchParams.get("end_date")).toBe(TODAY);
+      if (url.searchParams.get("dimensions") === '["room_id","stat_time_day"]') {
+        expect(url.searchParams.get("filtering")).toBe(JSON.stringify({ campaign_ids: [CAMPAIGN] }));
+        const list = options.room ? [{ dimensions: { room_id: ROOM, stat_time_day: `${TODAY} 00:00:00` },
+          metrics: { live_status: options.room, live_launched_time: `${TODAY} 15:55:00`, live_duration: "", cost: "0.00" } }] : [];
+        return Response.json({ code: 0, data: { list, page_info: { ...pageInfo(list.length, 1, list.length ? 1 : 0), page_size: 20 } } });
+      }
+      expect(url.searchParams.get("filtering")).toBe('{"gmv_max_promotion_types":["LIVE"],"campaign_statuses":["STATUS_ALL"]}');
       return Response.json({ code: 0, data: daily(Number(url.searchParams.get("page"))) });
     }
     expect(url.pathname).toBe("/open_api/v1.3/report/integrated/get/");
@@ -109,7 +123,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
       CREATOR_WEB_SRIHIW_BUDGET_MODE: options.mode ?? "live", CREATOR_WEB_SRIHIW_BUDGET_LIVE_ENABLED: options.extraLive ? "true" : "false",
       ...(options.extraClient ? { [`CREATOR_WEB_${options.extraClient.toUpperCase()}_BUDGET_MODE`]: options.mode ?? "live",
         [`CREATOR_WEB_${options.extraClient.toUpperCase()}_BUDGET_LIVE_ENABLED`]: options.extraLive ? "true" : "false" } : {}),
-      CREATOR_BUDGET_TEST_ENABLED: options.legacy ? "true" : "false", CREATOR_WEB_POLICY_BRIDGE_KEY: options.policyKey ?? KEY } });
+      CREATOR_BUDGET_TEST_ENABLED: options.legacy ? "true" : "false", CREATOR_WEB_POLICY_BRIDGE_KEY: options.policyKey ?? KEY, ...scheduledEnv } });
   return { adapters, calls, queries, edit(value: number) { budget = value; stamp = "2025-03-15 08:59:30"; }, setSpend(value: string) { spend = value; },
     setOtherSpend(value: string) { otherSpend = value; }, setDaily(value: typeof daily) { daily = value; },
     async input(targetBudgetMinor = 310_000, source?: WebBudgetSource) {
@@ -121,8 +135,8 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
 }
 
 describe("exact read-only scheduled Auto context", () => {
-  it.each(["ashopbytheta", "bubpa_shop189"] as const)("can read an enabled future %s campaign without a spend row, room or write", async extraClient => {
-    const h = harness({ extraClient, targetAbsent: true, nativeUnknown: true, campaignInfo: {
+  it.each(SCHEDULED_SCOPES)("can read an enabled future %s campaign without a spend row, room or write", async (_scope, options) => {
+    const h = harness({ ...options, targetAbsent: true, nativeUnknown: true, campaignInfo: {
       schedule_type: "SCHEDULE_START_END", schedule_start_time: "2025-03-15 10:00:00", schedule_end_time: "2025-03-15 12:00:00" } });
     await expect(h.adapters.readPreArmContext!(CAMPAIGN)).resolves.toEqual({ campaignId: CAMPAIGN,
       reportingDate: TODAY, observedAt: NOW, budgetMinor: 280_000, fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/), nativeAutoState: "UNKNOWN",
@@ -179,11 +193,19 @@ describe("exact read-only scheduled Auto context", () => {
     expect(h.providerPosts()).toHaveLength(0);
   });
 
-  it("is not exposed in Ppan, Srihiw, nnshop or Myu scopes", () => {
-    for (const h of [harness(), harness({ extra: true }), harness({ extraClient: "nnshop5719" }), harness({ extraClient: "myushop4" })]) {
-      expect(h.adapters.readPreArmContext).toBeUndefined();
-      expect(h.calls).toHaveLength(0);
+  it.each(SCHEDULED_SCOPES)("forces a separately verified room only for the scheduled %s read", async (scope, options) => {
+    const h = harness({ ...options, room: "ONGOING" });
+    const active = await h.adapters.readScheduledLiveContext!(CAMPAIGN);
+    expect(active).toMatchObject({ campaignId: CAMPAIGN, spendMinor: 210_009, deliveryVerified: true, liveDeliveryState: "LIVE",
+      liveSessionId: ROOM, liveSessionStartedAt: "2025-03-15T08:55:00.000Z" });
+    expect(h.calls.filter(x => x.path.endsWith("/advertiser/info/"))).toHaveLength(1);
+    expect(h.calls.filter(x => x.path.endsWith("/gmv_max/report/get/"))).toHaveLength(1);
+    if (["punpan_020", "srihiw", "nnshop5719"].includes(scope)) {
+      h.calls.length = 0;
+      await expect(h.adapters.readContext(CAMPAIGN)).resolves.toMatchObject({ deliveryVerified: false, liveDeliveryState: "UNKNOWN" });
+      expect(h.calls.filter(x => x.path.endsWith("/gmv_max/report/get/"))).toHaveLength(0);
     }
+    expect(h.providerPosts()).toHaveLength(0);
   });
 
   it("rejects stale or day-crossing samples instead of returning evidence from a previous reporting day", async () => {
@@ -192,6 +214,36 @@ describe("exact read-only scheduled Auto context", () => {
       const h = harness({ extraClient: "ashopbytheta", now: () => new Date(++nowCalls < 3 ? before : after) });
       await expect(h.adapters.readPreArmContext!(CAMPAIGN)).rejects.toThrow("WEB_BUDGET_ADAPTER_UNVERIFIED");
       expect(h.providerPosts()).toHaveLength(0);
+    }
+  });
+});
+
+describe("verified room dispatch boundary", () => {
+  it.each(SCHEDULED_SCOPES)("%s uses current room evidence for exactly one +20%% send when authorized", async (_scope, options) => {
+    const h = harness({ ...options, scheduledLive: true, extraLive: true, room: "ONGOING", nativeUnknown: true });
+    const input = await h.input(336_000, "auto");
+    const before = h.calls.length;
+    await expect(h.adapters.dispatch({ ...input, evidenceMode: LIVE_ROOM_SPEND_TREND })).resolves.toMatchObject({
+      outcome: "APPLIED_VERIFIED", observedBudgetMinor: 336_000 });
+    const dispatchCalls = h.calls.slice(before);
+    expect(dispatchCalls.filter(x => x.path.endsWith("/gmv_max/report/get/") && x.method === "GET")).toHaveLength(1);
+    expect(h.providerPosts()).toHaveLength(1);
+  });
+
+  it.each(["not-authorized", "room-ended", "room-missing", "non-exact"] as const)("keeps the hybrid send closed when %s", async scenario => {
+    const h = harness({ scheduledLive: scenario !== "not-authorized", room: scenario === "room-missing" ? undefined : scenario === "room-ended" ? "END" : "ONGOING" });
+    const input = await h.input(scenario === "non-exact" ? 336_001 : 336_000, "auto");
+    await expect(h.adapters.dispatch({ ...input, evidenceMode: LIVE_ROOM_SPEND_TREND })).resolves.toEqual({ outcome: "NOT_SENT" });
+    expect(h.providerPosts()).toHaveLength(0);
+  });
+
+  it("does not impose the new room check on an already-authorized legacy spend-trend send", async () => {
+    for (const options of [{ spendTrend: true }, { extra: true, extraLive: true, sriTrend: true }]) {
+      const h = harness({ ...options, room: "END", nativeUnknown: true });
+      const { nativeAutoOff: _, noConcurrentChanges: __, ...input } = await h.input(336_000, "auto");
+      await expect(h.adapters.dispatch({ ...input, evidenceMode: "spend-trend" })).resolves.toMatchObject({ outcome: "APPLIED_VERIFIED" });
+      expect(h.calls.filter(x => x.path.endsWith("/gmv_max/report/get/"))).toHaveLength(0);
+      expect(h.providerPosts()).toHaveLength(1);
     }
   });
 });

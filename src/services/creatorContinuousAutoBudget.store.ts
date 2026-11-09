@@ -201,13 +201,16 @@ $creator_continuous_room_only$;`;
 
 // Relax only the scheduled scopes' session check. Attempts still require a
 // room, and a waiting session cannot hold an operation or provider outcome.
+const WAITING_STATE_CHECK_SQL = `evidence_mode<>'${LIVE_ROOM_SPEND_TREND}' OR live_session_id IS NOT NULL
+  OR (status<>'BLOCKED' AND operation_id IS NULL AND last_outcome IS NULL AND last_verified_at IS NULL)`;
+const WAITING_STATE_CHECK_PG = `((evidence_mode <> ''${LIVE_ROOM_SPEND_TREND}''::text) OR (live_session_id IS NOT NULL) OR ((status <> ''BLOCKED''::text) AND (operation_id IS NULL) AND (last_outcome IS NULL) AND (last_verified_at IS NULL)))`;
 const CREATOR_CONTINUOUS_AWAITING_LIVE_SCHEMA_SQL = `
 DO $creator_continuous_awaiting_live$
 DECLARE
   sessions constant regclass := 'creator_continuous_auto_budget_sessions'::regclass;
   old_evidence constant text := '(((evidence_mode = ''${LIVE_ROOM_SPEND_TREND}''::text) AND (live_session_id IS NOT NULL) AND native_auto_off_attested AND no_concurrent_changes_attested) OR ((evidence_mode = ''spend-trend''::text) AND (live_session_id IS NULL) AND (NOT native_auto_off_attested) AND (NOT no_concurrent_changes_attested)))';
   new_evidence constant text := '(((evidence_mode = ''${LIVE_ROOM_SPEND_TREND}''::text) AND native_auto_off_attested AND no_concurrent_changes_attested) OR ((evidence_mode = ''spend-trend''::text) AND (live_session_id IS NULL) AND (NOT native_auto_off_attested) AND (NOT no_concurrent_changes_attested)))';
-  state_guard constant text := '((evidence_mode <> ''${LIVE_ROOM_SPEND_TREND}''::text) OR (live_session_id IS NOT NULL) OR ((status <> ''BLOCKED''::text) AND (operation_id IS NULL) AND (last_outcome IS NULL) AND (last_verified_at IS NULL)))';
+  state_guard constant text := '${WAITING_STATE_CHECK_PG}';
   current_evidence text;
   current_guard text;
 BEGIN
@@ -231,12 +234,65 @@ BEGIN
       (evidence_mode='${LIVE_ROOM_SPEND_TREND}' AND native_auto_off_attested AND no_concurrent_changes_attested)
       OR (evidence_mode='spend-trend' AND live_session_id IS NULL AND NOT native_auto_off_attested AND NOT no_concurrent_changes_attested)
     ),
-    ADD CONSTRAINT creator_continuous_session_awaiting_live_v4 CHECK (
-      evidence_mode<>'${LIVE_ROOM_SPEND_TREND}' OR live_session_id IS NOT NULL
-      OR (status<>'BLOCKED' AND operation_id IS NULL AND last_outcome IS NULL AND last_verified_at IS NULL)
-    );
+    ADD CONSTRAINT creator_continuous_session_awaiting_live_v4 CHECK (${WAITING_STATE_CHECK_SQL});
 END
 $creator_continuous_awaiting_live$;`;
+
+// Ppan and Srihiw may already have real legacy rows (including unresolved
+// sends). Add hybrid room evidence alongside both original DB representations
+// without touching their values, authorization, retry index, or pending proof.
+const VERIFIED_SESSION_PG = `((evidence_mode = ''verified-room''::text) AND (live_session_id IS NOT NULL) AND native_auto_off_attested AND no_concurrent_changes_attested)`;
+const TREND_SESSION_PG = `((evidence_mode = ''spend-trend''::text) AND (live_session_id IS NULL) AND (NOT native_auto_off_attested) AND (NOT no_concurrent_changes_attested))`;
+const HYBRID_SESSION_PG = `((evidence_mode = ''${LIVE_ROOM_SPEND_TREND}''::text) AND native_auto_off_attested AND no_concurrent_changes_attested)`;
+const VERIFIED_ATTEMPT_PG = `((evidence_mode = ''verified-room''::text) AND (live_session_id IS NOT NULL))`;
+const TREND_ATTEMPT_PG = `((evidence_mode = ''spend-trend''::text) AND (live_session_id IS NULL))`;
+const HYBRID_ATTEMPT_PG = `((evidence_mode = ''${LIVE_ROOM_SPEND_TREND}''::text) AND (live_session_id IS NOT NULL))`;
+const CREATOR_CONTINUOUS_MIXED_EVIDENCE_SCHEMA_SQL = `
+DO $creator_continuous_mixed_evidence$
+DECLARE
+  sessions constant regclass := 'creator_continuous_auto_budget_sessions'::regclass;
+  attempts constant regclass := 'creator_continuous_auto_budget_attempts'::regclass;
+  old_session constant text := '(${VERIFIED_SESSION_PG} OR ${TREND_SESSION_PG})';
+  old_attempt constant text := '(${VERIFIED_ATTEMPT_PG} OR ${TREND_ATTEMPT_PG})';
+  new_session constant text := '(${VERIFIED_SESSION_PG} OR ${TREND_SESSION_PG} OR ${HYBRID_SESSION_PG})';
+  new_attempt constant text := '(${VERIFIED_ATTEMPT_PG} OR ${TREND_ATTEMPT_PG} OR ${HYBRID_ATTEMPT_PG})';
+  state_guard constant text := '${WAITING_STATE_CHECK_PG}';
+  current_session text;
+  current_attempt text;
+  current_guard text;
+BEGIN
+  FOR pass IN 1..2 LOOP
+    SELECT pg_get_expr(conbin,conrelid) INTO current_session FROM pg_constraint WHERE conrelid=sessions
+      AND conname='creator_continuous_auto_budget_session_evidence_v2' AND convalidated AND contype='c';
+    SELECT pg_get_expr(conbin,conrelid) INTO current_attempt FROM pg_constraint WHERE conrelid=attempts
+      AND conname='creator_continuous_auto_budget_attempt_evidence_v2' AND convalidated AND contype='c';
+    SELECT pg_get_expr(conbin,conrelid) INTO current_guard FROM pg_constraint WHERE conrelid=sessions
+      AND conname='creator_continuous_session_awaiting_live_v4' AND convalidated AND contype='c';
+    IF current_session=new_session AND current_attempt=new_attempt AND current_guard=state_guard THEN RETURN; END IF;
+    IF pass=1 THEN
+      LOCK TABLE creator_continuous_auto_budget_sessions, creator_continuous_auto_budget_attempts IN ACCESS EXCLUSIVE MODE;
+    END IF;
+  END LOOP;
+  IF current_session IS DISTINCT FROM old_session OR current_attempt IS DISTINCT FROM old_attempt OR current_guard IS NOT NULL THEN
+    RAISE EXCEPTION 'Unrecognized Creator mixed evidence constraints';
+  END IF;
+  ALTER TABLE creator_continuous_auto_budget_sessions
+    DROP CONSTRAINT creator_continuous_auto_budget_session_evidence_v2,
+    ADD CONSTRAINT creator_continuous_auto_budget_session_evidence_v2 CHECK (
+      (evidence_mode='verified-room' AND live_session_id IS NOT NULL AND native_auto_off_attested AND no_concurrent_changes_attested)
+      OR (evidence_mode='spend-trend' AND live_session_id IS NULL AND NOT native_auto_off_attested AND NOT no_concurrent_changes_attested)
+      OR (evidence_mode='${LIVE_ROOM_SPEND_TREND}' AND native_auto_off_attested AND no_concurrent_changes_attested)
+    ),
+    ADD CONSTRAINT creator_continuous_session_awaiting_live_v4 CHECK (${WAITING_STATE_CHECK_SQL});
+  ALTER TABLE creator_continuous_auto_budget_attempts
+    DROP CONSTRAINT creator_continuous_auto_budget_attempt_evidence_v2,
+    ADD CONSTRAINT creator_continuous_auto_budget_attempt_evidence_v2 CHECK (
+      (evidence_mode='verified-room' AND live_session_id IS NOT NULL)
+      OR (evidence_mode='spend-trend' AND live_session_id IS NULL)
+      OR (evidence_mode='${LIVE_ROOM_SPEND_TREND}' AND live_session_id IS NOT NULL)
+    );
+END
+$creator_continuous_mixed_evidence$;`;
 
 type Runner = ReturnType<CreatorWebBudgetDatabase["createQueryRunner"]>;
 function rows(value: unknown): Record<string, unknown>[] {
@@ -326,7 +382,7 @@ const EXACT_WEB_OP = `w.client_id='punpan_020' AND w.operation_id=$9::uuid AND w
   AND w.policy_revision=$4 AND w.current_budget_minor=$5 AND w.fingerprint=$6 AND w.mode='live' AND w.source='auto'`;
 
 /**
- * Open-ended, owner-armed authority for one exact Ppan campaign, never a provider writer.
+ * Open-ended, owner-armed authority for one exact Creator campaign, never a provider writer.
  * Each operation still needs the existing short writer lease, fresh provider evidence,
  * owner revalidation, and provider readback. An unresolved send cannot be reset by Stop.
  */
@@ -335,7 +391,8 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
   // Translate only literal, reviewed scopes. Keep existing tables unchanged
   // and new SQL identifiers short enough to avoid PostgreSQL truncation.
   const prefix = clientId === "srihiw" ? "creator_srihiw_continuous_" : clientId === "ashopbytheta" ? "creator_ashop_cauto_" :
-    clientId === "myushop4" ? "creator_myu_cauto_" : "creator_bubpa_cauto_";
+    clientId === "myushop4" ? "creator_myu_cauto_" : clientId === "bubpa_shop189" ? "creator_bubpa_cauto_" : "creator_nn_cauto_";
+  const roomOnly = isVerifiedRoomCreator(clientId) || clientId === "nnshop5719";
   const scopedSql = (sql: string) => clientId === CLIENT ? sql : sql
     .replaceAll("creator_continuous_", prefix)
     .replaceAll("creator_web_budget_operations", `creator_web_budget_${clientId}_operations`)
@@ -362,12 +419,11 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
   return {
     async ensureSchema() { await run(async runner => {
       await runner.query(CREATOR_CONTINUOUS_AUTO_BUDGET_SCHEMA_SQL);
-      // These scoped tables are new; old Ppan/Srihiw evidence schema stays byte-for-byte unchanged.
-      await runner.query(isVerifiedRoomCreator(clientId) ? CREATOR_CONTINUOUS_SPEND_TREND_SCHEMA_SQL
+      await runner.query(roomOnly ? CREATOR_CONTINUOUS_SPEND_TREND_SCHEMA_SQL
         .replaceAll("'verified-room'", `'${LIVE_ROOM_SPEND_TREND}'`) : CREATOR_CONTINUOUS_SPEND_TREND_SCHEMA_SQL);
       await runner.query(CREATOR_CONTINUOUS_SAFE_RETRY_SCHEMA_SQL);
-      if (isVerifiedRoomCreator(clientId)) await runner.query(CREATOR_VERIFIED_ROOM_ONLY_SCHEMA_SQL);
-      if (allowsScheduledCreatorAuto(clientId)) await runner.query(CREATOR_CONTINUOUS_AWAITING_LIVE_SCHEMA_SQL);
+      if (roomOnly) await runner.query(CREATOR_VERIFIED_ROOM_ONLY_SCHEMA_SQL);
+      if (allowsScheduledCreatorAuto(clientId)) await runner.query(roomOnly ? CREATOR_CONTINUOUS_AWAITING_LIVE_SCHEMA_SQL : CREATOR_CONTINUOUS_MIXED_EVIDENCE_SCHEMA_SQL);
     }); },
     async getActive() {
       // Includes stopped sessions whose already reserved operation still needs reconciliation.

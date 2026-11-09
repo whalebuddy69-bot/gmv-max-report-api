@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { bangkokDay } from "./creatorRead.service";
-import { isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND, type CreatorBudgetScope } from "./creatorBudgetScope";
+import { allowsScheduledCreatorAuto, isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND, type CreatorBudgetScope } from "./creatorBudgetScope";
 
 export const WEB_BUDGET_CLIENT_ID = "punpan_020";
 export const WEB_BUDGET_OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -52,6 +52,7 @@ export interface WebBudgetAdapters {
   finishLease(operationId: string, outcome: WebBudgetOutcome): Promise<void>;
   readContext(expectedCampaignId: string, source?: WebBudgetSource): Promise<WebBudgetContext>;
   readPreArmContext?(expectedCampaignId: string): Promise<WebBudgetPreArmContext | null>;
+  readScheduledLiveContext?(expectedCampaignId: string): Promise<WebBudgetContext>;
   dispatch(input: WebBudgetDispatch): Promise<{ outcome: WebBudgetOutcome; observedBudgetMinor?: number; observedFingerprint?: string }>;
 }
 export interface WebBudgetProposal {
@@ -137,8 +138,10 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
   store: WebBudgetStore; adapters: WebBudgetAdapters; mode: () => WebBudgetMode; clientId?: CreatorBudgetScope; now?: () => Date;
 }) {
   async function getPolicy() { return checkPolicy(await adapters.readPolicy(), now().getTime()); }
-  async function validatedInputs(campaignId: string, current: number, target: number, source: WebBudgetSource) {
-    const [rawCap, rawContext] = await Promise.all([adapters.readPolicy(), adapters.readContext(campaignId, source).catch(error => {
+  async function validatedInputs(campaignId: string, current: number, target: number, source: WebBudgetSource, roomTrend = false) {
+    const readContext = roomTrend && adapters.readScheduledLiveContext
+      ? adapters.readScheduledLiveContext(campaignId) : adapters.readContext(campaignId, source);
+    const [rawCap, rawContext] = await Promise.all([adapters.readPolicy(), readContext.catch(error => {
       if (source === "manual" && !(error instanceof WebBudgetError)) {
         reject("BUDGET_CONTEXT_UNVERIFIED", 409, "ยังยืนยันงบและยอดใช้ล่าสุดไม่ครบ กรุณาลองใหม่");
       }
@@ -198,7 +201,7 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
         (clientId === WEB_BUDGET_CLIENT_ID ? autoRounding !== "floor-satang" : autoRounding !== undefined) ||
         input.nativeAutoOff !== undefined || input.noConcurrentChanges !== undefined)
         : (input.nativeAutoOff !== true || input.noConcurrentChanges !== true || (useRoomTrend ?
-          (!isVerifiedRoomCreator(clientId) || initial.source !== "auto" || !autoGuard || autoRounding !== undefined) :
+          (!allowsScheduledCreatorAuto(clientId) || initial.source !== "auto" || !autoGuard || autoRounding !== undefined) :
           (input.evidenceMode !== undefined || (initial.source === "auto" && isVerifiedRoomCreator(clientId)))))) {
         reject("BUDGET_ATTESTATION_REQUIRED", 400, "ต้องยืนยันสิทธิ์และเงื่อนไขการปรับงบ");
       }
@@ -219,7 +222,7 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
       try {
         const source = reserved.source ?? "manual";
         if (source !== (initial.source ?? "manual")) reject("BUDGET_PRECONDITION_CHANGED", 409, "รายการเปลี่ยน กรุณาเปิดรายการใหม่");
-        const { cap, context } = await validatedInputs(reserved.campaignId, reserved.currentBudgetMinor, reserved.targetBudgetMinor, source);
+        const { cap, context } = await validatedInputs(reserved.campaignId, reserved.currentBudgetMinor, reserved.targetBudgetMinor, source, useRoomTrend);
         if (!sameCap(reserved.cap, cap) || context.reportingDate !== reserved.reportingDate || context.fingerprint !== reserved.fingerprint) {
           reject("BUDGET_PRECONDITION_CHANGED", 409, "งบหรือเพดานเปลี่ยน กรุณาเปิดรายการใหม่");
         }

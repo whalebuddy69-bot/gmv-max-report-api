@@ -14,8 +14,8 @@ import { createPpanAutoWatchRouter } from "../routes/ppanAutoWatch.route";
 import { bangkokDay, createCreatorReader, createExtraCreatorReader } from "./creatorRead.service";
 import { parseAutomationViewerIds } from "../routes/automation.route";
 import { User } from "../entities/User";
-import { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode, configuredPpanSpendTrendLive, configuredCreatorSpendTrendLive,
-  isExtraCreatorBudgetScope, isLegacyAutoBudgetScope, isContinuousCreatorBudgetScope, isVerifiedRoomCreator,
+import { configuredCreatorAutoBudgetMode, configuredCreatorScheduledAutoLive, configuredCreatorWebBudgetMode, configuredPpanSpendTrendLive, configuredCreatorSpendTrendLive,
+  isExtraCreatorBudgetScope, isLegacyAutoBudgetScope, isVerifiedRoomCreator,
   LIVE_ROOM_SPEND_TREND,
   type ContinuousCreatorBudgetScope, type CreatorBudgetScope } from "./creatorBudgetScope";
 export { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode } from "./creatorBudgetScope";
@@ -43,16 +43,17 @@ export function createCreatorWebBudgetRuntime() {
     const service = createCreatorWebBudgetService({ clientId, store, adapters,
       mode: () => ledgerReady.has(clientId) ? configuredCreatorWebBudgetMode(process.env, clientId) : "disabled" });
     const autoService = isLegacyAutoBudgetScope(clientId) ? createCreatorAutoBudgetService({ clientId, grants, writer: service, ledger: store, adapters, recheckOwner,
-      mode: () => autoLedgerReady && ledgerReady.has(clientId) ? (isContinuousCreatorBudgetScope(clientId) ? "shadow" : configuredCreatorAutoBudgetMode(process.env, clientId)) : "disabled",
+      mode: () => autoLedgerReady && ledgerReady.has(clientId) ? (clientId === "nnshop5719" ? configuredCreatorAutoBudgetMode(process.env, clientId) : "shadow") : "disabled",
       discover: async () => (await reader()).campaign?.campaignId ?? null }) : undefined;
     return { clientId, store, service, autoService };
   }
   const ppanReader = createCreatorReader({ loadToken: loadCreatorToken });
   const ppanAdapters = createCreatorWebBudgetAdapters({ loadToken: loadCreatorToken });
   const ppan = makeRuntime("punpan_020", ppanAdapters, ppanReader);
+  const scheduledLive = (id: ContinuousCreatorBudgetScope) => continuousReady.has(id) && ledgerReady.has(id) && configuredCreatorScheduledAutoLive(process.env, id);
   const continuousAutoService = createCreatorContinuousAutoBudgetService({ sessions, writer: ppan.service, ledger: ppan.store,
     observeTick: event => diagnosticsReady ? diagnostics.recordTick(event) : Promise.resolve(),
-    adapters: ppanAdapters, recheckOwner, evidenceMode: () => configuredPpanSpendTrendLive() ? "spend-trend" : "verified-room", mode: () => {
+    adapters: ppanAdapters, recheckOwner, scheduledLive: () => scheduledLive("punpan_020"), evidenceMode: () => configuredPpanSpendTrendLive() ? "spend-trend" : "verified-room", mode: () => {
       if (!continuousReady.has("punpan_020") || !ledgerReady.has("punpan_020")) return "disabled";
       if (configuredPpanSpendTrendLive()) return "live";
       const configured = configuredCreatorAutoBudgetMode();
@@ -79,21 +80,23 @@ export function createCreatorWebBudgetRuntime() {
     const reader = createExtraCreatorReader({ loadToken }, clientId, binding);
     const runtime = makeRuntime(clientId, adapters, reader);
     allRuntimes.push(runtime);
-    if (isContinuousCreatorBudgetScope(clientId)) {
+    {
       const scopedSessions = createCreatorContinuousAutoBudgetStore(AppDataSource, clientId);
       const scopedAuto = createCreatorContinuousAutoBudgetService({ clientId, sessions: scopedSessions,
         writer: runtime.service, ledger: runtime.store, adapters, recheckOwner,
-        evidenceMode: () => isVerifiedRoomCreator(clientId) ? LIVE_ROOM_SPEND_TREND : "spend-trend",
+        scheduledLive: () => scheduledLive(clientId),
+        evidenceMode: () => clientId === "srihiw" ? "spend-trend" : LIVE_ROOM_SPEND_TREND,
         mode: () => {
           if (!continuousReady.has(clientId) || !ledgerReady.has(clientId)) return "disabled";
           const configured = configuredCreatorAutoBudgetMode(process.env, clientId);
-          if (isVerifiedRoomCreator(clientId)) return configured;
+          if (isVerifiedRoomCreator(clientId) || clientId === "nnshop5719") return configured;
           return configuredCreatorSpendTrendLive(process.env, clientId) ? "live" : configured === "shadow" ? "shadow" : "disabled";
         },
         discover: async () => (await reader()).campaign?.campaignId ?? null, legacyBusy: () => legacyBusy(clientId) });
       continuousScopes.push({ id: clientId, store: scopedSessions, service: scopedAuto });
-      extraScopes[clientId] = { ...runtime, continuousAutoService: scopedAuto };
-    } else extraScopes[clientId] = runtime;
+      extraScopes[clientId] = { ...runtime, continuousAutoService: scopedAuto,
+        ...(clientId === "nnshop5719" ? { activeLegacy: () => legacyBusy(clientId) } : {}) };
+    }
   }
   const router = createCreatorWebBudgetRouter({ service: ppan.service, autoService: ppan.autoService, continuousAutoService,
     autoDiagnostics: async ownerId => {

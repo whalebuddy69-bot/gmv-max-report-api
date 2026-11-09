@@ -49,10 +49,10 @@ function operation(session: CreatorContinuousAutoBudgetSession, target = Number(
 }
 
 describe("Ppan continuous Auto session", () => {
-  it("bootstraps each new verified-room scope independently and never accepts a legacy spend-trend permit", async () => {
+  it("bootstraps each room-only scope independently and never accepts a legacy spend-trend permit", async () => {
     const h = setup();
     const records: Array<{ sessions: typeof h.sessions; row: CreatorContinuousAutoBudgetSession; operationId: string }> = [];
-    for (const id of VERIFIED_ROOM_CREATOR_IDS) {
+    for (const id of [...VERIFIED_ROOM_CREATOR_IDS, "nnshop5719"] as const) {
       const ledger = createCreatorWebBudgetStore(h.database, id), sessions = createCreatorContinuousAutoBudgetStore(h.database, id);
       await ledger.ensureSchema(); await sessions.ensureSchema(); await sessions.ensureSchema();
       expect(await sessions.arm(trendArm())).toBeNull();
@@ -60,7 +60,7 @@ describe("Ppan continuous Auto session", () => {
       const row = (await sessions.arm(arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, baselineBudgetMinor: 250000 })))!;
       expect(row).toMatchObject({ clientId: id, liveSessionId: ROOM, evidenceMode: LIVE_ROOM_SPEND_TREND });
       const table = { ashopbytheta: "creator_ashop_cauto_auto_budget_sessions", myushop4: "creator_myu_cauto_auto_budget_sessions",
-        bubpa_shop189: "creator_bubpa_cauto_auto_budget_sessions" }[id];
+        bubpa_shop189: "creator_bubpa_cauto_auto_budget_sessions", nnshop5719: "creator_nn_cauto_auto_budget_sessions" }[id];
       await expect(h.db.query(`UPDATE ${table} SET evidence_mode='spend-trend', live_session_id=NULL,
         native_auto_off_attested=false,no_concurrent_changes_attested=false WHERE session_id=$1`, [row.sessionId])).rejects.toMatchObject({ code: "23514" });
       for (const other of records) {
@@ -123,23 +123,78 @@ describe("Ppan continuous Auto session", () => {
     expect(await sessions.reserve(bound, proposal.operationId, proposal.targetBudgetMinor)).toMatchObject({ operationId: proposal.operationId });
   }, 30_000);
 
-  it("does not bind a stopped or different Creator's wait, or extend scheduled waits to Myushop4 and spend-trend", async () => {
+  it("binds independent scheduled waits and does not bind a stopped session or a legacy spend-trend session", async () => {
     const h = setup();
     const ashop = createCreatorContinuousAutoBudgetStore(h.database, "ashopbytheta");
     const bubpa = createCreatorContinuousAutoBudgetStore(h.database, "bubpa_shop189");
     const myu = createCreatorContinuousAutoBudgetStore(h.database, "myushop4");
-    await ashop.ensureSchema(); await bubpa.ensureSchema(); await myu.ensureSchema(); await h.sessions.ensureSchema();
+    const nn = createCreatorContinuousAutoBudgetStore(h.database, "nnshop5719");
+    await ashop.ensureSchema(); await bubpa.ensureSchema(); await myu.ensureSchema(); await nn.ensureSchema(); await h.sessions.ensureSchema();
     const input = arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, liveSessionId: null });
     const a = (await ashop.arm(input))!, b = (await bubpa.arm(input))!;
-    expect(await myu.arm(input)).toBeNull();
-    expect(await h.sessions.arm(input)).toBeNull();
+    const m = (await myu.arm(input))!, n = (await nn.arm(input))!;
+    expect(m).toMatchObject({ clientId: "myushop4", liveSessionId: null });
+    expect(n).toMatchObject({ clientId: "nnshop5719", liveSessionId: null });
     expect(await ashop.bindLiveSession(b, ROOM)).toBeNull();
-    expect(await myu.bindLiveSession({ ...a, clientId: "myushop4" }, ROOM)).toBeNull();
+    expect(await myu.bindLiveSession(a, ROOM)).toBeNull();
+    expect(await nn.bindLiveSession(m, ROOM)).toBeNull();
     const trend = (await h.sessions.arm(trendArm()))!;
     expect(await h.sessions.bindLiveSession(trend, ROOM)).toBeNull();
     expect(await ashop.stop(a.ownerId, a.sessionId)).toMatchObject({ status: "STOPPED", liveSessionId: null });
     expect(await ashop.bindLiveSession(a, ROOM)).toBeNull();
     expect(await bubpa.bindLiveSession(b, ROOM)).toMatchObject({ status: "ACTIVE", liveSessionId: ROOM });
+    expect(await myu.bindLiveSession(m, ROOM)).toMatchObject({ status: "ACTIVE", liveSessionId: ROOM });
+    expect(await nn.bindLiveSession(n, ROOM)).toMatchObject({ status: "ACTIVE", liveSessionId: ROOM });
+  }, 30_000);
+
+  it("migrates Ppan and Srihiw in place, keeping each legacy pending send and requiring a room for new hybrid attempts", async () => {
+    const h = setup();
+    for (const id of ["punpan_020", "srihiw"] as const) {
+      const sessions = createCreatorContinuousAutoBudgetStore(h.database, id), ledger = createCreatorWebBudgetStore(h.database, id);
+      const prefix = id === "srihiw" ? "creator_srihiw_continuous_" : "creator_continuous_";
+      const table = `${prefix}auto_budget_sessions`, attempts = `${prefix}auto_budget_attempts`;
+      const preUpgrade = (sql: string) => sql.replaceAll("creator_continuous_", prefix).replaceAll("'punpan_020'", `'${id}'`);
+      await ledger.ensureSchema();
+      await h.db.exec(preUpgrade(CREATOR_CONTINUOUS_AUTO_BUDGET_SCHEMA_SQL));
+      await h.db.exec(preUpgrade(CREATOR_CONTINUOUS_SPEND_TREND_SCHEMA_SQL));
+      const old = id === "srihiw" ? trendArm({ baselineBudgetMinor: 250_000 }) : arm({ evidenceMode: "verified-room", baselineBudgetMinor: 250_000 });
+      const pendingId = randomUUID();
+      await h.db.query(`INSERT INTO ${table}
+        (session_id,client_id,owner_id,campaign_id,live_session_id,policy_revision,baseline_budget_minor,baseline_fingerprint,
+          authorized_at,native_auto_off_attested,no_concurrent_changes_attested,evidence_mode,operation_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'2026-11-08T00:00:00.000Z',$9,$10,$11,$12)`,
+      [old.sessionId, id, old.ownerId, old.campaignId, old.liveSessionId, old.policyRevision, old.baselineBudgetMinor, old.baselineFingerprint,
+        old.nativeAutoOffAttested, old.noConcurrentChangesAttested, old.evidenceMode, pendingId]);
+      await h.db.query(`INSERT INTO ${attempts}
+        (operation_id,session_id,client_id,campaign_id,live_session_id,baseline_fingerprint,baseline_budget_minor,target_budget_minor,evidence_mode)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,300000,$8)`,
+      [pendingId, old.sessionId, id, old.campaignId, old.liveSessionId, old.baselineFingerprint, old.baselineBudgetMinor, old.evidenceMode]);
+      const [before] = (await h.db.query(`SELECT * FROM ${table}`)).rows;
+      await sessions.ensureSchema(); await sessions.ensureSchema();
+      const pending = (await sessions.getActive())!;
+      expect(pending).toMatchObject({ ...old, status: "ACTIVE", operationId: pendingId });
+      expect((await h.db.query(`SELECT * FROM ${table}`)).rows).toEqual([before]);
+      expect((await h.db.query(`SELECT operation_id,live_session_id,evidence_mode,retry_released FROM ${attempts}`)).rows)
+        .toEqual([{ operation_id: pendingId, live_session_id: old.liveSessionId, evidence_mode: old.evidenceMode, retry_released: false }]);
+      if (id === "punpan_020") await expect(h.db.query(`UPDATE ${table} SET live_session_id=NULL WHERE session_id=$1`, [old.sessionId]))
+        .rejects.toMatchObject({ code: "23514" });
+      const waitingInput = arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, liveSessionId: null, baselineFingerprint: AFTER, baselineBudgetMinor: 250_000 });
+      expect(await sessions.arm(waitingInput)).toBeNull();
+      const legacyOp = operation(pending, 300_000, { operationId: pendingId });
+      await ledger.create(legacyOp); await ledger.reserve(pending.ownerId, pendingId, "live");
+      await ledger.finish(pending.ownerId, pendingId, { status: "NOT_SENT", observedBudgetMinor: null, reason: "PRECHECK" });
+      expect(await sessions.settleNotSent(pending, pendingId)).toMatchObject({ operationId: null, lastOutcome: "NOT_SENT" });
+      if (id === "srihiw") await sessions.stop(pending.ownerId, pending.sessionId);
+
+      const waiting = (await sessions.arm(waitingInput))!;
+      expect(waiting).toMatchObject({ ...waitingInput, status: "ACTIVE" });
+      await expect(h.db.query(`INSERT INTO ${attempts}
+        (operation_id,session_id,client_id,campaign_id,live_session_id,baseline_fingerprint,baseline_budget_minor,target_budget_minor,evidence_mode)
+        VALUES ($1,$2,$3,$4,NULL,$5,250000,300000,$6)`,
+      [randomUUID(), waiting.sessionId, id, waiting.campaignId, waiting.baselineFingerprint, waiting.evidenceMode]))
+        .rejects.toMatchObject({ code: "23514" });
+      expect(await sessions.bindLiveSession(waiting, ROOM)).toMatchObject({ liveSessionId: ROOM, baselineFingerprint: AFTER });
+    }
   }, 30_000);
 
   it("keeps Srihiw session, attempts and writer proof independent, even with identical baseline data", async () => {
