@@ -74,6 +74,22 @@ describe("read-only LIVE GMV Max discovery", () => {
     expect(f.requests.filter(r => r.params.get("advertiser_id") === A)).toHaveLength(2);
   });
 
+  it("checks an 11-page advertiser fully and retains an ENABLE row from its last page", async () => {
+    const lastId = String(BigInt(ID) + 1060n);
+    const f = setup(u => {
+      if (u.pathname.endsWith("/oauth2/advertiser/get/")) return ok(grant([A, "Ppan"]));
+      const current = Number(u.searchParams.get("page"));
+      expect(u.searchParams.get("page_size")).toBe("100");
+      const items = Array.from({ length: current === 11 ? 61 : 100 }, (_, index) => {
+        const campaignId = String(BigInt(ID) + BigInt((current - 1) * 100 + index));
+        return campaign(A, campaignId, campaignId === lastId ? "ENABLE" : "DISABLE");
+      });
+      return ok(page(items, current, 11, 1061));
+    });
+    expect(await f.scanner.scan()).toMatchObject({ state: "ready", accountsTotal: 1, accountsChecked: 1, campaigns: [{ campaignId: lastId }] });
+    expect(f.requests.filter(r => r.path === "/gmv_max/campaign/get/")).toHaveLength(11);
+  });
+
   it("serializes parallel metadata requests and drops a newer verified disabled or non-LIVE detail", async () => {
     const f = setup(u => {
       if (u.pathname.endsWith("/oauth2/advertiser/get/")) return ok(grant([A, "Ppan"]));

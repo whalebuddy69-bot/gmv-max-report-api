@@ -7,7 +7,7 @@ const BASE = "https://business-api.tiktok.com/open_api/v1.3";
 const OAUTH = "/oauth2/advertiser/get/", LIST = "/gmv_max/campaign/get/";
 const ENRICH = new Set(["/campaign/gmv_max/info/", "/identity/info/", "/gmv_max/store/list/", "/gmv_max/identity/get/"]);
 const MAX_CREDENTIAL_ROWS = 200, MAX_GRANTS = 12, MAX_ACCOUNTS = 150;
-const MAX_PAGES = 8, PAGE_SIZE = 100, MAX_CAMPAIGNS = 200, MAX_CALLS = 230;
+const MAX_PAGES = 16, PAGE_SIZE = 100, MAX_CAMPAIGNS = 200, MAX_CALLS = 230;
 const MAX_BYTES = 1_048_576, REQUEST_TIMEOUT_MS = 6_000, REQUEST_GAP_MS = 850, SCAN_TIMEOUT_MS = 220_000;
 const CACHE_MS = 300_000, COOLDOWN_MS = 120_000, THROTTLED_COOLDOWN_MS = 300_000;
 const SAFE_ID = /^[1-9]\d{5,30}$/;
