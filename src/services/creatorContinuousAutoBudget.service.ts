@@ -35,6 +35,10 @@ function spendReady(ctx: WebBudgetContext, at: Date, after?: string | null) {
     bangkokDay(new Date(watermark)) === ctx.reportingDate && (!after || watermark > instant(after));
 }
 const verifiedEnded = (ctx: WebBudgetContext) => ctx.deliveryVerified === true && ctx.liveDeliveryState === "NOT_LIVE";
+function predatesWaitingAuthorization(ctx: WebBudgetContext, row: Session) {
+  const launch = instant(ctx.liveSessionStartedAt), arm = instant(row.authorizedAt);
+  return hasRoom(ctx) && Number.isFinite(launch) && Number.isFinite(arm) && launch < arm - 60_000;
+}
 function blockers(ctx: WebBudgetContext, policy: WebBudgetPolicy, fenced: boolean, at: Date, evidence: EvidenceMode, session?: Session) {
   const codes: PpanAutoTickReason[] = [];
   if (evidence === "spend-trend") {
@@ -113,8 +117,9 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     pulse = { key, at: timestamp, spend: ctx.spendMinor };
     return previous?.key === key && gap >= 40_000 && gap <= 95_000 && ctx.spendMinor > previous.spend ? previous.spend : null;
   }
-  async function read(campaignId: string, evidence: EvidenceMode) {
-    const readContext = evidence === LIVE_ROOM_SPEND_TREND && adapters.readScheduledLiveContext ? adapters.readScheduledLiveContext(campaignId) : adapters.readContext(campaignId);
+  async function read(campaignId: string, evidence: EvidenceMode, expectedLiveSessionId?: string) {
+    const readContext = evidence === LIVE_ROOM_SPEND_TREND && adapters.readScheduledLiveContext
+      ? adapters.readScheduledLiveContext(campaignId, expectedLiveSessionId) : adapters.readContext(campaignId);
     const [context, policy, fenced] = await Promise.all([readContext, adapters.readPolicy(), ledger.hasFence()]);
     return { context, policy, fenced };
   }
@@ -155,12 +160,17 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       const canReadScheduled = canWaitForLive() && (canRequest || waiting(own));
       // When offering the new authorization, do not equate historical spend with
       // a current room. Existing spend-trend rounds keep their original reads.
-      const full = await read(campaign, canReadScheduled ? LIVE_ROOM_SPEND_TREND : evidence)
+      const full = await read(campaign, canReadScheduled ? LIVE_ROOM_SPEND_TREND : evidence,
+        row?.status === "ACTIVE" ? row.liveSessionId ?? undefined : undefined)
         .catch(error => { if (!canReadScheduled) throw error; return null; });
       if (canReadScheduled && (!full || !hasRoom(full.context) || waiting(own))) {
         const { context, policy, fenced } = await readScheduled(campaign), at = now();
         if (!context || !validScheduledContext(context, campaign, at)) return { ...base, canArm: false, preview: null, blockers: ["CONTEXT_UNAVAILABLE"] };
         const reasons = scheduledBlockers(context, policy, fenced, at);
+        if (own && waiting(own) && full) {
+          if (full.context.roomEvidenceIssue === "STALE_ONGOING") reasons.push("LIVE_ROOM_REPORT_STALE");
+          else if (predatesWaitingAuthorization(full.context, own)) reasons.push("LIVE_ROOM_PREDATES_AUTO");
+        }
         return { ...base, evidenceMode: LIVE_ROOM_SPEND_TREND, canArm: canRequest && !reasons.length && !await legacyBusy(), blockers: reasons,
           preview: { status: "WAITING_FOR_LIVE", waitingForLive: true as const, campaignId: campaign, currentBudgetMinor: context.budgetMinor,
             liveSessionId: null, spendMinor: null, policyRevision: policy.revision, thresholdMinor: Number((BigInt(context.budgetMinor) * 8n + 9n) / 10n),
@@ -293,7 +303,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
         reason = bound ? "SPEND_TREND_PENDING" : "WRITE_LOCKED";
         return; // Never send on the first verified room/spend reading.
       }
-      const { context, policy, fenced } = await read(campaign, evidence), at = now();
+      const { context, policy, fenced } = await read(campaign, evidence, row.liveSessionId ?? undefined), at = now();
       if (context.campaignId !== campaign || !freshContext(context, at)) { pulse = undefined; return; }
       const verdict = preview(context, policy, at, evidence);
       if (verdict.status !== "CONTEXT_UNVERIFIED") lastValidReadAt = context.observedAt;
@@ -321,8 +331,17 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       }
       if (needsPair && previousSpend === null) { reason = "SPEND_TREND_PENDING"; return; }
       if (!allowedEvidence(evidence)) { reason = "AUTO_DISABLED"; return; }
+      const dayEnd = Date.parse(`${context.reportingDate}T00:00:00+07:00`) + 86_400_000;
+      if (roomTrend && dayEnd - now().getTime() < 30_000) {
+        pulse = undefined; reason = "SPEND_UPDATE_PENDING"; return;
+      }
       const op = await writer.prepare(row.ownerId, { expectedCampaignId: row.campaignId,
         expectedBudgetMinor: row.baselineBudgetMinor, targetBudgetMinor: verdict.targetBudgetMinor }, "auto");
+      // Preparing a proposal near midnight can finish after the reporting day
+      // changed. Wait for a fresh pair instead of consuming an Auto attempt.
+      if (roomTrend && (bangkokDay(now()) !== context.reportingDate || instant(op.expiresAt) - now().getTime() < 15_000)) {
+        pulse = undefined; reason = "SPEND_UPDATE_PENDING"; return;
+      }
       if (!await sessions.reserve(row, op.operationId, verdict.targetBudgetMinor)) { reason = "WRITE_LOCKED"; return; }
       if (needsPair) pulse = undefined; // A second increase always needs a new pair.
       const allowed = async () => allowedEvidence(evidence) && await recheckOwner(current.ownerId, current.authorizedAt) && await sessions.isReserved(current, op.operationId);

@@ -171,6 +171,42 @@ describe("Ppan continuous budget automation", () => {
     expect(await f.sessions.getLatest()).toMatchObject({ status: "STOPPED", stopReason: "BASELINE_CHANGED" });
     expect(f.dispatch).not.toHaveBeenCalled();
   });
+  it("explains an already-armed stale or pre-authorization room without binding or sending", async () => {
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, "bubpa_shop189", true);
+    await f.armWaiting();
+    f.refresh(60_000, { roomEvidenceIssue: "STALE_ONGOING", liveDeliveryState: "UNKNOWN", deliveryVerified: false, liveSessionId: null });
+    expect(await f.service.status(true, OWNER)).toMatchObject({ canArm: false, blockers: ["LIVE_ROOM_REPORT_STALE"], continuousSession: { waitingForLive: true } });
+    await f.service.tick();
+    f.refresh(60_000, { roomEvidenceIssue: undefined, liveDeliveryState: "LIVE", deliveryVerified: true, liveSessionId: ROOM,
+      liveSessionStartedAt: "2026-11-07T13:50:00.000Z" });
+    expect(await f.service.status(true, OWNER)).toMatchObject({ blockers: ["LIVE_ROOM_PREDATES_AUTO"] });
+    await f.service.tick();
+    expect(f.sessions.bindLiveSession).not.toHaveBeenCalled();
+    expect(f.dispatch).not.toHaveBeenCalled();
+  });
+  it("keeps the same authorized campaign through Bangkok midnight and only uses a new same-day spend pair", async () => {
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, "bubpa_shop189", true);
+    const readRoomContext = vi.fn(async (_campaignId: string, _roomId?: string) => f.readContext());
+    f.adapters.readScheduledLiveContext = readRoomContext;
+    await f.arm();
+    const armed = await f.sessions.getLatest();
+    f.refresh(Date.parse("2026-11-07T16:58:30.000Z") - Date.parse("2026-11-07T14:14:00.000Z"), { spendMinor: ORIGINAL_THRESHOLD });
+    await f.service.tick();
+    f.refresh(75_000, { spendMinor: ORIGINAL_THRESHOLD + 50 }); // 23:59:45; no time for a verified write before rollover.
+    await f.service.tick();
+    f.refresh(60_000, { reportingDate: "2026-11-08", liveDeliveryState: "UNKNOWN", deliveryVerified: false, liveSessionId: null });
+    await f.service.tick();
+    expect(await f.sessions.getLatest()).toMatchObject({ sessionId: armed?.sessionId, status: "ACTIVE", liveSessionId: ROOM });
+    expect(readRoomContext).toHaveBeenCalledWith(CAMPAIGN, ROOM);
+    expect(f.ledger.create).not.toHaveBeenCalled();
+    f.refresh(60_000, { liveDeliveryState: "LIVE", deliveryVerified: true, liveSessionId: ROOM, spendMinor: ORIGINAL_THRESHOLD + 100 });
+    await f.service.tick();
+    expect(f.dispatch).not.toHaveBeenCalled();
+    f.refresh(60_000, { spendMinor: ORIGINAL_THRESHOLD + 500 });
+    await f.service.tick();
+    expect(f.writes).toEqual([780_000]);
+    expect(f.lineOutbox.size).toBe(1);
+  });
   it.each(VERIFIED_ROOM_CREATOR_IDS)("requires the exact room plus a rising spend pair and attestation for %s", async clientId => {
     const f = fixture("live", LIVE_ROOM_SPEND_TREND, clientId);
     f.refresh(0, { providerSpendObservedAt: null, nativeAutoState: "UNKNOWN", liveDeliveryState: "UNKNOWN", deliveryVerified: false, liveSessionId: null });

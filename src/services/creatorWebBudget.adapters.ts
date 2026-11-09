@@ -277,7 +277,7 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
       fingerprint: live.fingerprint, nativeAutoState: live.native, scheduleStartAt: live.scheduleStartAt, scheduleEndAt: live.scheduleEndAt };
   }
 
-  async function context(expectedCampaignId: string, accessToken: string, source?: WebBudgetSource, forceRoom = false) {
+  async function context(expectedCampaignId: string, accessToken: string, source?: WebBudgetSource, forceRoom = false, expectedLiveSessionId?: string) {
     if (forceRoom && (!allowsScheduledCreatorAuto(clientId) || source === "manual")) unverified();
     // The pinned pilot's default reader skips advertiser metadata; a new
     // room-based path explicitly proves the timezone used by the room report.
@@ -295,17 +295,17 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     // Room evidence is separate from the spend read. Do not manufacture a
     // provider spend watermark or equate an enabled campaign with a LIVE.
     const room = forceRoom || (isVerifiedRoomCreator(clientId) && source !== "manual") ? await readRoom({ advertiserId: binding.advertiserId,
-      campaignId: expectedCampaignId, accessToken, reportingDate: raw.reportingDate }) :
+      campaignId: expectedCampaignId, accessToken, reportingDate: raw.reportingDate, expectedLiveSessionId }) :
       { deliveryVerified: false, liveDeliveryState: "UNKNOWN" as const, liveSessionId: null };
     return { campaignId: expectedCampaignId, reportingDate: raw.reportingDate as string, observedAt: raw.observedAt,
       budgetMinor: live.budgetMinor, spendMinor: c.spendMinor, aggregateSpendMinor: quality.aggregateSpendMinor,
       fingerprint: live.fingerprint, nativeAutoState: live.native, providerSpendObservedAt: null, ...room, sample: live };
   }
 
-  async function readScheduledLiveContext(expectedCampaignId: string) {
+  async function readScheduledLiveContext(expectedCampaignId: string, expectedLiveSessionId?: string) {
     if (!allowsScheduledCreatorAuto(clientId) || env.CREATOR_READ_ENABLED !== "true" ||
       typeof expectedCampaignId !== "string" || !ID.test(expectedCampaignId)) unverified();
-    const { sample: _, ...result } = await context(expectedCampaignId, await token(), undefined, true);
+    const { sample: _, ...result } = await context(expectedCampaignId, await token(), undefined, true, expectedLiveSessionId);
     return result;
   }
 

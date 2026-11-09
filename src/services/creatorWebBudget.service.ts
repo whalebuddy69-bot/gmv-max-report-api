@@ -35,6 +35,7 @@ export interface WebBudgetContext extends WebBudgetCampaignEvidence {
   liveDeliveryState?: "LIVE" | "NOT_LIVE" | "UNKNOWN";
   liveSessionId?: string | null;
   liveSessionStartedAt?: string;
+  roomEvidenceIssue?: "STALE_ONGOING";
 }
 export type WebAutoBudgetProof = { previousBudgetMinor: number; targetBudgetMinor: number; rounding?: "floor-satang" };
 export type WebBudgetAuthorization = { nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: typeof LIVE_ROOM_SPEND_TREND }
@@ -52,7 +53,7 @@ export interface WebBudgetAdapters {
   finishLease(operationId: string, outcome: WebBudgetOutcome): Promise<void>;
   readContext(expectedCampaignId: string, source?: WebBudgetSource): Promise<WebBudgetContext>;
   readPreArmContext?(expectedCampaignId: string): Promise<WebBudgetPreArmContext | null>;
-  readScheduledLiveContext?(expectedCampaignId: string): Promise<WebBudgetContext>;
+  readScheduledLiveContext?(expectedCampaignId: string, expectedLiveSessionId?: string): Promise<WebBudgetContext>;
   dispatch(input: WebBudgetDispatch): Promise<{ outcome: WebBudgetOutcome; observedBudgetMinor?: number; observedFingerprint?: string }>;
 }
 export interface WebBudgetProposal {

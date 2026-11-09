@@ -51,6 +51,7 @@ describe("exact Creator LIVE-room evidence", () => {
   it("converts a valid Bangkok launch at day rollover and does not require spend", async () => {
     // Interpreting the previous date 23:58 as UTC would be in the future.
     await expect(setup().read(INPUT)).resolves.toEqual(LIVE);
+    await expect(setup().read({ ...INPUT, expectedLiveSessionId: ROOM })).resolves.toEqual(LIVE);
     await expect(setup(payload([row({ metrics: { live_launched_time: `${DAY} 00:22:00`, cost: "0.00" } })])).read(INPUT))
       .resolves.toEqual({ ...LIVE, liveSessionStartedAt: "2026-11-09T17:22:00.000Z" });
   });
@@ -62,7 +63,26 @@ describe("exact Creator LIVE-room evidence", () => {
     await expect(setup(payload([])).read(INPUT)).resolves.toEqual(UNKNOWN);
   });
 
-  it.each([null, "", "0", "2026-11-09T16:58:15Z", "2026-11-10 00:22:09", "2026-11-09 00:22:07", "2026-02-30 12:00:00",
+  it("only concludes that a bound room ended when today's report explicitly lists that room as END", async () => {
+    const bound = { ...INPUT, expectedLiveSessionId: ROOM };
+    const otherEnded = row({ dimensions: { room_id: OTHER_ROOM }, metrics: { live_status: "END", live_launched_time: "" } });
+    const exactEnded = row({ metrics: { live_status: "END", live_launched_time: "" } });
+    const oldExactEnded = row({ dimensions: { stat_time_day: "2026-11-09" }, metrics: { live_status: "END", live_launched_time: "" } });
+    await expect(setup(payload([otherEnded])).read(bound)).resolves.toEqual(UNKNOWN);
+    await expect(setup(payload([])).read(bound)).resolves.toEqual(UNKNOWN);
+    await expect(setup(payload([otherEnded, exactEnded])).read(bound)).resolves.toEqual(ENDED);
+    await expect(setup(payload([oldExactEnded])).read(bound)).resolves.toEqual(UNKNOWN);
+    const otherLive = row({ dimensions: { room_id: OTHER_ROOM } });
+    await expect(setup(payload([otherLive])).read(bound)).resolves.toEqual({ ...LIVE, liveSessionId: OTHER_ROOM });
+    await expect(setup(payload([row(), otherLive])).read(bound)).resolves.toEqual(UNKNOWN);
+  });
+
+  it("surfaces the stale ongoing report without verifying it as LIVE", async () => {
+    await expect(setup(payload([row({ metrics: { live_launched_time: "2026-11-09 00:22:07" } })])).read(INPUT))
+      .resolves.toEqual({ ...UNKNOWN, roomEvidenceIssue: "STALE_ONGOING" });
+  });
+
+  it.each([null, "", "0", "2026-11-09T16:58:15Z", "2026-11-10 00:22:09", "2026-02-30 12:00:00",
     "2026-11-10 24:00:00", "2026-11-10 00:00:61"])("rejects an invalid, ambiguous, future or stale launch %j", async launch => {
     await expect(setup(payload([row({ metrics: { live_launched_time: launch } })])).read(INPUT)).resolves.toEqual(UNKNOWN);
   });
@@ -89,7 +109,7 @@ describe("exact Creator LIVE-room evidence", () => {
   it("rejects invalid request scope before issuing any GET", async () => {
     const h = setup();
     for (const input of [{ advertiserId: "9123456789012345677" }, { campaignId: "https://evil.invalid" },
-      { accessToken: "invalid token" }, { reportingDate: "2026-11-09" }]) {
+      { accessToken: "invalid token" }, { reportingDate: "2026-11-09" }, { expectedLiveSessionId: "not-a-room-id" }]) {
       await expect(h.read({ ...INPUT, ...input })).resolves.toEqual(UNKNOWN);
     }
     expect(h.fetchImpl).not.toHaveBeenCalled();
