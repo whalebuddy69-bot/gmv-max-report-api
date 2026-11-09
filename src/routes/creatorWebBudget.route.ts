@@ -9,7 +9,7 @@ import { parseAutomationViewerIds } from "./automation.route";
 import type { createCreatorWebCapAdapters } from "../services/creatorWebBudget.adapters";
 import type { createCreatorAutoBudgetService } from "../services/creatorAutoBudget.service";
 import type { createCreatorContinuousAutoBudgetService } from "../services/creatorContinuousAutoBudget.service";
-import { EXTRA_CREATOR_BUDGET_SCOPE_IDS, isExtraCreatorBudgetScope, isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND,
+import { allowsScheduledCreatorAuto, EXTRA_CREATOR_BUDGET_SCOPE_IDS, isExtraCreatorBudgetScope, isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND,
   type ExtraCreatorBudgetScope } from "../services/creatorBudgetScope";
 
 export const CREATOR_WEB_BUDGET_ORIGIN = "https://report.whalebuddy69.com";
@@ -158,7 +158,8 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
       if (!fields(value, [...base, "expectedLiveSessionId", "nativeAutoOff", "noConcurrentChanges", "evidenceMode"]) ||
         value.evidenceMode !== LIVE_ROOM_SPEND_TREND || value.nativeAutoOff !== true || value.noConcurrentChanges !== true ||
         typeof value.expectedCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedCampaignId) ||
-        typeof value.expectedLiveSessionId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedLiveSessionId) ||
+        !(typeof value.expectedLiveSessionId === "string" && WEB_BUDGET_CAMPAIGN_ID.test(value.expectedLiveSessionId) ||
+          value.expectedLiveSessionId === null && allowsScheduledCreatorAuto(firstSegment(req))) ||
         !safeAmount(value.expectedBudgetMinor) || !safeAmount(value.expectedPolicyRevision)) badInput();
       return continuous.arm(id, { expectedCampaignId: value.expectedCampaignId, expectedLiveSessionId: value.expectedLiveSessionId,
         expectedBudgetMinor: value.expectedBudgetMinor, expectedPolicyRevision: value.expectedPolicyRevision,

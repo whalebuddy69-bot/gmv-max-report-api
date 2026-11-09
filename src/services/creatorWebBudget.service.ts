@@ -21,14 +21,20 @@ export interface WebBudgetPolicy {
   capWriteEnabled?: boolean;
   autoLineReady?: boolean;
 }
-export interface WebBudgetContext {
-  campaignId: string; reportingDate: string; observedAt: string;
-  budgetMinor: number; spendMinor: number; aggregateSpendMinor: number; fingerprint: string;
+interface WebBudgetCampaignEvidence {
+  campaignId: string; reportingDate: string; observedAt: string; budgetMinor: number; fingerprint: string;
   nativeAutoState: "DISABLED" | "UNKNOWN" | "ENABLED" | "CONFLICT";
+}
+export interface WebBudgetPreArmContext extends WebBudgetCampaignEvidence {
+  scheduleStartAt: string; scheduleEndAt: string | null;
+}
+export interface WebBudgetContext extends WebBudgetCampaignEvidence {
+  spendMinor: number; aggregateSpendMinor: number;
   providerSpendObservedAt?: string | null;
   deliveryVerified?: boolean;
   liveDeliveryState?: "LIVE" | "NOT_LIVE" | "UNKNOWN";
   liveSessionId?: string | null;
+  liveSessionStartedAt?: string;
 }
 export type WebAutoBudgetProof = { previousBudgetMinor: number; targetBudgetMinor: number; rounding?: "floor-satang" };
 export type WebBudgetAuthorization = { nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: typeof LIVE_ROOM_SPEND_TREND }
@@ -45,6 +51,7 @@ export interface WebBudgetAdapters {
   acquireLease(operationId: string, revision: number, autoBudget?: WebAutoBudgetProof): Promise<WebBudgetPolicy & { operationId: string; expiresAt: string }>;
   finishLease(operationId: string, outcome: WebBudgetOutcome): Promise<void>;
   readContext(expectedCampaignId: string, source?: WebBudgetSource): Promise<WebBudgetContext>;
+  readPreArmContext?(expectedCampaignId: string): Promise<WebBudgetPreArmContext | null>;
   dispatch(input: WebBudgetDispatch): Promise<{ outcome: WebBudgetOutcome; observedBudgetMinor?: number; observedFingerprint?: string }>;
 }
 export interface WebBudgetProposal {

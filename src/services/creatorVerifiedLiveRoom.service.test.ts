@@ -12,7 +12,7 @@ const NOW = "2026-11-09T17:22:08.000Z";
 const INPUT = { advertiserId: ADVERTISER, campaignId: CAMPAIGN, accessToken: TOKEN, reportingDate: DAY };
 const UNKNOWN = { liveDeliveryState: "UNKNOWN", liveSessionId: null, deliveryVerified: false };
 const ENDED = { liveDeliveryState: "NOT_LIVE", liveSessionId: null, deliveryVerified: true };
-const LIVE = { liveDeliveryState: "LIVE", liveSessionId: ROOM, deliveryVerified: true };
+const LIVE = { liveDeliveryState: "LIVE", liveSessionId: ROOM, liveSessionStartedAt: "2026-11-09T16:58:15.000Z", deliveryVerified: true };
 
 function row({ dimensions = {}, metrics = {}, outer = {} }: { dimensions?: Record<string, unknown>; metrics?: Record<string, unknown>;
   outer?: Record<string, unknown> } = {}) {
@@ -52,7 +52,7 @@ describe("exact Creator LIVE-room evidence", () => {
     // Interpreting the previous date 23:58 as UTC would be in the future.
     await expect(setup().read(INPUT)).resolves.toEqual(LIVE);
     await expect(setup(payload([row({ metrics: { live_launched_time: `${DAY} 00:22:00`, cost: "0.00" } })])).read(INPUT))
-      .resolves.toEqual(LIVE);
+      .resolves.toEqual({ ...LIVE, liveSessionStartedAt: "2026-11-09T17:22:00.000Z" });
   });
 
   it("accepts exactly one active room alongside other clearly ended rooms", async () => {

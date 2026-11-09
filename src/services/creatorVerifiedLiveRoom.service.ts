@@ -19,6 +19,7 @@ export type CreatorVerifiedLiveRoom = Readonly<{
   liveDeliveryState: "LIVE" | "NOT_LIVE" | "UNKNOWN";
   liveSessionId: string | null;
   deliveryVerified: boolean;
+  liveSessionStartedAt?: string;
 }>;
 
 const UNKNOWN: CreatorVerifiedLiveRoom = Object.freeze({ liveDeliveryState: "UNKNOWN", liveSessionId: null, deliveryVerified: false });
@@ -67,7 +68,7 @@ function classify(payload: unknown, input: CreatorVerifiedLiveRoomInput, observe
   if (!sameScope(payload.data, input) || !Array.isArray(list) || list.length < 1 || list.length > PAGE_SIZE || !isRecord(page) ||
       page.page !== 1 || page.page_size !== PAGE_SIZE || page.total_page !== 1 || page.total_number !== list.length) return UNKNOWN;
   const seen = new Set<string>();
-  let ongoingRoom: string | null = null;
+  let ongoingRoom: { id: string; launched: number } | null = null;
   for (const row of list) {
     if (!isRecord(row) || !isRecord(row.dimensions) || !isRecord(row.metrics) || !sameScope(row, input) ||
         !sameScope(row.dimensions, input) || !sameScope(row.metrics, input) || !sameDay(row.dimensions.stat_time_day, input.reportingDate)) return UNKNOWN;
@@ -79,9 +80,10 @@ function classify(payload: unknown, input: CreatorVerifiedLiveRoomInput, observe
     if (status !== "ONGOING" || ongoingRoom !== null) return UNKNOWN;
     const launched = bangkokLaunch(row.metrics.live_launched_time);
     if (launched === null || launched > observedAt.getTime() || observedAt.getTime() - launched > MAX_ONGOING_AGE_MS) return UNKNOWN;
-    ongoingRoom = roomId;
+    ongoingRoom = { id: roomId, launched };
   }
-  return ongoingRoom === null ? NOT_LIVE : Object.freeze({ liveDeliveryState: "LIVE", liveSessionId: ongoingRoom, deliveryVerified: true });
+  return ongoingRoom === null ? NOT_LIVE : Object.freeze({ liveDeliveryState: "LIVE", liveSessionId: ongoingRoom.id,
+    liveSessionStartedAt: new Date(ongoingRoom.launched).toISOString(), deliveryVerified: true });
 }
 
 /** Reads exactly one provider room report after the caller verifies the enabled no-Shop Creator campaign and identity. */

@@ -16,7 +16,7 @@ const CONFIRM = { expectedCampaignId: CAMPAIGN, expectedLiveSessionId: ROOM, exp
   expectedPolicyRevision: CAP_REVISION, nativeAutoOff: true, noConcurrentChanges: true } as const;
 const ts = (ms: number) => new Date(ms).toISOString();
 
-function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence = "verified-room", clientId: ContinuousCreatorBudgetScope = "punpan_020") {
+function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence = "verified-room", clientId: ContinuousCreatorBudgetScope = "punpan_020", scheduled = false) {
   let clock = Date.parse("2026-11-07T14:14:00.000Z");
   let session: CreatorContinuousAutoBudgetSession | null = null;
   let context: WebBudgetContext = {
@@ -71,6 +71,8 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
     }),
     adoptBaseline: vi.fn(async (prior, next) => session?.sessionId === prior.sessionId && session.status === "ACTIVE" && !session.operationId
       ? save({ baselineBudgetMinor: next.budgetMinor, baselineFingerprint: next.fingerprint }) : null),
+    bindLiveSession: vi.fn(async (prior, liveSessionId) => session?.sessionId === prior.sessionId && session.status === "ACTIVE" && !session.operationId && session.liveSessionId === null
+      ? save({ liveSessionId }) : null),
     reserve: vi.fn(async (prior, id) => session && session.sessionId === prior.sessionId && session.status === "ACTIVE" && !session.operationId
       ? save({ operationId: id, lastOutcome: null }) : null),
     isReserved: vi.fn(async (prior, id) => isPending(prior, id) && session?.status === "ACTIVE"),
@@ -93,6 +95,9 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
   const adapters: WebBudgetAdapters = {
     readPolicy: vi.fn(async () => policy),
     readContext: vi.fn(async () => context),
+    ...(scheduled ? { readPreArmContext: vi.fn(async () => ({ campaignId: CAMPAIGN, observedAt: context.observedAt, reportingDate: context.reportingDate,
+      budgetMinor: context.budgetMinor, fingerprint: context.fingerprint, nativeAutoState: context.nativeAutoState,
+      scheduleStartAt: "2026-11-07T14:16:00.000Z", scheduleEndAt: null })) } : {}),
     acquireLease: vi.fn(async operationId => ({ ...policy, locked: true, operationId, expiresAt: ts(clock + 60_000) })),
     finishLease: vi.fn(async (operationId, outcome) => { if (outcome === "APPLIED_VERIFIED") lineOutbox.add(operationId); }),
     dispatch,
@@ -106,6 +111,8 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
     ledger, recheckOwner: async (owner, authorizedAt) => owner === OWNER && authorizedAt === session?.authorizedAt,
     legacyBusy, evidenceMode: () => evidence, observeTick: observe, now });
   return { service, sessions, discover, dispatch, ledger, adapters, legacyBusy, writes, lineOutbox, observe, readContext: () => context,
+    armWaiting: () => service.arm(OWNER, { ...CONFIRM, expectedLiveSessionId: null, evidenceMode: LIVE_ROOM_SPEND_TREND }, async () => true),
+    setPolicy: (changes: Partial<WebBudgetPolicy>) => { policy = { ...policy, ...changes }; },
     nextReservedSpend: (spend: number) => { nextReservedSpend = spend; },
     arm: () => service.arm(OWNER, evidence === "spend-trend" ? { expectedCampaignId: CAMPAIGN, expectedBudgetMinor: ORIGINAL_BUDGET,
       expectedPolicyRevision: CAP_REVISION, evidenceMode: evidence } : evidence === LIVE_ROOM_SPEND_TREND ? { ...CONFIRM, evidenceMode: evidence } : CONFIRM, async () => true),
@@ -118,6 +125,42 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
 }
 
 describe("Ppan continuous budget automation", () => {
+  it.each(["ashopbytheta", "bubpa_shop189"] as const)("pre-arms %s without LIVE or spend and writes only after two verified readings from a new room", async client => {
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, client, true);
+    vi.mocked(f.adapters.readContext).mockRejectedValueOnce(new Error("no daily spend report"));
+    expect(await f.service.status(true, OWNER)).toMatchObject({ canArm: true, preview: { waitingForLive: true, liveSessionId: null, spendMinor: null } });
+    await expect(f.armWaiting()).resolves.toMatchObject({ waitingForLive: true });
+    expect((await f.service.status(true, OWNER, "summary")).continuousSession).toMatchObject({ waitingForLive: true, status: "ARMED" });
+    f.refresh(60_000, { liveDeliveryState: "NOT_LIVE", deliveryVerified: true, liveSessionId: null });
+    vi.mocked(f.adapters.readContext).mockRejectedValueOnce(new Error("scheduled future"));
+    await f.service.tick();
+    f.refresh(60_000, { liveDeliveryState: "LIVE", liveSessionId: OTHER_ROOM, liveSessionStartedAt: "2026-11-07T13:10:00.000Z" });
+    await f.service.tick();
+    expect(f.sessions.bindLiveSession).not.toHaveBeenCalled();
+    expect(f.ledger.create).not.toHaveBeenCalled();
+    f.refresh(60_000, { liveSessionId: ROOM, liveSessionStartedAt: "2026-11-07T14:16:30.000Z" });
+    await f.service.tick();
+    expect(f.sessions.bindLiveSession).toHaveBeenCalledTimes(1);
+    expect(f.dispatch).not.toHaveBeenCalled();
+    f.refresh(60_000, { spendMinor: ORIGINAL_THRESHOLD + 500 });
+    await f.service.tick();
+    expect(f.writes).toEqual([780_000]);
+    expect(f.lineOutbox.size).toBe(1);
+  });
+  it("refuses scheduling outside the two scopes or with a low cap; stops a pending round when settings change", async () => {
+    await expect(fixture("live", LIVE_ROOM_SPEND_TREND, "myushop4", true).armWaiting()).rejects.toMatchObject({ code: "AUTO_BUDGET_NOT_READY" });
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, "bubpa_shop189", true);
+    f.refresh(0, { liveDeliveryState: "UNKNOWN", deliveryVerified: false, liveSessionId: null });
+    f.setPolicy({ clientDailyCapMinor: ORIGINAL_BUDGET });
+    expect(await f.service.status(true, OWNER)).toMatchObject({ canArm: false, blockers: ["SCHEDULED_CAP_TOO_LOW"] });
+    await expect(f.armWaiting()).rejects.toMatchObject({ code: "AUTO_BUDGET_NOT_READY" });
+    f.setPolicy({ clientDailyCapMinor: 1_100_000 });
+    await f.armWaiting();
+    f.refresh(60_000, { fingerprint: "c".repeat(64) });
+    await f.service.tick();
+    expect(await f.sessions.getLatest()).toMatchObject({ status: "STOPPED", stopReason: "BASELINE_CHANGED" });
+    expect(f.dispatch).not.toHaveBeenCalled();
+  });
   it.each(VERIFIED_ROOM_CREATOR_IDS)("requires the exact room plus a rising spend pair and attestation for %s", async clientId => {
     const f = fixture("live", LIVE_ROOM_SPEND_TREND, clientId);
     f.refresh(0, { providerSpendObservedAt: null, nativeAutoState: "UNKNOWN", liveDeliveryState: "UNKNOWN", deliveryVerified: false, liveSessionId: null });

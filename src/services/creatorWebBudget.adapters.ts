@@ -2,9 +2,9 @@ import { createHash } from "node:crypto";
 import { bangkokDay, CREATOR_BINDING, createCreatorReader, createExtraCreatorReader, createPpanManualBudgetReader, minor } from "./creatorRead.service";
 import type { AutomationVerifiedCreatorBinding } from "./creatorAutomationRegistry.service";
 import { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode, configuredCreatorSpendTrendLive, creatorBudgetPolicyPath,
-  isExtraCreatorBudgetScope, isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND, type CreatorBudgetScope } from "./creatorBudgetScope";
+  allowsScheduledCreatorAuto, isExtraCreatorBudgetScope, isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND, type CreatorBudgetScope } from "./creatorBudgetScope";
 import { createCreatorVerifiedLiveRoomReader } from "./creatorVerifiedLiveRoom.service";
-import { WEB_BUDGET_MAX_MINOR, WebBudgetError, type WebBudgetAdapters, type WebBudgetSource } from "./creatorWebBudget.service";
+import { WEB_BUDGET_MAX_MINOR, WebBudgetError, type WebBudgetAdapters, type WebBudgetPreArmContext, type WebBudgetSource } from "./creatorWebBudget.service";
 
 const POLICY_ORIGIN = "https://whale-buddy-ads-control-plane.onrender.com/internal/automation";
 const TIKTOK = "https://business-api.tiktok.com/open_api/v1.3";
@@ -16,7 +16,8 @@ const MAX_BODY = 1_048_576;
 
 type Data = Record<string, unknown>;
 type Native = "DISABLED" | "UNKNOWN" | "ENABLED" | "CONFLICT";
-type Sample = { budgetMinor: number; stamp: string; unchanged: string; fingerprint: string; native: Native };
+type Sample = { budgetMinor: number; stamp: string; unchanged: string; fingerprint: string; native: Native;
+  scheduleStartAt: string; scheduleEndAt: string | null };
 type Policy = Awaited<ReturnType<WebBudgetAdapters["readPolicy"]>>;
 
 function unverified(): never { throw new Error("WEB_BUDGET_ADAPTER_UNVERIFIED"); }
@@ -31,6 +32,7 @@ function validIso(x: unknown): x is string {
 function secondsStamp(x: unknown): x is string {
   return typeof x === "string" && DATE_TIME.test(x) && validIso(x.replace(" ", "T") + ".000Z");
 }
+const utcSecondsIso = (stamp: string) => stamp.replace(" ", "T") + ".000Z";
 function fresh(x: unknown, at: number, maxAge: number): x is string {
   return validIso(x) && at >= Date.parse(x) && at - Date.parse(x) <= maxAge;
 }
@@ -178,6 +180,14 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     return value;
   }
 
+  async function getTikTokData(url: URL, accessToken: string) {
+    const r = await fetchImpl(url, { method: "GET", redirect: "error", signal: AbortSignal.timeout(5000),
+      headers: { "Access-Token": accessToken, Accept: "application/json", "Cache-Control": "no-cache" } });
+    const j = await json(r);
+    if (!r.ok || j.code !== 0) unverified();
+    return object(j.data);
+  }
+
   async function providerGet(path: typeof INFO | typeof LIST, campaignId: string, accessToken: string) {
     if (!ID.test(campaignId) || (path !== INFO && path !== LIST)) unverified();
     const url = new URL(TIKTOK + path);
@@ -188,14 +198,25 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
       url.searchParams.set("fields", JSON.stringify(["advertiser_id", "campaign_id", "operation_status", "modify_time"]));
       url.searchParams.set("page", "1"); url.searchParams.set("page_size", "100");
     }
-    const r = await fetchImpl(url, { method: "GET", redirect: "error", signal: AbortSignal.timeout(5000),
-      headers: { "Access-Token": accessToken, Accept: "application/json", "Cache-Control": "no-cache" } });
-    const j = await json(r);
-    if (!r.ok || j.code !== 0) unverified();
-    return object(j.data);
+    return getTikTokData(url, accessToken);
   }
 
-  async function sample(campaignId: string, accessToken: string): Promise<Sample> {
+  async function exactCampaignStamp(campaignId: string, accessToken: string, allowInactive = false): Promise<string | null> {
+    const list = await providerGet(LIST, campaignId, accessToken);
+    const page = object(list.page_info);
+    if (!Array.isArray(list.list) || page.page !== 1 || (allowInactive &&
+      ((list.advertiser_id !== undefined && list.advertiser_id !== binding.advertiserId) ||
+       (page.page_size !== undefined && page.page_size !== 100)))) unverified();
+    if (allowInactive && list.list.length === 0 && page.total_number === 0 && (page.total_page === 0 || page.total_page === 1)) return null;
+    if (list.list.length !== 1 || page.total_page !== 1 || page.total_number !== 1) unverified();
+    const row = object(list.list[0]);
+    if (row.advertiser_id !== binding.advertiserId || row.campaign_id !== campaignId) unverified();
+    if (allowInactive && (row.operation_status === "DISABLE" || row.operation_status === "DELETE")) return null;
+    if (row.operation_status !== "ENABLE" || !secondsStamp(row.modify_time)) unverified();
+    return row.modify_time;
+  }
+
+  async function sample(campaignId: string, accessToken: string, preArmStamp?: string): Promise<Sample> {
     const data = await providerGet(INFO, campaignId, accessToken);
     if (data.advertiser_id !== binding.advertiserId || data.campaign_id !== campaignId ||
       data.shopping_ads_type !== "LIVE" || data.operation_status !== "ENABLE" || data.store_id !== "0" ||
@@ -210,20 +231,43 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
       !noShop(identity.store_id) || !noShop(identity.identity_authorized_shop_id)) unverified();
     const at = now().getTime();
     const start = data.schedule_start_time, end = data.schedule_end_time;
-    if (!["FROM_NOW", "SCHEDULE_FROM_NOW", "START_END", "SCHEDULE_START_END"].includes(String(data.schedule_type)) ||
-      !secondsStamp(start) || Date.parse(start.replace(" ", "T") + "Z") > at ||
-      ((end != null || ["START_END", "SCHEDULE_START_END"].includes(String(data.schedule_type))) &&
-        (!secondsStamp(end) || Date.parse(end.replace(" ", "T") + "Z") <= at))) unverified();
+    const hasFixedEnd = ["START_END", "SCHEDULE_START_END"].includes(String(data.schedule_type));
+    if ((!hasFixedEnd && !["FROM_NOW", "SCHEDULE_FROM_NOW"].includes(String(data.schedule_type))) || !secondsStamp(start) ||
+      ((end != null || hasFixedEnd) && !secondsStamp(end))) unverified();
+    const scheduleStartAt = utcSecondsIso(start), scheduleEndAt = secondsStamp(end) ? utcSecondsIso(end) : null;
+    if ((scheduleEndAt !== null && scheduleEndAt <= scheduleStartAt) || (preArmStamp === undefined &&
+      (Date.parse(scheduleStartAt) > at || (scheduleEndAt !== null && Date.parse(scheduleEndAt) <= at)))) unverified();
+    if (preArmStamp !== undefined && data.modify_time !== undefined && data.modify_time !== preArmStamp) unverified();
     const { budget, modify_time: _, ...untouched } = data;
     const budgetMinor = minor(budget);
     if (!positive(budgetMinor)) unverified();
-    const list = await providerGet(LIST, campaignId, accessToken);
-    const page = object(list.page_info);
-    if (!Array.isArray(list.list) || list.list.length !== 1 || page.page !== 1 || page.total_page !== 1 || page.total_number !== 1) unverified();
-    const row = object(list.list[0]);
-    if (row.advertiser_id !== binding.advertiserId || row.campaign_id !== campaignId || row.operation_status !== "ENABLE" || !secondsStamp(row.modify_time)) unverified();
+    const stamp = preArmStamp ?? await exactCampaignStamp(campaignId, accessToken);
+    if (stamp === null) unverified();
     const native = nativeState(data), unchanged = hash(untouched);
-    return { budgetMinor, stamp: row.modify_time, unchanged, native, fingerprint: hash([budgetMinor, row.modify_time, unchanged]) };
+    return { budgetMinor, stamp, unchanged, native, fingerprint: hash([budgetMinor, stamp, unchanged]), scheduleStartAt, scheduleEndAt };
+  }
+
+  async function readPreArmContext(expectedCampaignId: string): Promise<WebBudgetPreArmContext | null> {
+    if (!extraBinding || !allowsScheduledCreatorAuto(clientId) || env.CREATOR_READ_ENABLED !== "true" ||
+      typeof expectedCampaignId !== "string" || !ID.test(expectedCampaignId)) unverified();
+    const startedAt = now().toISOString(), reportingDate = bangkokDay(new Date(startedAt));
+    const accessToken = await token();
+    const url = new URL(TIKTOK + "/advertiser/info/");
+    url.searchParams.set("advertiser_ids", JSON.stringify([binding.advertiserId]));
+    url.searchParams.set("fields", JSON.stringify(["advertiser_id", "currency", "timezone"]));
+    const metadata = await getTikTokData(url, accessToken);
+    if ((metadata.advertiser_id !== undefined && metadata.advertiser_id !== binding.advertiserId) ||
+      !Array.isArray(metadata.list) || metadata.list.length !== 1) unverified();
+    const advertiser = object(metadata.list[0]);
+    if (advertiser.advertiser_id !== binding.advertiserId || advertiser.currency !== "THB" || advertiser.timezone !== "Asia/Bangkok") unverified();
+    const stamp = await exactCampaignStamp(expectedCampaignId, accessToken, true);
+    const live = stamp === null ? null : await sample(expectedCampaignId, accessToken, stamp);
+    const observed = now();
+    if (!fresh(startedAt, observed.getTime(), 20_000) || bangkokDay(observed) !== reportingDate) unverified();
+    if (!live || (live.scheduleEndAt !== null && Date.parse(live.scheduleEndAt) <= observed.getTime())) return null;
+    if (live.budgetMinor > WEB_BUDGET_MAX_MINOR) unverified();
+    return { campaignId: expectedCampaignId, reportingDate, observedAt: observed.toISOString(), budgetMinor: live.budgetMinor,
+      fingerprint: live.fingerprint, nativeAutoState: live.native, scheduleStartAt: live.scheduleStartAt, scheduleEndAt: live.scheduleEndAt };
   }
 
   async function context(expectedCampaignId: string, accessToken: string, source?: WebBudgetSource) {
@@ -249,6 +293,7 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
 
   return {
     async readPolicy() { return checkedPolicy(await policyRequest(""), now()); },
+    ...(allowsScheduledCreatorAuto(clientId) ? { readPreArmContext } : {}),
     async acquireLease(operationId, revision, autoBudget) {
       if (!UUID.test(operationId) || !positive(revision)) unverified();
       if (autoBudget) {

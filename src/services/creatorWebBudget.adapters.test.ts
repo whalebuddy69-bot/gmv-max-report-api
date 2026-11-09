@@ -19,9 +19,12 @@ const pageInfo = (count: number, page = 1, pages = 1) => ({ page, total_page: pa
 
 function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: boolean; spendTrend?: boolean; sriTrend?: boolean; legacy?: boolean; policyKey?: string;
   providerResult?: "unknown" | "reject" | "roi-drift" | "reject-with-drift"; readAt?: string;
-  extra?: boolean; extraLive?: boolean; extraClient?: "nnshop5719" | "ashopbytheta"; wrongProviderScope?: boolean;
-  targetAbsent?: boolean; integrated?: Record<string, unknown>; daily?: (page: number) => unknown; currency?: string } = {}) {
+  extra?: boolean; extraLive?: boolean; extraClient?: "nnshop5719" | "ashopbytheta" | "myushop4" | "bubpa_shop189"; wrongProviderScope?: boolean;
+  targetAbsent?: boolean; integrated?: Record<string, unknown>; daily?: (page: number) => unknown; currency?: string;
+  campaignInfo?: Record<string, unknown>; campaignList?: Record<string, unknown>; listedStatus?: string; timezone?: string;
+  now?: () => Date } = {}) {
   const calls: { host: string; path: string; method: string }[] = [];
+  const queries: { path: string; query: Record<string, string> }[] = [];
   const extra = options.extraClient ? { ...SRIHIW, clientId: options.extraClient,
     advertiserId: options.extraClient === "nnshop5719" ? "1234567890198768" : "1234567890198769",
     identityId: `synthetic-${options.extraClient}-identity` } : options.extra ? SRIHIW : undefined;
@@ -33,6 +36,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
     const method = init?.method ?? "GET";
     const headers = new Headers(init?.headers);
     calls.push({ host: url.host, path: url.pathname, method });
+    queries.push({ path: url.pathname, query: Object.fromEntries(url.searchParams) });
     expect(init?.redirect).toBe("error");
     if (url.host === "whale-buddy-ads-control-plane.onrender.com") {
       expect(headers.get("x-creator-web-key")).toBe(KEY);
@@ -68,18 +72,19 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
       return Response.json({ code: 0, data: { campaign_id: CAMPAIGN } });
     }
     if (url.pathname.endsWith("/advertiser/info/")) return Response.json({ code: 0, data: { list: [{ advertiser_id: binding.advertiserId,
-      timezone: "Asia/Bangkok", currency: options.currency ?? "THB" }] } });
+      timezone: options.timezone ?? "Asia/Bangkok", currency: options.currency ?? "THB" }] } });
     expect(url.searchParams.get("advertiser_id")).toBe(binding.advertiserId);
     if (url.pathname.endsWith("/gmv_max/campaign/get/")) return Response.json({ code: 0, data: {
       page_info: { page: 1, total_page: 1, total_number: 1 }, list: [{ campaign_id: CAMPAIGN,
-        advertiser_id: options.wrongProviderScope ? CREATOR_BINDING.advertiserId : binding.advertiserId, operation_status: "ENABLE", modify_time: stamp }] } });
+        advertiser_id: options.wrongProviderScope ? CREATOR_BINDING.advertiserId : binding.advertiserId, operation_status: options.listedStatus ?? "ENABLE", modify_time: stamp }],
+      ...options.campaignList } });
     if (url.pathname.endsWith("/campaign/gmv_max/info/")) return Response.json({ code: 0, data: {
       advertiser_id: binding.advertiserId, campaign_id: CAMPAIGN, campaign_name: "Fixture LIVE", shopping_ads_type: "LIVE",
       store_id: "0", store_authorized_bc_id: "0", operation_status: "ENABLE", budget, roas_bid: roi,
       optimization_goal: "VALUE", deep_bid_type: "VO_MIN_ROAS", schedule_type: "SCHEDULE_FROM_NOW",
       schedule_start_time: "2025-03-15 08:30:00", ...(options.nativeUnknown ? {} : { auto_budget_enabled: options.competing === true }),
       promotion_days: { is_enabled: false }, identity_list: [{ identity_id: binding.identityId,
-        identity_type: binding.identityType, identity_authorized_bc_id: binding.identityAuthorizedBcId }] } });
+        identity_type: binding.identityType, identity_authorized_bc_id: binding.identityAuthorizedBcId }], ...options.campaignInfo } });
     if (url.pathname.endsWith("/gmv_max/report/get/")) {
       expect(method).toBe("GET");
       expect(headers.get("Cache-Control")).toBe("no-cache");
@@ -96,7 +101,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
     ];
     return Response.json({ code: 0, data: { page_info: pageInfo(list.length), list, ...options.integrated } });
   }) as typeof fetch;
-  const adapters = createCreatorWebBudgetAdapters({ loadToken: async () => TOKEN, fetchImpl, now: () => new Date(NOW), sleep: async () => {},
+  const adapters = createCreatorWebBudgetAdapters({ loadToken: async () => TOKEN, fetchImpl, now: options.now ?? (() => new Date(NOW)), sleep: async () => {},
     extraBinding: extra,
     env: { CREATOR_READ_ENABLED: "true", CREATOR_WEB_BUDGET_MODE: options.mode ?? "live", CREATOR_WEB_BUDGET_LIVE_ENABLED: "true",
       CREATOR_AUTO_BUDGET_PPAN_SPEND_TREND_LIVE_ENABLED: options.spendTrend ? "true" : "false",
@@ -105,7 +110,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
       ...(options.extraClient ? { [`CREATOR_WEB_${options.extraClient.toUpperCase()}_BUDGET_MODE`]: options.mode ?? "live",
         [`CREATOR_WEB_${options.extraClient.toUpperCase()}_BUDGET_LIVE_ENABLED`]: options.extraLive ? "true" : "false" } : {}),
       CREATOR_BUDGET_TEST_ENABLED: options.legacy ? "true" : "false", CREATOR_WEB_POLICY_BRIDGE_KEY: options.policyKey ?? KEY } });
-  return { adapters, calls, edit(value: number) { budget = value; stamp = "2025-03-15 08:59:30"; }, setSpend(value: string) { spend = value; },
+  return { adapters, calls, queries, edit(value: number) { budget = value; stamp = "2025-03-15 08:59:30"; }, setSpend(value: string) { spend = value; },
     setOtherSpend(value: string) { otherSpend = value; }, setDaily(value: typeof daily) { daily = value; },
     async input(targetBudgetMinor = 310_000, source?: WebBudgetSource) {
       const ctx = await adapters.readContext(CAMPAIGN, source);
@@ -114,6 +119,82 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
         source, nativeAutoOff: true as const, noConcurrentChanges: true as const, canSend: async () => true };
     }, providerPosts() { return calls.filter(c => c.host === "business-api.tiktok.com" && c.method === "POST"); } };
 }
+
+describe("exact read-only scheduled Auto context", () => {
+  it.each(["ashopbytheta", "bubpa_shop189"] as const)("can read an enabled future %s campaign without a spend row, room or write", async extraClient => {
+    const h = harness({ extraClient, targetAbsent: true, nativeUnknown: true, campaignInfo: {
+      schedule_type: "SCHEDULE_START_END", schedule_start_time: "2025-03-15 10:00:00", schedule_end_time: "2025-03-15 12:00:00" } });
+    await expect(h.adapters.readPreArmContext!(CAMPAIGN)).resolves.toEqual({ campaignId: CAMPAIGN,
+      reportingDate: TODAY, observedAt: NOW, budgetMinor: 280_000, fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/), nativeAutoState: "UNKNOWN",
+      scheduleStartAt: "2025-03-15T10:00:00.000Z", scheduleEndAt: "2025-03-15T12:00:00.000Z" });
+    expect(h.calls.map(x => [x.method, x.path])).toEqual([["GET", "/open_api/v1.3/advertiser/info/"],
+      ["GET", "/open_api/v1.3/gmv_max/campaign/get/"], ["GET", "/open_api/v1.3/campaign/gmv_max/info/"]]);
+    expect(h.queries[1].query.filtering).toBe(JSON.stringify({ gmv_max_promotion_types: ["LIVE_GMV_MAX"], campaign_ids: [CAMPAIGN] }));
+    expect(h.queries[2].query.campaign_id).toBe(CAMPAIGN);
+    expect(h.providerPosts()).toHaveLength(0);
+  });
+
+  it("shares the real writer fingerprint and does not relax current spend or schedule checks", async () => {
+    const h = harness({ extraClient: "ashopbytheta" });
+    const armed = await h.adapters.readPreArmContext!(CAMPAIGN), current = await h.adapters.readContext(CAMPAIGN, "manual");
+    expect(armed?.fingerprint).toBe(current.fingerprint);
+    expect(armed?.scheduleEndAt).toBeNull();
+    const future = harness({ extraClient: "bubpa_shop189", campaignInfo: { schedule_start_time: "2025-03-15 11:00:00" } });
+    await expect(future.adapters.readPreArmContext!(CAMPAIGN)).resolves.not.toBeNull();
+    await expect(future.adapters.readContext(CAMPAIGN, "manual")).rejects.toThrow();
+    const noSpend = harness({ extraClient: "ashopbytheta", targetAbsent: true });
+    await expect(noSpend.adapters.readPreArmContext!(CAMPAIGN)).resolves.not.toBeNull();
+    await expect(noSpend.adapters.readContext(CAMPAIGN, "manual")).rejects.toThrow();
+    expect(future.providerPosts()).toHaveLength(0);
+    expect(noSpend.providerPosts()).toHaveLength(0);
+  });
+
+  it.each(["DISABLE", "DELETE"])("returns null for exact, confirmed inactive operation %s", async listedStatus => {
+    const h = harness({ extraClient: "ashopbytheta", listedStatus });
+    await expect(h.adapters.readPreArmContext!(CAMPAIGN)).resolves.toBeNull();
+    expect(h.calls).toHaveLength(2);
+    expect(h.providerPosts()).toHaveLength(0);
+  });
+
+  it("returns null for a complete exact absent campaign or an expired exact schedule", async () => {
+    const absent = harness({ extraClient: "bubpa_shop189", campaignList: { page_info: pageInfo(0, 1, 0), list: [] } });
+    await expect(absent.adapters.readPreArmContext!(CAMPAIGN)).resolves.toBeNull();
+    expect(absent.calls).toHaveLength(2);
+    const expired = harness({ extraClient: "bubpa_shop189", campaignInfo: {
+      schedule_type: "SCHEDULE_START_END", schedule_start_time: "2025-03-15 07:00:00", schedule_end_time: "2025-03-15 09:00:00" } });
+    await expect(expired.adapters.readPreArmContext!(CAMPAIGN)).resolves.toBeNull();
+    expect(expired.calls).toHaveLength(3);
+  });
+
+  it.each([
+    { currency: "USD" }, { timezone: "UTC" }, { wrongProviderScope: true }, { listedStatus: "UNKNOWN" },
+    { campaignList: { page_info: pageInfo(1, 1, 2), list: [] } },
+    { campaignInfo: { identity_list: [] } }, { campaignInfo: { campaign_id: OTHER_CAMPAIGN } },
+    { campaignInfo: { operation_status: "DISABLE" } }, { campaignInfo: { modify_time: "2025-03-15 08:56:00" } },
+    { campaignInfo: { schedule_type: "SCHEDULE_START_END" } },
+    { campaignInfo: { schedule_type: "SCHEDULE_START_END", schedule_end_time: "2025-03-15 08:00:00" } },
+  ])("throws instead of treating uncertain or foreign evidence as absent: %j", async options => {
+    const h = harness({ ...options, extraClient: "ashopbytheta" });
+    await expect(h.adapters.readPreArmContext!(CAMPAIGN)).rejects.toThrow("WEB_BUDGET_ADAPTER_UNVERIFIED");
+    expect(h.providerPosts()).toHaveLength(0);
+  });
+
+  it("is not exposed in Ppan, Srihiw, nnshop or Myu scopes", () => {
+    for (const h of [harness(), harness({ extra: true }), harness({ extraClient: "nnshop5719" }), harness({ extraClient: "myushop4" })]) {
+      expect(h.adapters.readPreArmContext).toBeUndefined();
+      expect(h.calls).toHaveLength(0);
+    }
+  });
+
+  it("rejects stale or day-crossing samples instead of returning evidence from a previous reporting day", async () => {
+    for (const [before, after] of [[NOW, "2025-03-15T09:00:21.000Z"], ["2025-03-15T16:59:59.000Z", "2025-03-15T17:00:00.000Z"]]) {
+      let nowCalls = 0;
+      const h = harness({ extraClient: "ashopbytheta", now: () => new Date(++nowCalls < 3 ? before : after) });
+      await expect(h.adapters.readPreArmContext!(CAMPAIGN)).rejects.toThrow("WEB_BUDGET_ADAPTER_UNVERIFIED");
+      expect(h.providerPosts()).toHaveLength(0);
+    }
+  });
+});
 
 describe("Ppan manual-only verified zero spend", () => {
   it("keeps the integrated account total when the complete GMV day has an explicit zero for each omitted row", async () => {

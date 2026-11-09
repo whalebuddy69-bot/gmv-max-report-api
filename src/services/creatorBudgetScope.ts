@@ -14,6 +14,10 @@ export function isVerifiedRoomCreator(id: unknown): id is VerifiedRoomCreator {
   return typeof id === "string" && (VERIFIED_ROOM_CREATOR_IDS as readonly string[]).includes(id);
 }
 
+export function allowsScheduledCreatorAuto(id: unknown): id is "ashopbytheta" | "bubpa_shop189" {
+  return id === "ashopbytheta" || id === "bubpa_shop189";
+}
+
 export function isLegacyAutoBudgetScope(id: unknown): id is LegacyAutoBudgetScope {
   return id === "punpan_020" || id === "srihiw" || id === "nnshop5719" || id === "ashopbytheta";
 }
