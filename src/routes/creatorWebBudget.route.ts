@@ -54,7 +54,8 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
   router.use((req, res, next) => {
     res.set("Cache-Control", "no-store").vary("Authorization").vary("Origin");
     const query = req.originalUrl.indexOf("?");
-    if (query >= 0 && !(req.method === "GET" && AUTO_STATUS_PATHS.includes(req.path) && req.originalUrl.slice(query) === "?view=summary")) {
+    if (query >= 0 && !(req.method === "GET" && AUTO_STATUS_PATHS.includes(req.path) &&
+      ["?view=summary", "?view=detect-live"].includes(req.originalUrl.slice(query)))) {
       res.status(400).json({ error: { code: "BUDGET_FIXED_SCOPE", message: "ไม่รองรับ query สำหรับคำสั่งงบ" } }); return;
     }
     if (req.method === "POST" && req.header("origin") !== CREATOR_WEB_BUDGET_ORIGIN) {
@@ -146,7 +147,11 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
   router.get(AUTO_STATUS_PATHS, get, handle(async (req, id) => {
     const selected = firstSegment(req);
     const legacyInUse = selected === "nnshop5719" && await configuredExtra(selected)?.activeLegacy?.();
-    const auto = legacyInUse ? autoFor(req) : continuousFor(req) ?? autoFor(req);
+    const continuous = legacyInUse ? undefined : continuousFor(req);
+    if (req.query.view === "detect-live") {
+      return continuous ? continuous.status(canOperate(id), id, "detect-live") : autoFor(req).status(canOperate(id), id);
+    }
+    const auto = continuous ?? autoFor(req);
     return req.originalUrl.includes("?") ? auto.status(canOperate(id), id, "summary") : auto.status(canOperate(id), id);
   }));
   router.post(scopedPaths("/auto/arm"), onlyOperator, onlyJson, json, handle((req, id) => {
@@ -156,9 +161,12 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
     if (isVerifiedRoomCreator(firstSegment(req)) && !continuous) {
       throw new WebBudgetError("AUTO_BUDGET_NOT_CONFIGURED", 404, "ยังไม่ได้ตั้งค่า Auto สำหรับ Creator นี้");
     }
+    const roomFields = [...base, "expectedLiveSessionId", "nativeAutoOff", "noConcurrentChanges", "evidenceMode"];
+    const newDetection = fields(value, [...roomFields, "autoDetectLive"]) && value.autoDetectLive === true;
+    const roomInput = fields(value, roomFields) || newDetection;
     if (continuous && (isVerifiedRoomCreator(firstSegment(req)) || firstSegment(req) === "nnshop5719" ||
-      fields(value, [...base, "expectedLiveSessionId", "nativeAutoOff", "noConcurrentChanges", "evidenceMode"]) && value.evidenceMode === LIVE_ROOM_SPEND_TREND)) {
-      if (!fields(value, [...base, "expectedLiveSessionId", "nativeAutoOff", "noConcurrentChanges", "evidenceMode"]) ||
+      roomInput && value.evidenceMode === LIVE_ROOM_SPEND_TREND)) {
+      if (!roomInput ||
         value.evidenceMode !== LIVE_ROOM_SPEND_TREND || value.nativeAutoOff !== true || value.noConcurrentChanges !== true ||
         typeof value.expectedCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedCampaignId) ||
         !(typeof value.expectedLiveSessionId === "string" && WEB_BUDGET_CAMPAIGN_ID.test(value.expectedLiveSessionId) ||
@@ -166,7 +174,8 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
         !safeAmount(value.expectedBudgetMinor) || !safeAmount(value.expectedPolicyRevision)) badInput();
       return continuous.arm(id, { expectedCampaignId: value.expectedCampaignId, expectedLiveSessionId: value.expectedLiveSessionId,
         expectedBudgetMinor: value.expectedBudgetMinor, expectedPolicyRevision: value.expectedPolicyRevision,
-        evidenceMode: LIVE_ROOM_SPEND_TREND, nativeAutoOff: true, noConcurrentChanges: true }, () => recheck(req, id));
+        evidenceMode: LIVE_ROOM_SPEND_TREND, nativeAutoOff: true, noConcurrentChanges: true,
+        ...(newDetection ? { autoDetectLive: true as const } : {}) }, () => recheck(req, id));
     }
     if (continuous && !isVerifiedRoomCreator(firstSegment(req)) && fields(value, [...base, "evidenceMode"]) && value.evidenceMode === "spend-trend") {
       if (typeof value.expectedCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedCampaignId)

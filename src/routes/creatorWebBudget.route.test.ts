@@ -146,6 +146,24 @@ describe("Automation web budget HTTP boundary", () => {
     expect(h.continuous.arm).toHaveBeenCalledWith(27, payload, expect.any(Function));
   });
 
+  it("passes explicit auto-detect consent only for an attested scoped hybrid Auto arm", async () => {
+    const h = await start({ withContinuous: true, withVerifiedContinuous: true });
+    const payload = { expectedCampaignId: PREPARE.expectedCampaignId, expectedBudgetMinor: PREPARE.expectedBudgetMinor,
+      expectedPolicyRevision: 2, expectedLiveSessionId: null, nativeAutoOff: true, noConcurrentChanges: true,
+      evidenceMode: "verified-room-spend-trend", autoDetectLive: true };
+    expect((await h.post("/bubpa_shop189/auto/arm", JSON.stringify(payload))).status).toBe(200);
+    expect(h.bubpaRoom.arm).toHaveBeenCalledWith(27, payload, expect.any(Function));
+    expect((await h.post("/bubpa_shop189/auto/arm", JSON.stringify({ ...payload, autoDetectLive: false }))).status).toBe(400);
+    expect((await h.post("/bubpa_shop189/auto/arm", JSON.stringify({ ...payload, nativeAutoOff: false }))).status).toBe(400);
+    expect((await h.post("/auto/arm", JSON.stringify({ expectedCampaignId: PREPARE.expectedCampaignId,
+      expectedBudgetMinor: PREPARE.expectedBudgetMinor, expectedPolicyRevision: 2, evidenceMode: "spend-trend", autoDetectLive: true }))).status).toBe(400);
+    expect(h.bubpaRoom.arm).toHaveBeenCalledTimes(1);
+    expect((await fetch(h.base + "/bubpa_shop189/auto/status?view=detect-live", { headers: HEADERS })).status).toBe(200);
+    expect(h.bubpaRoom.status).toHaveBeenCalledWith(true, 27, "detect-live");
+    expect((await fetch(h.base + "/bubpa_shop189/auto/status", { headers: HEADERS })).status).toBe(200);
+    expect(h.bubpaRoom.status).toHaveBeenLastCalledWith(true, 27);
+  });
+
   it("keeps Srihiw continuous arm isolated and Ppan diagnostics limited to operators", async () => {
     const h = await start({ withContinuous: true, withSrihiwContinuous: true });
     const payload = { expectedCampaignId: PREPARE.expectedCampaignId, expectedBudgetMinor: PREPARE.expectedBudgetMinor,

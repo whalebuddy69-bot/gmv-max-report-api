@@ -147,6 +147,42 @@ describe("Ppan continuous Auto session", () => {
     expect(await nn.bindLiveSession(n, ROOM)).toMatchObject({ status: "ACTIVE", liveSessionId: ROOM });
   }, 30_000);
 
+  it("keeps old waiting authorities non-opted-in after migration and rejects a forged flag at bind", async () => {
+    const h = setup(), table = "creator_ashop_cauto_auto_budget_sessions";
+    const sessions = createCreatorContinuousAutoBudgetStore(h.database, "ashopbytheta");
+    await sessions.ensureSchema();
+    const draft = arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, liveSessionId: null });
+    const old = (await sessions.arm(draft))!;
+    await h.db.exec(`ALTER TABLE ${table} DROP CONSTRAINT creator_ashop_cauto_session_auto_detect_v5, DROP COLUMN auto_detect_live`);
+    await sessions.ensureSchema(); await sessions.ensureSchema();
+    expect(await sessions.getActive()).toEqual(old);
+    expect((await h.db.query(`SELECT auto_detect_live FROM ${table} WHERE session_id=$1`, [old.sessionId])).rows)
+      .toEqual([{ auto_detect_live: false }]);
+    expect(await sessions.bindLiveSession({ ...old, autoDetectLive: true }, ROOM)).toBeNull();
+    expect(await sessions.bindLiveSession(old, ROOM)).toEqual({ ...old, liveSessionId: ROOM });
+  });
+
+  it("persists only explicit hybrid auto-detect authority for all six scopes, including exact current-room arms", async () => {
+    const h = setup();
+    for (const id of ["punpan_020", "srihiw", "nnshop5719", ...VERIFIED_ROOM_CREATOR_IDS] as const) {
+      const sessions = createCreatorContinuousAutoBudgetStore(h.database, id);
+      await sessions.ensureSchema(); await sessions.ensureSchema();
+      expect(await sessions.arm(arm({ autoDetectLive: true }))).toBeNull();
+      expect(await sessions.arm(trendArm({ autoDetectLive: true }))).toBeNull();
+      const draft = arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, liveSessionId: null, autoDetectLive: true });
+      expect(await sessions.arm({ ...draft, nativeAutoOffAttested: false })).toBeNull();
+      expect(await sessions.arm({ ...draft, noConcurrentChangesAttested: false })).toBeNull();
+      const optedIn = (await sessions.arm(draft))!;
+      expect(optedIn).toMatchObject({ ...draft, clientId: id, status: "ACTIVE" });
+      const { autoDetectLive: _dropped, ...missingAuthority } = optedIn;
+      expect(await sessions.bindLiveSession(missingAuthority, ROOM)).toBeNull();
+      expect(await sessions.bindLiveSession(optedIn, ROOM)).toEqual({ ...optedIn, liveSessionId: ROOM });
+      expect(await sessions.stop(optedIn.ownerId, optedIn.sessionId)).toMatchObject({ status: "STOPPED", autoDetectLive: true });
+      expect(await sessions.arm(arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true })))
+        .toMatchObject({ liveSessionId: ROOM, autoDetectLive: true, status: "ACTIVE" });
+    }
+  }, 30_000);
+
   it("migrates Ppan and Srihiw in place, keeping each legacy pending send and requiring a room for new hybrid attempts", async () => {
     const h = setup();
     for (const id of ["punpan_020", "srihiw"] as const) {
@@ -173,7 +209,10 @@ describe("Ppan continuous Auto session", () => {
       await sessions.ensureSchema(); await sessions.ensureSchema();
       const pending = (await sessions.getActive())!;
       expect(pending).toMatchObject({ ...old, status: "ACTIVE", operationId: pendingId });
-      expect((await h.db.query(`SELECT * FROM ${table}`)).rows).toEqual([before]);
+      expect((await h.db.query(`SELECT * FROM ${table}`)).rows).toEqual([{ ...before, auto_detect_live: false }]);
+      expect(pending.autoDetectLive).toBeUndefined();
+      await expect(h.db.query(`UPDATE ${table} SET auto_detect_live=true WHERE session_id=$1`, [old.sessionId]))
+        .rejects.toMatchObject({ code: "23514" });
       expect((await h.db.query(`SELECT operation_id,live_session_id,evidence_mode,retry_released FROM ${attempts}`)).rows)
         .toEqual([{ operation_id: pendingId, live_session_id: old.liveSessionId, evidence_mode: old.evidenceMode, retry_released: false }]);
       if (id === "punpan_020") await expect(h.db.query(`UPDATE ${table} SET live_session_id=NULL WHERE session_id=$1`, [old.sessionId]))

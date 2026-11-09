@@ -27,7 +27,8 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
   extra?: boolean; extraLive?: boolean; extraClient?: "nnshop5719" | "ashopbytheta" | "myushop4" | "bubpa_shop189"; wrongProviderScope?: boolean;
   targetAbsent?: boolean; integrated?: Record<string, unknown>; daily?: (page: number) => unknown; currency?: string;
   campaignInfo?: Record<string, unknown>; campaignList?: Record<string, unknown>; listedStatus?: string; timezone?: string;
-  scheduledLive?: boolean; room?: "ONGOING" | "END"; now?: () => Date } = {}) {
+  scheduledLive?: boolean; room?: "ONGOING" | "END"; detectRoom?: boolean; roomCost?: string | null;
+  identityLive?: "ongoing" | "ended" | "missing"; now?: () => Date } = {}) {
   const calls: { host: string; path: string; method: string }[] = [];
   const queries: { path: string; query: Record<string, string> }[] = [];
   const extra = options.extraClient ? { ...SRIHIW, clientId: options.extraClient,
@@ -82,6 +83,14 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
     if (url.pathname.endsWith("/advertiser/info/")) return Response.json({ code: 0, data: { list: [{ advertiser_id: binding.advertiserId,
       timezone: options.timezone ?? "Asia/Bangkok", currency: options.currency ?? "THB" }] } });
     expect(url.searchParams.get("advertiser_id")).toBe(binding.advertiserId);
+    if (url.pathname.endsWith("/identity/live/get/")) {
+      expect(method).toBe("GET");
+      expect(options.detectRoom).toBe(true);
+      expect(Object.fromEntries(url.searchParams)).toEqual({ advertiser_id: binding.advertiserId, identity_id: binding.identityId,
+        identity_type: binding.identityType, identity_authorized_bc_id: binding.identityAuthorizedBcId, cursor: "0" });
+      return Response.json({ code: 0, data: { live_list: options.identityLive === "missing" ? [] : [{ live_id: ROOM,
+        finish_timestamp: options.identityLive === "ended" ? `${TODAY} 09:00:00` : "1970-01-01 00:00:00" }] } });
+    }
     if (url.pathname.endsWith("/gmv_max/campaign/get/")) return Response.json({ code: 0, data: {
       page_info: { page: 1, total_page: 1, total_number: 1 }, list: [{ campaign_id: CAMPAIGN,
         advertiser_id: options.wrongProviderScope ? CREATOR_BINDING.advertiserId : binding.advertiserId, operation_status: options.listedStatus ?? "ENABLE", modify_time: stamp }],
@@ -102,7 +111,8 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
       if (url.searchParams.get("dimensions") === '["room_id","stat_time_day"]') {
         expect(url.searchParams.get("filtering")).toBe(JSON.stringify({ campaign_ids: [CAMPAIGN] }));
         const list = options.room ? [{ dimensions: { room_id: ROOM, stat_time_day: `${TODAY} 00:00:00` },
-          metrics: { live_status: options.room, live_launched_time: `${TODAY} 15:55:00`, live_duration: "", cost: "0.00" } }] : [];
+          metrics: { live_status: options.room, live_launched_time: `${TODAY} ${options.detectRoom ? "08:55:00" : "15:55:00"}`,
+            live_duration: "", cost: options.detectRoom ? options.roomCost : "0.00" } }] : [];
         return Response.json({ code: 0, data: { list, page_info: { ...pageInfo(list.length, 1, list.length ? 1 : 0), page_size: 20 } } });
       }
       expect(url.searchParams.get("filtering")).toBe('{"gmv_max_promotion_types":["LIVE"],"campaign_statuses":["STATUS_ALL"]}');
@@ -245,6 +255,48 @@ describe("verified room dispatch boundary", () => {
       expect(h.calls.filter(x => x.path.endsWith("/gmv_max/report/get/"))).toHaveLength(0);
       expect(h.providerPosts()).toHaveLength(1);
     }
+  });
+});
+
+describe("independent auto-detected room and strict budget contexts", () => {
+  it.each(SCHEDULED_SCOPES)("can bind %s from corroborated current room without the campaign spend report or room cost", async (_scope, options) => {
+    const h = harness({ ...options, targetAbsent: true, room: "ONGOING", detectRoom: true });
+    const detected = await h.adapters.readAutoDetectContext!(CAMPAIGN);
+    expect(detected).toMatchObject({ campaignId: CAMPAIGN, liveDeliveryState: "LIVE", liveSessionId: ROOM, deliveryVerified: true,
+      liveSessionStartedAt: "2025-03-15T08:55:00.000Z" });
+    expect(detected).not.toHaveProperty("roomSpendMinor");
+    expect(h.calls.filter(x => x.path.endsWith("/report/integrated/get/"))).toHaveLength(0);
+    expect(h.calls.filter(x => x.path.endsWith("/identity/live/get/"))).toHaveLength(1);
+    await expect(h.adapters.readScheduledLiveContext!(CAMPAIGN, ROOM, true)).rejects.toThrow("WEB_BUDGET_ADAPTER_UNVERIFIED");
+    expect(h.providerPosts()).toHaveLength(0);
+  });
+
+  it("will not bind an ongoing room to a campaign whose schedule has not started", async () => {
+    const h = harness({ room: "ONGOING", detectRoom: true, campaignInfo: { schedule_start_time: "2025-03-15 10:00:00" } });
+    const stat = await h.adapters.readAutoDetectContext!(CAMPAIGN);
+    expect(stat).toMatchObject({ campaignId: CAMPAIGN, scheduleStartAt: "2025-03-15T10:00:00.000Z" });
+    expect(stat).not.toHaveProperty("liveSessionId");
+    expect(h.calls).toHaveLength(3);
+  });
+
+  it("feeds fresh exact room cost and real campaign spend into the strict context", async () => {
+    const h = harness({ room: "ONGOING", detectRoom: true, roomCost: "21.35" });
+    await expect(h.adapters.readScheduledLiveContext!(CAMPAIGN, ROOM, true)).resolves.toMatchObject({
+      liveDeliveryState: "LIVE", liveSessionId: ROOM, roomSpendMinor: 2135, spendMinor: 210009 });
+    await expect(h.adapters.readScheduledLiveContext!(CAMPAIGN, OTHER_CAMPAIGN, true)).resolves.toMatchObject({ liveDeliveryState: "UNKNOWN" });
+    expect(h.providerPosts()).toHaveLength(0);
+  });
+
+  it.each(["ready", "missing-cost", "ended-identity"] as const)("rechecks both sources and room cost on new hybrid dispatch: %s", async scenario => {
+    const h = harness({ scheduledLive: true, room: "ONGOING", detectRoom: true,
+      ...(scenario !== "missing-cost" ? { roomCost: "25.20" } : {}), ...(scenario === "ended-identity" ? { identityLive: "ended" as const } : {}) });
+    const input = await h.input(336_000, "auto");
+    const ready = scenario === "ready";
+    const result = await h.adapters.dispatch({ ...input, evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true,
+      canSend: async x => { if (ready) expect(x).toMatchObject({ roomSpendMinor: 2520, liveSessionId: ROOM }); return true; } });
+    expect(result.outcome).toBe(ready ? "APPLIED_VERIFIED" : "NOT_SENT");
+    expect(h.providerPosts()).toHaveLength(ready ? 1 : 0);
+    expect(h.calls.filter(x => x.path.endsWith("/identity/live/get/"))).toHaveLength(1);
   });
 });
 

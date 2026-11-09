@@ -17,7 +17,7 @@ const CONFIRM = { expectedCampaignId: CAMPAIGN, expectedLiveSessionId: ROOM, exp
   expectedPolicyRevision: CAP_REVISION, nativeAutoOff: true, noConcurrentChanges: true } as const;
 const ts = (ms: number) => new Date(ms).toISOString();
 
-function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence = "verified-room", clientId: ContinuousCreatorBudgetScope = "punpan_020", scheduled = false) {
+function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence = "verified-room", clientId: ContinuousCreatorBudgetScope = "punpan_020", scheduled = false, autoDetect = false) {
   let clock = Date.parse("2026-11-07T14:14:00.000Z");
   let session: CreatorContinuousAutoBudgetSession | null = null;
   let context: WebBudgetContext = {
@@ -93,12 +93,16 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
     context = { ...context, budgetMinor: input.targetBudgetMinor, fingerprint };
     return { outcome: "APPLIED_VERIFIED", observedBudgetMinor: context.budgetMinor, observedFingerprint: fingerprint };
   });
+  const preArmContext = () => ({ campaignId: CAMPAIGN, observedAt: context.observedAt, reportingDate: context.reportingDate,
+    budgetMinor: context.budgetMinor, fingerprint: context.fingerprint, nativeAutoState: context.nativeAutoState,
+    scheduleStartAt: "2026-11-07T14:16:00.000Z", scheduleEndAt: null });
   const adapters: WebBudgetAdapters = {
     readPolicy: vi.fn(async () => policy),
     readContext: vi.fn(async () => context),
-    ...(scheduled ? { readPreArmContext: vi.fn(async () => ({ campaignId: CAMPAIGN, observedAt: context.observedAt, reportingDate: context.reportingDate,
-      budgetMinor: context.budgetMinor, fingerprint: context.fingerprint, nativeAutoState: context.nativeAutoState,
-      scheduleStartAt: "2026-11-07T14:16:00.000Z", scheduleEndAt: null })) } : {}),
+    ...(scheduled ? { readPreArmContext: vi.fn(async () => preArmContext()) } : {}),
+    ...(autoDetect ? { readAutoDetectContext: vi.fn(async () => ({ ...preArmContext(), deliveryVerified: context.deliveryVerified,
+      liveDeliveryState: context.liveDeliveryState, liveSessionId: context.liveSessionId, liveSessionStartedAt: context.liveSessionStartedAt })),
+      readScheduledLiveContext: vi.fn(async () => context) } : {}),
     acquireLease: vi.fn(async operationId => ({ ...policy, locked: true, operationId, expiresAt: ts(clock + 60_000) })),
     finishLease: vi.fn(async (operationId, outcome) => { if (outcome === "APPLIED_VERIFIED") lineOutbox.add(operationId); }),
     dispatch,
@@ -113,6 +117,8 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
     legacyBusy, evidenceMode: () => evidence, ...(scheduled ? { scheduledLive: () => mode === "live" } : {}), observeTick: observe, now });
   return { service, sessions, discover, dispatch, ledger, adapters, legacyBusy, writes, lineOutbox, observe, readContext: () => context,
     armWaiting: () => service.arm(OWNER, { ...CONFIRM, expectedLiveSessionId: null, evidenceMode: LIVE_ROOM_SPEND_TREND }, async () => true),
+    armDetecting: (room: string | null) => service.arm(OWNER, { ...CONFIRM, expectedLiveSessionId: room,
+      evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true }, async () => true),
     setPolicy: (changes: Partial<WebBudgetPolicy>) => { policy = { ...policy, ...changes }; },
     nextReservedSpend: (spend: number) => { nextReservedSpend = spend; },
     arm: () => service.arm(OWNER, evidence === "spend-trend" ? { expectedCampaignId: CAMPAIGN, expectedBudgetMinor: ORIGINAL_BUDGET,
@@ -126,6 +132,41 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
 }
 
 describe("Ppan continuous budget automation", () => {
+  it.each(["punpan_020", "srihiw", "nnshop5719", "ashopbytheta", "myushop4", "bubpa_shop189"] as const)(
+    "can explicitly link %s's existing LIVE even before the spend row arrives", async client => {
+      const f = fixture("live", client === "punpan_020" || client === "srihiw" ? "spend-trend" : LIVE_ROOM_SPEND_TREND, client, true, true);
+      f.refresh(0, { liveSessionStartedAt: "2026-11-07T13:00:00.000Z" });
+      vi.mocked(f.adapters.readScheduledLiveContext!).mockRejectedValueOnce(new Error("daily spend missing"));
+      expect(await f.service.status(true, OWNER, "detect-live")).toMatchObject({ canArm: true, blockers: [], preview: { status: "LIVE_WAITING_FOR_SPEND",
+        autoDetectLive: true, liveSessionId: ROOM, liveSessionStartedAt: "2026-11-07T13:00:00.000Z", spendMinor: null } });
+      await expect(f.armDetecting(OTHER_ROOM)).rejects.toMatchObject({ code: "AUTO_BUDGET_NOT_READY" });
+      await f.armDetecting(ROOM);
+      expect(await f.sessions.getLatest()).toMatchObject({ liveSessionId: ROOM, autoDetectLive: true });
+      expect(f.ledger.create).not.toHaveBeenCalled();
+    });
+
+  it("polls an empty campaign, binds a verified ongoing room, and needs same-day growth of both room and campaign spend", async () => {
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, "bubpa_shop189", true, true);
+    f.refresh(0, { liveDeliveryState: "UNKNOWN", deliveryVerified: false, liveSessionId: null });
+    expect(await f.service.status(true, OWNER, "detect-live")).toMatchObject({ canArm: true, preview: { status: "WAITING_FOR_LIVE", autoDetectLive: true } });
+    await f.armDetecting(null);
+    f.refresh(60_000); await f.service.tick();
+    expect(f.sessions.bindLiveSession).not.toHaveBeenCalled();
+    f.refresh(60_000, { liveDeliveryState: "LIVE", deliveryVerified: true, liveSessionId: ROOM, liveSessionStartedAt: "2026-11-07T13:00:00.000Z" });
+    await f.service.tick();
+    expect(f.sessions.bindLiveSession).toHaveBeenCalledTimes(1);
+    expect(f.ledger.create).not.toHaveBeenCalled();
+    f.refresh(60_000, { spendMinor: ORIGINAL_THRESHOLD + 100, roomSpendMinor: 300_000 }); await f.service.tick();
+    f.refresh(60_000, { spendMinor: ORIGINAL_THRESHOLD + 200 }); await f.service.tick();
+    expect(f.dispatch).not.toHaveBeenCalled();
+    f.refresh(60_000, { spendMinor: ORIGINAL_THRESHOLD + 400, roomSpendMinor: 300_500 }); await f.service.tick();
+    expect(f.writes).toEqual([780_000]);
+    expect(f.dispatch).toHaveBeenCalledWith(expect.objectContaining({ autoDetectLive: true }));
+    expect(f.lineOutbox.size).toBe(1);
+    f.refresh(60_000, { liveSessionId: OTHER_ROOM }); await f.service.tick();
+    expect(await f.sessions.getLatest()).toMatchObject({ status: "STOPPED", liveSessionId: ROOM });
+    expect(f.sessions.bindLiveSession).toHaveBeenCalledTimes(1);
+  });
   it("allows explicit NN scheduling without enabling other Creators or legacy Auto, and still requires verified manual scope", () => {
     const env = { CREATOR_READ_ENABLED: "true", CREATOR_WEB_BUDGET_LIVE_ENABLED: "true", CREATOR_AUTO_BUDGET_NNSHOP5719_MODE: "shadow",
       CREATOR_AUTO_BUDGET_NNSHOP5719_SCHEDULED_LIVE_ENABLED: "true", CREATOR_WEB_NNSHOP5719_BUDGET_MODE: "live" };

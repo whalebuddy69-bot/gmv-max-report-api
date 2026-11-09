@@ -24,6 +24,7 @@ export interface CreatorContinuousAutoBudgetArmInput {
   baselineFingerprint: string;
   nativeAutoOffAttested: boolean;
   noConcurrentChangesAttested: boolean;
+  autoDetectLive?: true;
 }
 export interface CreatorContinuousAutoBudgetSession extends CreatorContinuousAutoBudgetArmInput {
   clientId: CreatorContinuousAutoBudgetClient;
@@ -294,6 +295,36 @@ BEGIN
 END
 $creator_continuous_mixed_evidence$;`;
 
+// Presence records new, explicit authority. Old rooms, waiting rounds and
+// legacy spend-trend evidence keep the non-opted-in meaning of their rows.
+const CREATOR_CONTINUOUS_AUTO_DETECT_SCHEMA_SQL = `
+DO $creator_continuous_auto_detect$
+DECLARE
+  sessions constant regclass := 'creator_continuous_auto_budget_sessions'::regclass;
+  expected_guard constant text := '((NOT auto_detect_live) OR ((evidence_mode = ''${LIVE_ROOM_SPEND_TREND}''::text) AND native_auto_off_attested AND no_concurrent_changes_attested))';
+  current_guard text;
+  column_present boolean;
+  valid_column boolean;
+BEGIN
+  FOR pass IN 1..2 LOOP
+    SELECT true, a.atttypid='boolean'::regtype AND a.attnotnull AND pg_get_expr(d.adbin,d.adrelid)='false'
+      INTO column_present,valid_column
+      FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+      WHERE a.attrelid=sessions AND a.attname='auto_detect_live' AND NOT a.attisdropped;
+    SELECT pg_get_expr(conbin,conrelid) INTO current_guard FROM pg_constraint WHERE conrelid=sessions
+      AND conname='creator_continuous_session_auto_detect_v5' AND convalidated AND contype='c';
+    IF valid_column AND current_guard=expected_guard THEN RETURN; END IF;
+    IF pass=1 THEN LOCK TABLE creator_continuous_auto_budget_sessions IN ACCESS EXCLUSIVE MODE; END IF;
+  END LOOP;
+  IF column_present OR current_guard IS NOT NULL THEN RAISE EXCEPTION 'Unrecognized Creator automatic LIVE authority'; END IF;
+  ALTER TABLE creator_continuous_auto_budget_sessions
+    ADD COLUMN auto_detect_live boolean NOT NULL DEFAULT false,
+    ADD CONSTRAINT creator_continuous_session_auto_detect_v5 CHECK (
+      NOT auto_detect_live OR (evidence_mode='${LIVE_ROOM_SPEND_TREND}' AND native_auto_off_attested AND no_concurrent_changes_attested)
+    );
+END
+$creator_continuous_auto_detect$;`;
+
 type Runner = ReturnType<CreatorWebBudgetDatabase["createQueryRunner"]>;
 function rows(value: unknown): Record<string, unknown>[] {
   if (!Array.isArray(value)) throw new Error("CREATOR_CONTINUOUS_AUTO_STORE_SHAPE");
@@ -317,6 +348,7 @@ function validArm(value: CreatorContinuousAutoBudgetArmInput | null | undefined,
   return !!value && identifier(value.sessionId, WEB_BUDGET_OPERATION_ID) && positive(value.ownerId) &&
     identifier(value.campaignId, WEB_BUDGET_CAMPAIGN_ID) && positive(value.policyRevision) &&
     positive(value.baselineBudgetMinor, WEB_BUDGET_MAX_MINOR) && identifier(value.baselineFingerprint, FINGERPRINT) &&
+    (value.autoDetectLive === undefined || (value.autoDetectLive === true && value.evidenceMode === LIVE_ROOM_SPEND_TREND && allowsScheduledCreatorAuto(clientId))) &&
     (value.evidenceMode === "spend-trend"
       ? value.liveSessionId === null && value.nativeAutoOffAttested === false && value.noConcurrentChangesAttested === false
       : (value.evidenceMode === undefined || value.evidenceMode === "verified-room" || value.evidenceMode === LIVE_ROOM_SPEND_TREND) &&
@@ -348,10 +380,11 @@ function map(row: Record<string, unknown>, clientId: CreatorContinuousAutoBudget
   const { status, last_outcome: lastOutcome, operation_id: operationId, stop_reason: stopReason } = row;
   const value = { clientId: row.client_id, sessionId: row.session_id, ownerId: integerFromDb(row.owner_id),
     campaignId: row.campaign_id, liveSessionId: row.live_session_id, evidenceMode: row.evidence_mode, policyRevision: integerFromDb(row.policy_revision),
+    ...(row.auto_detect_live === true ? { autoDetectLive: true as const } : {}),
     baselineBudgetMinor: integerFromDb(row.baseline_budget_minor),
     baselineFingerprint: row.baseline_fingerprint, nativeAutoOffAttested: row.native_auto_off_attested,
     noConcurrentChangesAttested: row.no_concurrent_changes_attested, authorizedAt, status, operationId, lastOutcome, lastVerifiedAt, stopReason };
-  if (row.evidence_mode === undefined || !validScopedSession(value as CreatorContinuousAutoBudgetSession, clientId) ||
+  if (row.evidence_mode === undefined || typeof row.auto_detect_live !== "boolean" || !validScopedSession(value as CreatorContinuousAutoBudgetSession, clientId) ||
     (status !== "ACTIVE" && status !== "BLOCKED" && status !== "STOPPED") ||
     (operationId !== null && !identifier(operationId, WEB_BUDGET_OPERATION_ID)) ||
     (lastOutcome !== null && lastOutcome !== "APPLIED_VERIFIED" && lastOutcome !== "NOT_SENT" && lastOutcome !== "OUTCOME_UNKNOWN") ||
@@ -424,6 +457,7 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
       await runner.query(CREATOR_CONTINUOUS_SAFE_RETRY_SCHEMA_SQL);
       if (roomOnly) await runner.query(CREATOR_VERIFIED_ROOM_ONLY_SCHEMA_SQL);
       if (allowsScheduledCreatorAuto(clientId)) await runner.query(roomOnly ? CREATOR_CONTINUOUS_AWAITING_LIVE_SCHEMA_SQL : CREATOR_CONTINUOUS_MIXED_EVIDENCE_SCHEMA_SQL);
+      await runner.query(CREATOR_CONTINUOUS_AUTO_DETECT_SCHEMA_SQL);
     }); },
     async getActive() {
       // Includes stopped sessions whose already reserved operation still needs reconciliation.
@@ -438,14 +472,14 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
       if (!validArm(input, clientId) || !supportsContinuousEvidence(clientId, input.evidenceMode ?? "verified-room")) return null;
       return run(async runner => one(await runner.query(`INSERT INTO ${SESSION}
         (session_id,client_id,owner_id,campaign_id,policy_revision,baseline_budget_minor,baseline_fingerprint,live_session_id,
-         authorized_at,native_auto_off_attested,no_concurrent_changes_attested,evidence_mode)
-        SELECT $1::uuid,'punpan_020',$2,$3,$4,$5,$6,$7,date_trunc('milliseconds',clock_timestamp()),$8,$9,$10
+         authorized_at,native_auto_off_attested,no_concurrent_changes_attested,evidence_mode,auto_detect_live)
+        SELECT $1::uuid,'punpan_020',$2,$3,$4,$5,$6,$7,date_trunc('milliseconds',clock_timestamp()),$8,$9,$10,$11
         WHERE NOT EXISTS (SELECT 1 FROM creator_continuous_auto_budget_attempts
           WHERE client_id='punpan_020' AND campaign_id=$3 AND baseline_fingerprint=$6 AND (NOT retry_released OR $10<>'spend-trend'))
         ON CONFLICT DO NOTHING RETURNING *`,
       [input.sessionId, input.ownerId, input.campaignId, input.policyRevision, input.baselineBudgetMinor,
         input.baselineFingerprint, input.liveSessionId, input.nativeAutoOffAttested, input.noConcurrentChangesAttested,
-        input.evidenceMode ?? "verified-room"])));
+        input.evidenceMode ?? "verified-room", input.autoDetectLive === true])));
     },
     async bindLiveSession(session: CreatorContinuousAutoBudgetSession, liveSessionId: string) {
       if (!allowsScheduledCreatorAuto(clientId) || !validSession(session) || !awaitingLive(session) || session.status !== "ACTIVE" ||
@@ -456,8 +490,8 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
         SET live_session_id=$8,updated_at=clock_timestamp()
         WHERE ${EXACT_BASE} AND s.evidence_mode='${LIVE_ROOM_SPEND_TREND}' AND s.status='ACTIVE'
           AND s.live_session_id IS NULL AND s.operation_id IS NULL AND s.last_outcome IS NULL AND s.last_verified_at IS NULL
-          AND s.native_auto_off_attested AND s.no_concurrent_changes_attested
-        RETURNING s.*`, [...args(session).slice(0, 7), liveSessionId])));
+          AND s.native_auto_off_attested AND s.no_concurrent_changes_attested AND s.auto_detect_live=$9::boolean
+        RETURNING s.*`, [...args(session).slice(0, 7), liveSessionId, session.autoDetectLive === true])));
     },
     async adoptBaseline(session: CreatorContinuousAutoBudgetSession, next: { budgetMinor: number; fingerprint: string; policyRevision: number }) {
       if (!validSession(session) || session.evidenceMode !== "spend-trend" || session.status !== "ACTIVE" ||

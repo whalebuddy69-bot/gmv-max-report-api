@@ -28,18 +28,21 @@ interface WebBudgetCampaignEvidence {
 export interface WebBudgetPreArmContext extends WebBudgetCampaignEvidence {
   scheduleStartAt: string; scheduleEndAt: string | null;
 }
-export interface WebBudgetContext extends WebBudgetCampaignEvidence {
-  spendMinor: number; aggregateSpendMinor: number;
-  providerSpendObservedAt?: string | null;
+export interface WebBudgetRoomEvidence {
   deliveryVerified?: boolean;
   liveDeliveryState?: "LIVE" | "NOT_LIVE" | "UNKNOWN";
   liveSessionId?: string | null;
   liveSessionStartedAt?: string;
+  roomSpendMinor?: number;
   roomEvidenceIssue?: "STALE_ONGOING";
 }
+export interface WebBudgetContext extends WebBudgetCampaignEvidence, WebBudgetRoomEvidence {
+  spendMinor: number; aggregateSpendMinor: number;
+  providerSpendObservedAt?: string | null;
+}
 export type WebAutoBudgetProof = { previousBudgetMinor: number; targetBudgetMinor: number; rounding?: "floor-satang" };
-export type WebBudgetAuthorization = { nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: typeof LIVE_ROOM_SPEND_TREND }
-  | { evidenceMode: "spend-trend"; nativeAutoOff?: never; noConcurrentChanges?: never };
+export type WebBudgetAuthorization = { nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: typeof LIVE_ROOM_SPEND_TREND; autoDetectLive?: true }
+  | { evidenceMode: "spend-trend"; nativeAutoOff?: never; noConcurrentChanges?: never; autoDetectLive?: never };
 export type WebBudgetDispatch = WebBudgetAuthorization & {
   campaignId: string; reportingDate: string; expectedBudgetMinor: number; targetBudgetMinor: number;
   campaignCapMinor: number; clientDailyCapMinor: number;
@@ -53,7 +56,8 @@ export interface WebBudgetAdapters {
   finishLease(operationId: string, outcome: WebBudgetOutcome): Promise<void>;
   readContext(expectedCampaignId: string, source?: WebBudgetSource): Promise<WebBudgetContext>;
   readPreArmContext?(expectedCampaignId: string): Promise<WebBudgetPreArmContext | null>;
-  readScheduledLiveContext?(expectedCampaignId: string, expectedLiveSessionId?: string): Promise<WebBudgetContext>;
+  readScheduledLiveContext?(expectedCampaignId: string, expectedLiveSessionId?: string, autoDetectLive?: true): Promise<WebBudgetContext>;
+  readAutoDetectContext?(expectedCampaignId: string, expectedLiveSessionId?: string): Promise<(WebBudgetPreArmContext & WebBudgetRoomEvidence) | null>;
   dispatch(input: WebBudgetDispatch): Promise<{ outcome: WebBudgetOutcome; observedBudgetMinor?: number; observedFingerprint?: string }>;
 }
 export interface WebBudgetProposal {
@@ -139,9 +143,9 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
   store: WebBudgetStore; adapters: WebBudgetAdapters; mode: () => WebBudgetMode; clientId?: CreatorBudgetScope; now?: () => Date;
 }) {
   async function getPolicy() { return checkPolicy(await adapters.readPolicy(), now().getTime()); }
-  async function validatedInputs(campaignId: string, current: number, target: number, source: WebBudgetSource, roomTrend = false) {
+  async function validatedInputs(campaignId: string, current: number, target: number, source: WebBudgetSource, roomTrend = false, autoDetectLive?: true) {
     const readContext = roomTrend && adapters.readScheduledLiveContext
-      ? adapters.readScheduledLiveContext(campaignId) : adapters.readContext(campaignId, source);
+      ? adapters.readScheduledLiveContext(campaignId, undefined, autoDetectLive) : adapters.readContext(campaignId, source);
     const [rawCap, rawContext] = await Promise.all([adapters.readPolicy(), readContext.catch(error => {
       if (source === "manual" && !(error instanceof WebBudgetError)) {
         reject("BUDGET_CONTEXT_UNVERIFIED", 409, "ยังยืนยันงบและยอดใช้ล่าสุดไม่ครบ กรุณาลองใหม่");
@@ -198,6 +202,9 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
       }
       const useTrend = input.evidenceMode === "spend-trend";
       const useRoomTrend = input.evidenceMode === LIVE_ROOM_SPEND_TREND;
+      if (input.autoDetectLive !== undefined && (!useRoomTrend || input.autoDetectLive !== true || !adapters.readAutoDetectContext || !adapters.readScheduledLiveContext)) {
+        reject("BUDGET_ATTESTATION_REQUIRED", 400, "ต้องยืนยันห้อง LIVE ที่ตรงกับแคมเปญ");
+      }
       if (useTrend ? ((clientId !== WEB_BUDGET_CLIENT_ID && clientId !== "srihiw") || initial.source !== "auto" || !autoGuard ||
         (clientId === WEB_BUDGET_CLIENT_ID ? autoRounding !== "floor-satang" : autoRounding !== undefined) ||
         input.nativeAutoOff !== undefined || input.noConcurrentChanges !== undefined)
@@ -223,7 +230,7 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
       try {
         const source = reserved.source ?? "manual";
         if (source !== (initial.source ?? "manual")) reject("BUDGET_PRECONDITION_CHANGED", 409, "รายการเปลี่ยน กรุณาเปิดรายการใหม่");
-        const { cap, context } = await validatedInputs(reserved.campaignId, reserved.currentBudgetMinor, reserved.targetBudgetMinor, source, useRoomTrend);
+        const { cap, context } = await validatedInputs(reserved.campaignId, reserved.currentBudgetMinor, reserved.targetBudgetMinor, source, useRoomTrend, input.autoDetectLive);
         if (!sameCap(reserved.cap, cap) || context.reportingDate !== reserved.reportingDate || context.fingerprint !== reserved.fingerprint) {
           reject("BUDGET_PRECONDITION_CHANGED", 409, "งบหรือเพดานเปลี่ยน กรุณาเปิดรายการใหม่");
         }
@@ -253,7 +260,7 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
             expectedBudgetMinor: reserved.currentBudgetMinor, targetBudgetMinor: reserved.targetBudgetMinor, fingerprint: reserved.fingerprint,
             campaignCapMinor: lease.campaignCapMinor, clientDailyCapMinor: lease.clientDailyCapMinor, source,
             notAfter: new Date(deadline).toISOString(), ...(useTrend ? { evidenceMode: "spend-trend" as const }
-              : { ...(useRoomTrend ? { evidenceMode: LIVE_ROOM_SPEND_TREND } : {}), nativeAutoOff: true as const, noConcurrentChanges: true as const }),
+              : { ...(useRoomTrend ? { evidenceMode: LIVE_ROOM_SPEND_TREND } : {}), ...(input.autoDetectLive === true ? { autoDetectLive: true as const } : {}), nativeAutoOff: true as const, noConcurrentChanges: true as const }),
             canSend: async latest => mode() === "live" && await recheckOperator() &&
               (!autoGuard || (nativeReady(latest) && await autoGuard(latest, cap))) && mode() === "live" });
           const readbackProof = typeof sent?.observedFingerprint === "string" && FINGERPRINT.test(sent.observedFingerprint) &&

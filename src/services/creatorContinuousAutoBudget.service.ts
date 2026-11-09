@@ -6,14 +6,14 @@ import type { AutoBudgetOverviewState } from "./creatorAutoBudget.service";
 import type { CreatorContinuousAutoBudgetClient, createCreatorContinuousAutoBudgetStore } from "./creatorContinuousAutoBudget.store";
 import type { PpanAutoTickObservation, PpanAutoTickReason } from "./ppanAutoObservability.store";
 import { WEB_BUDGET_CAMPAIGN_ID, WEB_BUDGET_MAX_MINOR, WebBudgetError,
-  type createCreatorWebBudgetService, type WebBudgetAdapters, type WebBudgetContext, type WebBudgetPolicy, type WebBudgetPreArmContext, type WebBudgetStore } from "./creatorWebBudget.service";
+  type createCreatorWebBudgetService, type WebBudgetAdapters, type WebBudgetContext, type WebBudgetPolicy, type WebBudgetPreArmContext, type WebBudgetRoomEvidence, type WebBudgetStore } from "./creatorWebBudget.service";
 
 type Sessions = ReturnType<typeof createCreatorContinuousAutoBudgetStore>;
 type Session = NonNullable<Awaited<ReturnType<Sessions["getLatest"]>>>;
 type EvidenceMode = ContinuousEvidence;
 type ArmInput = { expectedCampaignId: string; expectedBudgetMinor: number; expectedPolicyRevision: number } & (
-  { expectedLiveSessionId: string | null; nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: typeof LIVE_ROOM_SPEND_TREND } |
-  { evidenceMode: "spend-trend"; expectedLiveSessionId?: never; nativeAutoOff?: never; noConcurrentChanges?: never });
+  { expectedLiveSessionId: string | null; nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: typeof LIVE_ROOM_SPEND_TREND; autoDetectLive?: true } |
+  { evidenceMode: "spend-trend"; expectedLiveSessionId?: never; nativeAutoOff?: never; noConcurrentChanges?: never; autoDetectLive?: never });
 type Mode = "disabled" | "shadow" | "live";
 const unavailable = () => new WebBudgetError("AUTO_BUDGET_NOT_READY", 409, "ข้อมูลสำหรับเปิด Auto ยังไม่ครบ จึงยังไม่ส่งคำสั่งจริง");
 const CLIENT = "punpan_020" as const;
@@ -26,7 +26,7 @@ function freshContext(ctx: Pick<WebBudgetContext, "observedAt" | "reportingDate"
   const readAt = instant(ctx.observedAt), age = at.getTime() - readAt;
   return age >= 0 && age <= 30_000 && ctx.reportingDate === bangkokDay(at) && bangkokDay(new Date(readAt)) === ctx.reportingDate;
 }
-function hasRoom(ctx: WebBudgetContext): ctx is WebBudgetContext & { liveSessionId: string } {
+function hasRoom<T extends WebBudgetRoomEvidence>(ctx: T): ctx is T & { liveSessionId: string } {
   return ctx.liveDeliveryState === "LIVE" && ctx.deliveryVerified === true && typeof ctx.liveSessionId === "string" && WEB_BUDGET_CAMPAIGN_ID.test(ctx.liveSessionId);
 }
 function spendReady(ctx: WebBudgetContext, at: Date, after?: string | null) {
@@ -34,7 +34,11 @@ function spendReady(ctx: WebBudgetContext, at: Date, after?: string | null) {
   return age >= 0 && age <= 5 * 60_000 && watermark <= instant(ctx.observedAt) &&
     bangkokDay(new Date(watermark)) === ctx.reportingDate && (!after || watermark > instant(after));
 }
-const verifiedEnded = (ctx: WebBudgetContext) => ctx.deliveryVerified === true && ctx.liveDeliveryState === "NOT_LIVE";
+const verifiedEnded = (ctx: WebBudgetRoomEvidence) => ctx.deliveryVerified === true && ctx.liveDeliveryState === "NOT_LIVE";
+function verifiedDetectedRoom<T extends WebBudgetRoomEvidence>(ctx: T, at: Date): ctx is T & { liveSessionId: string; liveSessionStartedAt: string } {
+  const launch = instant(ctx.liveSessionStartedAt);
+  return hasRoom(ctx) && Number.isFinite(launch) && launch <= at.getTime();
+}
 function predatesWaitingAuthorization(ctx: WebBudgetContext, row: Session) {
   const launch = instant(ctx.liveSessionStartedAt), arm = instant(row.authorizedAt);
   return hasRoom(ctx) && Number.isFinite(launch) && Number.isFinite(arm) && launch < arm - 60_000;
@@ -100,26 +104,33 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
   const allowedEvidence = (evidence: EvidenceMode) => (mode() === "live" && evidenceMode() === evidence) ||
     (evidence === LIVE_ROOM_SPEND_TREND && canWaitForLive());
   const waiting = (row: Session | null | undefined) => row?.status === "ACTIVE" && !row.operationId && row.liveSessionId === null && row.evidenceMode === LIVE_ROOM_SPEND_TREND;
+  const canAutoDetect = () => canWaitForLive() && !!adapters.readAutoDetectContext && !!adapters.readScheduledLiveContext;
   const preview = (ctx: WebBudgetContext, policy: WebBudgetPolicy, at: Date, evidence: EvidenceMode) =>
     previewCreatorAutoBudget({ now: at, context: ctx, policy, rounding: roundingFor(evidence) });
   // Deliberately process-local. A restart or incomplete read requires a fresh
   // pair of minute polls; an old qualifying sample never survives a restart.
-  let pulse: { key: string; at: number; spend: number } | undefined;
+  let pulse: { key: string; at: number; spend: number; roomSpend?: number } | undefined;
   function observeTrend(row: Session, ctx: WebBudgetContext) {
     const timestamp = instant(ctx.observedAt), anchor = Math.max(instant(row.authorizedAt), row.lastVerifiedAt ? instant(row.lastVerifiedAt) : 0);
-    if (!Number.isFinite(anchor) || timestamp <= anchor || !Number.isSafeInteger(ctx.spendMinor) || ctx.spendMinor < 0) {
+    const roomSpend = row.autoDetectLive ? ctx.roomSpendMinor : undefined;
+    if (!Number.isFinite(anchor) || timestamp <= anchor || !Number.isSafeInteger(ctx.spendMinor) || ctx.spendMinor < 0 ||
+      (row.autoDetectLive && (typeof roomSpend !== "number" || !Number.isSafeInteger(roomSpend) || roomSpend < 0))) {
       pulse = undefined;
       return null;
     }
-    const key = `${row.sessionId}:${ctx.reportingDate}:${ctx.fingerprint}:${anchor}:${row.evidenceMode === LIVE_ROOM_SPEND_TREND ? ctx.liveSessionId : ""}`;
+    const key = `${row.sessionId}:${ctx.reportingDate}:${ctx.fingerprint}:${anchor}:${row.evidenceMode === LIVE_ROOM_SPEND_TREND ? ctx.liveSessionId : ""}:${row.autoDetectLive ? ctx.liveSessionStartedAt : ""}`;
     const previous = pulse, gap = previous ? timestamp - previous.at : NaN;
-    if (previous?.key === key && gap >= 0 && gap < 40_000 && ctx.spendMinor >= previous.spend) return null;
-    pulse = { key, at: timestamp, spend: ctx.spendMinor };
-    return previous?.key === key && gap >= 40_000 && gap <= 95_000 && ctx.spendMinor > previous.spend ? previous.spend : null;
+    if (previous?.key === key && gap >= 0 && gap < 40_000 && ctx.spendMinor >= previous.spend &&
+      (!row.autoDetectLive || (roomSpend ?? -1) >= (previous.roomSpend ?? Infinity))) return null;
+    pulse = { key, at: timestamp, spend: ctx.spendMinor, roomSpend };
+    return previous?.key === key && gap >= 40_000 && gap <= 95_000 && ctx.spendMinor > previous.spend &&
+      (!row.autoDetectLive || (roomSpend ?? -1) > (previous.roomSpend ?? Infinity)) ? previous : null;
   }
-  async function read(campaignId: string, evidence: EvidenceMode, expectedLiveSessionId?: string) {
+  async function read(campaignId: string, evidence: EvidenceMode, expectedLiveSessionId?: string, autoDetectLive?: true) {
+    if (autoDetectLive && !adapters.readScheduledLiveContext) throw unavailable();
     const readContext = evidence === LIVE_ROOM_SPEND_TREND && adapters.readScheduledLiveContext
-      ? adapters.readScheduledLiveContext(campaignId, expectedLiveSessionId) : adapters.readContext(campaignId);
+      ? autoDetectLive ? adapters.readScheduledLiveContext(campaignId, expectedLiveSessionId, true)
+        : adapters.readScheduledLiveContext(campaignId, expectedLiveSessionId) : adapters.readContext(campaignId);
     const [context, policy, fenced] = await Promise.all([readContext, adapters.readPolicy(), ledger.hasFence()]);
     return { context, policy, fenced };
   }
@@ -127,8 +138,13 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     const [context, policy, fenced] = await Promise.all([adapters.readPreArmContext!(campaignId), adapters.readPolicy(), ledger.hasFence()]);
     return { context, policy, fenced };
   }
+  async function readDetected(campaignId: string, expectedLiveSessionId?: string) {
+    if (!adapters.readAutoDetectContext) throw unavailable();
+    const [context, policy, fenced] = await Promise.all([adapters.readAutoDetectContext(campaignId, expectedLiveSessionId), adapters.readPolicy(), ledger.hasFence()]);
+    return { context, policy, fenced };
+  }
 
-  async function status(operator: boolean, ownerId?: number, view?: "summary") {
+  async function status(operator: boolean, ownerId?: number, view?: "summary" | "detect-live") {
     const currentMode = canWaitForLive() ? "live" : mode();
     const readOwnerState = operator && (view !== "summary" || (typeof ownerId === "number" && Number.isSafeInteger(ownerId) && ownerId > 0));
     const state = readOwnerState ? await sessions.getLatest().then(row => ({ row, ok: true })).catch(() => ({ row: null, ok: false })) : { row: null, ok: false };
@@ -138,7 +154,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     const ownStatus = own?.status === "ACTIVE" ? (own.operationId ? "SENDING" : "ARMED") : own?.status;
     const continuousSession = own && ownStatus ? { sessionId: own.sessionId, status: ownStatus,
       startedAt: own.authorizedAt, reason: own.stopReason ?? (own.lastOutcome === "OUTCOME_UNKNOWN" ? own.lastOutcome : null),
-      ...(waiting(own) ? { waitingForLive: true as const } : {}) } : null;
+      ...(waiting(own) ? { waitingForLive: true as const } : {}), ...(own.autoDetectLive ? { autoDetectLive: true as const } : {}) } : null;
     const base = { clientId, strategy: "continuous" as const, mode: currentMode, grant: null, continuousSession,
       ...(evidence !== "verified-room" ? { evidenceMode: evidence } : {}),
       canStop: !!own && own.status !== "STOPPED" };
@@ -157,6 +173,36 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       const campaign = await discover();
       if (!campaign) return { ...base, canArm: false, preview: null, blockers: ["CAMPAIGN_NOT_VISIBLE"] };
       const canRequest = currentMode === "live" && operator && state.ok && (!row || (row.status === "STOPPED" && !row.operationId));
+      if (view === "detect-live" && canAutoDetect() && (canRequest || (own?.status === "ACTIVE" && (own.autoDetectLive || waiting(own))))) {
+        const boundRoom = own?.status === "ACTIVE" ? own.liveSessionId ?? undefined : undefined;
+        const exact = await read(campaign, LIVE_ROOM_SPEND_TREND, boundRoom, true).catch(() => null);
+        const at = now();
+        const expected = (ctx: WebBudgetRoomEvidence) => !boundRoom || boundRoom === ctx.liveSessionId;
+        if (exact && freshContext(exact.context, at) && verifiedDetectedRoom(exact.context, at) && expected(exact.context)) {
+          const { context, policy, fenced } = exact;
+          const verdict = preview(context, policy, at, LIVE_ROOM_SPEND_TREND);
+          const reasons = blockers(context, policy, fenced, at, LIVE_ROOM_SPEND_TREND);
+          if (boundRoom && verdict.status === "WOULD_INCREASE" && !reasons.length) reasons.push("SPEND_TREND_PENDING");
+          return { ...base, evidenceMode: LIVE_ROOM_SPEND_TREND,
+            canArm: canRequest && canStart(context, policy, fenced, at, LIVE_ROOM_SPEND_TREND) && !await legacyBusy(), blockers: reasons,
+            preview: { status: verdict.status, autoDetectLive: true as const, campaignId: campaign, currentBudgetMinor: context.budgetMinor,
+              liveSessionId: context.liveSessionId, liveSessionStartedAt: context.liveSessionStartedAt, spendMinor: context.spendMinor, policyRevision: policy.revision,
+              thresholdMinor: Number((BigInt(context.budgetMinor) * 8n + 9n) / 10n), targetBudgetMinor: verdict.status === "WOULD_INCREASE" ? verdict.targetBudgetMinor : null,
+              projectedClientSpendMinor: verdict.status === "WOULD_INCREASE" ? verdict.projectedClientSpendMinor : null, observedAt: context.observedAt } };
+        }
+        const { context, policy, fenced } = await readDetected(campaign, boundRoom), checkedAt = now();
+        if (!context || !validScheduledContext(context, campaign, checkedAt)) return { ...base, canArm: false, preview: null, blockers: ["CONTEXT_UNAVAILABLE"] };
+        const reasons = scheduledBlockers(context, policy, fenced, checkedAt);
+        const matched = verifiedDetectedRoom(context, checkedAt) && expected(context) ? context : null;
+        if (!matched && boundRoom) reasons.push("LIVE_DELIVERY_UNVERIFIED");
+        if (!matched && context.roomEvidenceIssue === "STALE_ONGOING" && !canRequest) reasons.push("LIVE_ROOM_REPORT_STALE");
+        return { ...base, evidenceMode: LIVE_ROOM_SPEND_TREND, canArm: canRequest && !reasons.length && !await legacyBusy(), blockers: reasons,
+          preview: { ...(matched ? { status: "LIVE_WAITING_FOR_SPEND", liveSessionId: matched.liveSessionId, liveSessionStartedAt: matched.liveSessionStartedAt }
+            : { status: "WAITING_FOR_LIVE", waitingForLive: true as const, liveSessionId: null }),
+            autoDetectLive: true as const, campaignId: campaign, currentBudgetMinor: context.budgetMinor, spendMinor: null,
+            policyRevision: policy.revision, thresholdMinor: Number((BigInt(context.budgetMinor) * 8n + 9n) / 10n), targetBudgetMinor: null,
+            projectedClientSpendMinor: null, observedAt: context.observedAt } };
+      }
       const canReadScheduled = canWaitForLive() && (canRequest || waiting(own));
       // When offering the new authorization, do not equate historical spend with
       // a current room. Existing spend-trend rounds keep their original reads.
@@ -196,15 +242,21 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
   async function arm(ownerId: number, input: ArmInput, recheckOperator: () => Promise<boolean>) {
     const evidence = input.evidenceMode === LIVE_ROOM_SPEND_TREND ? LIVE_ROOM_SPEND_TREND : evidenceMode();
     const trend = input.evidenceMode === "spend-trend";
+    const autoDetectLive = input.autoDetectLive === true;
     const wait = input.expectedLiveSessionId === null && evidence === LIVE_ROOM_SPEND_TREND && canWaitForLive();
     if (!allowedEvidence(evidence) || !supportsContinuousEvidence(clientId, evidence) || !WEB_BUDGET_CAMPAIGN_ID.test(input.expectedCampaignId) ||
+      (input.autoDetectLive !== undefined && (!autoDetectLive || evidence !== LIVE_ROOM_SPEND_TREND || !canAutoDetect())) ||
       input.evidenceMode !== (evidence === "verified-room" ? undefined : evidence) ||
       (trend ? input.expectedLiveSessionId !== undefined || input.nativeAutoOff !== undefined || input.noConcurrentChanges !== undefined
         : (!wait && (typeof input.expectedLiveSessionId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(input.expectedLiveSessionId))) ||
           input.nativeAutoOff !== true || input.noConcurrentChanges !== true) || await legacyBusy()) throw unavailable();
     const campaignId = await discover();
     if (!campaignId || campaignId !== input.expectedCampaignId) throw unavailable();
-    const ready = wait ? await readScheduled(campaignId).then(({ context, policy, fenced }) => {
+    const ready = autoDetectLive ? await readDetected(campaignId, input.expectedLiveSessionId ?? undefined).then(({ context, policy, fenced }) => {
+      const at = now();
+      return context && validScheduledContext(context, campaignId, at) && !scheduledBlockers(context, policy, fenced, at).length &&
+        (wait || verifiedDetectedRoom(context, at) && context.liveSessionId === input.expectedLiveSessionId) ? { context, policy } : null;
+    }) : wait ? await readScheduled(campaignId).then(({ context, policy, fenced }) => {
       const at = now();
       return context && validScheduledContext(context, campaignId, at) && !scheduledBlockers(context, policy, fenced, at).length ? { context, policy } : null;
     }) : await read(campaignId, evidence).then(({ context, policy, fenced }) =>
@@ -217,7 +269,8 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       policyRevision: policy.revision, baselineBudgetMinor: context.budgetMinor, baselineFingerprint: context.fingerprint,
       ...(trend ? { evidenceMode: "spend-trend" as const, liveSessionId: null, nativeAutoOffAttested: false as const, noConcurrentChangesAttested: false as const }
         : { ...(evidence === LIVE_ROOM_SPEND_TREND ? { evidenceMode: evidence } : {}), liveSessionId: input.expectedLiveSessionId,
-          nativeAutoOffAttested: true as const, noConcurrentChangesAttested: true as const }) });
+          nativeAutoOffAttested: true as const, noConcurrentChangesAttested: true as const,
+          ...(autoDetectLive ? { autoDetectLive: true as const } : {}) }) });
     if (!row) throw new WebBudgetError("AUTO_BUDGET_SESSION_EXISTS", 409, "มีรอบ Auto หรือรายการที่ยังต้องตรวจสอบอยู่แล้ว");
     return { sessionId: row.sessionId, startedAt: row.authorizedAt, ...(wait ? { waitingForLive: true as const } : {}) };
   }
@@ -270,6 +323,36 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       reason = "CONTEXT_UNAVAILABLE";
       const campaign = await discover();
       if (campaign !== row.campaignId) { pulse = undefined; await sessions.stop(row.ownerId, row.sessionId, "CAMPAIGN_ENDED"); reason = "CAMPAIGN_ENDED"; return; }
+      // The newer opt-in covers the current exact room if there is one. It
+      // does not grant authority over a replacement after a room is bound.
+      const autoDetect = row.autoDetectLive === true;
+      if (autoDetect && !canAutoDetect()) { pulse = undefined; return; }
+      const detectedFull = autoDetect && !waiting(row)
+        ? await read(campaign, evidence, row.liveSessionId ?? undefined, true).catch(() => null) : null;
+      if (autoDetect && (waiting(row) || !detectedFull)) {
+        pulse = undefined;
+        const { context, policy, fenced } = await readDetected(campaign, row.liveSessionId ?? undefined), at = now();
+        if (!context) { await sessions.stop(row.ownerId, row.sessionId, "CAMPAIGN_ENDED"); reason = "CAMPAIGN_ENDED"; return; }
+        if (!validScheduledContext(context, campaign, at)) return;
+        if (policy.revision !== row.policyRevision) { await sessions.stop(row.ownerId, row.sessionId, "CAP_CHANGED"); reason = "CAP_CHANGED"; return; }
+        if (context.budgetMinor !== row.baselineBudgetMinor || context.fingerprint !== row.baselineFingerprint) {
+          await sessions.stop(row.ownerId, row.sessionId, "BASELINE_CHANGED"); reason = "BASELINE_CHANGED"; return;
+        }
+        const active = verifiedDetectedRoom(context, at);
+        if (row.liveSessionId !== null) {
+          if (verifiedEnded(context) || (active && context.liveSessionId !== row.liveSessionId)) {
+            await sessions.stop(row.ownerId, row.sessionId, "LIVE_ENDED"); reason = "LIVE_ENDED";
+          } else reason = active ? "SPEND_UPDATE_PENDING" : "LIVE_DELIVERY_UNVERIFIED";
+          return;
+        }
+        if (!active) { reason = "LIVE_DELIVERY_UNVERIFIED"; return; }
+        const reasons = scheduledBlockers(context, policy, fenced, at);
+        if (reasons.length) { reason = reasons.includes("NATIVE_AUTO_CONFLICT") ? "NATIVE_AUTO_CONFLICT" :
+          reasons.includes("WRITE_LOCKED") ? "WRITE_LOCKED" : reasons.includes("LINE_NOT_READY") ? "LINE_NOT_READY" : "CONTEXT_UNAVAILABLE"; return; }
+        const bound = await sessions.bindLiveSession(row, context.liveSessionId);
+        reason = bound ? "SPEND_UPDATE_PENDING" : "WRITE_LOCKED";
+        return; // Binding is not a spend sample or a write.
+      }
       if (waiting(row)) {
         pulse = undefined;
         const full = await read(campaign, evidence).catch(() => null);
@@ -303,7 +386,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
         reason = bound ? "SPEND_TREND_PENDING" : "WRITE_LOCKED";
         return; // Never send on the first verified room/spend reading.
       }
-      const { context, policy, fenced } = await read(campaign, evidence, row.liveSessionId ?? undefined), at = now();
+      const { context, policy, fenced } = detectedFull ?? await read(campaign, evidence, row.liveSessionId ?? undefined), at = now();
       if (context.campaignId !== campaign || !freshContext(context, at)) { pulse = undefined; return; }
       const verdict = preview(context, policy, at, evidence);
       if (verdict.status !== "CONTEXT_UNVERIFIED") lastValidReadAt = context.observedAt;
@@ -322,6 +405,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
         return;
       }
       const current = row;
+      if (autoDetect && !verifiedDetectedRoom(context, at)) { pulse = undefined; reason = "LIVE_DELIVERY_UNVERIFIED"; return; }
       const blocked = blockers(context, policy, fenced, at, evidence, current)[0];
       if (blocked) { pulse = undefined; reason = blocked; return; }
       const previousSpend = needsPair ? observeTrend(current, context) : null;
@@ -347,12 +431,14 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       const allowed = async () => allowedEvidence(evidence) && await recheckOwner(current.ownerId, current.authorizedAt) && await sessions.isReserved(current, op.operationId);
       const result = await writer.confirm(row.ownerId, { operationId: op.operationId,
         ...(trend ? { evidenceMode: "spend-trend" as const } : { ...(roomTrend ? { evidenceMode: LIVE_ROOM_SPEND_TREND } : {}),
-          nativeAutoOff: true as const, noConcurrentChanges: true as const }) }, allowed,
+          ...(autoDetect ? { autoDetectLive: true as const } : {}), nativeAutoOff: true as const, noConcurrentChanges: true as const }) }, allowed,
         async (latest, latestPolicy) => {
           const nowAt = now(), decision = preview(latest, latestPolicy, nowAt, evidence);
           const sameRoom = hasRoom(latest) && latest.liveSessionId === current.liveSessionId;
           const rising = previousSpend !== null && latest.reportingDate === context.reportingDate &&
-            instant(latest.observedAt) >= instant(context.observedAt) && latest.spendMinor > previousSpend;
+            instant(latest.observedAt) >= instant(context.observedAt) && latest.spendMinor > previousSpend.spend &&
+            (!autoDetect || (verifiedDetectedRoom(latest, nowAt) && latest.liveSessionStartedAt === context.liveSessionStartedAt &&
+              (latest.roomSpendMinor ?? -1) > (previousSpend.roomSpend ?? Infinity) && (latest.roomSpendMinor ?? -1) >= (context.roomSpendMinor ?? Infinity)));
           const signal = trend ? rising : sameRoom && (!roomTrend || (rising && latest.spendMinor >= context.spendMinor));
           const same = latest.campaignId === current.campaignId && latest.budgetMinor === current.baselineBudgetMinor &&
             latest.fingerprint === current.baselineFingerprint && latestPolicy.revision === current.policyRevision;
