@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { bangkokDay } from "./creatorRead.service";
-import type { CreatorBudgetScope } from "./creatorBudgetScope";
+import { isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND, type CreatorBudgetScope } from "./creatorBudgetScope";
 
 export const WEB_BUDGET_CLIENT_ID = "punpan_020";
 export const WEB_BUDGET_OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -31,7 +31,7 @@ export interface WebBudgetContext {
   liveSessionId?: string | null;
 }
 export type WebAutoBudgetProof = { previousBudgetMinor: number; targetBudgetMinor: number; rounding?: "floor-satang" };
-export type WebBudgetAuthorization = { nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: never }
+export type WebBudgetAuthorization = { nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: typeof LIVE_ROOM_SPEND_TREND }
   | { evidenceMode: "spend-trend"; nativeAutoOff?: never; noConcurrentChanges?: never };
 export type WebBudgetDispatch = WebBudgetAuthorization & {
   campaignId: string; reportingDate: string; expectedBudgetMinor: number; targetBudgetMinor: number;
@@ -186,13 +186,16 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
         reject("BUDGET_INPUT_INVALID", 400, "ไม่รองรับกติกาปัดเศษงบนี้");
       }
       const useTrend = input.evidenceMode === "spend-trend";
+      const useRoomTrend = input.evidenceMode === LIVE_ROOM_SPEND_TREND;
       if (useTrend ? ((clientId !== WEB_BUDGET_CLIENT_ID && clientId !== "srihiw") || initial.source !== "auto" || !autoGuard ||
         (clientId === WEB_BUDGET_CLIENT_ID ? autoRounding !== "floor-satang" : autoRounding !== undefined) ||
         input.nativeAutoOff !== undefined || input.noConcurrentChanges !== undefined)
-        : (input.evidenceMode !== undefined || input.nativeAutoOff !== true || input.noConcurrentChanges !== true)) {
+        : (input.nativeAutoOff !== true || input.noConcurrentChanges !== true || (useRoomTrend ?
+          (!isVerifiedRoomCreator(clientId) || initial.source !== "auto" || !autoGuard || autoRounding !== undefined) :
+          (input.evidenceMode !== undefined || (initial.source === "auto" && isVerifiedRoomCreator(clientId)))))) {
         reject("BUDGET_ATTESTATION_REQUIRED", 400, "ต้องยืนยันสิทธิ์และเงื่อนไขการปรับงบ");
       }
-      const nativeReady = (context: WebBudgetContext) => context.nativeAutoState === "DISABLED" || (useTrend && context.nativeAutoState === "UNKNOWN");
+      const nativeReady = (context: WebBudgetContext) => context.nativeAutoState === "DISABLED" || ((useTrend || useRoomTrend) && context.nativeAutoState === "UNKNOWN");
       if (initial.status !== "PREPARED") return result(initial);
       const activeMode = mode();
       if (activeMode === "disabled" || activeMode !== initial.mode) reject("BUDGET_MODE_CHANGED", 409, "โหมดเปลี่ยนแล้ว กรุณาเปิดรายการใหม่");
@@ -239,12 +242,12 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
             expectedBudgetMinor: reserved.currentBudgetMinor, targetBudgetMinor: reserved.targetBudgetMinor, fingerprint: reserved.fingerprint,
             campaignCapMinor: lease.campaignCapMinor, clientDailyCapMinor: lease.clientDailyCapMinor, source,
             notAfter: new Date(deadline).toISOString(), ...(useTrend ? { evidenceMode: "spend-trend" as const }
-              : { nativeAutoOff: true as const, noConcurrentChanges: true as const }),
+              : { ...(useRoomTrend ? { evidenceMode: LIVE_ROOM_SPEND_TREND } : {}), nativeAutoOff: true as const, noConcurrentChanges: true as const }),
             canSend: async latest => mode() === "live" && await recheckOperator() &&
               (!autoGuard || (nativeReady(latest) && await autoGuard(latest, cap))) && mode() === "live" });
           const readbackProof = typeof sent?.observedFingerprint === "string" && FINGERPRINT.test(sent.observedFingerprint) &&
             sent.observedFingerprint !== reserved.fingerprint ? sent.observedFingerprint : undefined;
-          if (sent?.outcome === "APPLIED_VERIFIED" && sent.observedBudgetMinor === reserved.targetBudgetMinor && (!(autoRounding || useTrend) || readbackProof)) {
+          if (sent?.outcome === "APPLIED_VERIFIED" && sent.observedBudgetMinor === reserved.targetBudgetMinor && (!(autoRounding || useTrend || useRoomTrend) || readbackProof)) {
             status = "APPLIED_VERIFIED"; reason = "EXACT_PROVIDER_READBACK"; observedBudgetMinor = sent.observedBudgetMinor;
             observedFingerprint = readbackProof;
           } else if (sent?.outcome === "NOT_SENT" || sent?.outcome === "PROVIDER_REJECTED") {

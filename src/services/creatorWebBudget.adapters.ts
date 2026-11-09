@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import { bangkokDay, CREATOR_BINDING, createCreatorReader, createExtraCreatorReader, createPpanManualBudgetReader, minor } from "./creatorRead.service";
 import type { AutomationVerifiedCreatorBinding } from "./creatorAutomationRegistry.service";
-import { configuredCreatorWebBudgetMode, configuredCreatorSpendTrendLive, creatorBudgetPolicyPath, isExtraCreatorBudgetScope, type CreatorBudgetScope } from "./creatorBudgetScope";
+import { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode, configuredCreatorSpendTrendLive, creatorBudgetPolicyPath,
+  isExtraCreatorBudgetScope, isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND, type CreatorBudgetScope } from "./creatorBudgetScope";
+import { createCreatorVerifiedLiveRoomReader } from "./creatorVerifiedLiveRoom.service";
 import { WEB_BUDGET_MAX_MINOR, WebBudgetError, type WebBudgetAdapters, type WebBudgetSource } from "./creatorWebBudget.service";
 
 const POLICY_ORIGIN = "https://whale-buddy-ads-control-plane.onrender.com/internal/automation";
@@ -165,6 +167,7 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
   const clientId: PolicyClient = isExtraCreatorBudgetScope(extraClient) ? extraClient : "punpan_020";
   const binding = extraBinding ?? CREATOR_BINDING;
   const policyRequest = createPolicyRequest({ fetchImpl, env, clientId });
+  const readRoom = createCreatorVerifiedLiveRoomReader({ advertiserId: binding.advertiserId, fetchImpl, now });
   function checkedPolicy(raw: Data, at: Date) {
     if (extraBinding && raw.configured !== true) unverified();
     return policyView(raw, at, clientId);
@@ -196,13 +199,14 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     const data = await providerGet(INFO, campaignId, accessToken);
     if (data.advertiser_id !== binding.advertiserId || data.campaign_id !== campaignId ||
       data.shopping_ads_type !== "LIVE" || data.operation_status !== "ENABLE" || data.store_id !== "0" ||
-      data.store_authorized_bc_id !== "0" || (!extraBinding && data.tiktok_account_id !== undefined && data.tiktok_account_id !== binding.tiktokAccountId) ||
+      data.store_authorized_bc_id !== "0" || ((!extraBinding || isVerifiedRoomCreator(clientId)) && data.tiktok_account_id !== undefined && data.tiktok_account_id !== binding.tiktokAccountId) ||
       !Array.isArray(data.identity_list) || data.identity_list.length !== 1 ||
       data.optimization_goal !== "VALUE" || data.deep_bid_type !== "VO_MIN_ROAS" ||
       typeof data.roas_bid !== "number" || !Number.isFinite(data.roas_bid) || data.roas_bid <= 0) unverified();
     const identity = object(data.identity_list[0]);
     if (identity.identity_id !== binding.identityId || identity.identity_type !== binding.identityType ||
       identity.identity_authorized_bc_id !== binding.identityAuthorizedBcId ||
+      (isVerifiedRoomCreator(clientId) && identity.tiktok_account_id !== undefined && identity.tiktok_account_id !== binding.tiktokAccountId) ||
       !noShop(identity.store_id) || !noShop(identity.identity_authorized_shop_id)) unverified();
     const at = now().getTime();
     const start = data.schedule_start_time, end = data.schedule_end_time;
@@ -233,13 +237,14 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     const live = await sample(expectedCampaignId, accessToken);
     const at = now();
     if (raw.reportingDate !== bangkokDay(at) || !fresh(raw.observedAt, at.getTime(), 25_000) || c.dailyBudgetMinor !== live.budgetMinor) unverified();
-    // The currently verified Creator report has no provider timestamp for
-    // today's spend and ENABLE is not proof that a LIVE is delivering. Do
-    // not substitute fetch time, campaign modification time or a default.
+    // Room evidence is separate from the spend read. Do not manufacture a
+    // provider spend watermark or equate an enabled campaign with a LIVE.
+    const room = isVerifiedRoomCreator(clientId) && source !== "manual" ? await readRoom({ advertiserId: binding.advertiserId,
+      campaignId: expectedCampaignId, accessToken, reportingDate: raw.reportingDate }) :
+      { deliveryVerified: false, liveDeliveryState: "UNKNOWN" as const, liveSessionId: null };
     return { campaignId: expectedCampaignId, reportingDate: raw.reportingDate as string, observedAt: raw.observedAt,
       budgetMinor: live.budgetMinor, spendMinor: c.spendMinor, aggregateSpendMinor: quality.aggregateSpendMinor,
-      fingerprint: live.fingerprint, nativeAutoState: live.native, providerSpendObservedAt: null, deliveryVerified: false,
-      liveDeliveryState: "UNKNOWN" as const, liveSessionId: null, sample: live };
+      fingerprint: live.fingerprint, nativeAutoState: live.native, providerSpendObservedAt: null, ...room, sample: live };
   }
 
   return {
@@ -274,12 +279,17 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     async dispatch(input) {
       let attempted = false;
       try {
+        const roomTrend = input.evidenceMode === LIVE_ROOM_SPEND_TREND;
         const allowedAuthority = input.evidenceMode === "spend-trend" ? configuredCreatorSpendTrendLive(env, clientId) &&
           input.nativeAutoOff === undefined && input.noConcurrentChanges === undefined &&
           positive(input.expectedBudgetMinor) && positive(input.targetBudgetMinor) &&
           BigInt(input.targetBudgetMinor) === BigInt(input.expectedBudgetMinor) * 6n / 5n &&
           (clientId === "punpan_020" || BigInt(input.expectedBudgetMinor) * 6n % 5n === 0n)
-          : input.evidenceMode === undefined && input.nativeAutoOff === true && input.noConcurrentChanges === true;
+          : input.nativeAutoOff === true && input.noConcurrentChanges === true && (roomTrend ?
+            isVerifiedRoomCreator(clientId) && input.source === "auto" && configuredCreatorAutoBudgetMode(env, clientId) === "live" &&
+            positive(input.expectedBudgetMinor) && positive(input.targetBudgetMinor) &&
+            BigInt(input.targetBudgetMinor) * 5n === BigInt(input.expectedBudgetMinor) * 6n :
+            input.evidenceMode === undefined && !(input.source === "auto" && isVerifiedRoomCreator(clientId)));
         if (configuredCreatorWebBudgetMode(env, clientId) !== "live" ||
           !allowedAuthority || !ID.test(input.campaignId) ||
           !positive(input.expectedBudgetMinor) || !positive(input.targetBudgetMinor) || input.expectedBudgetMinor === input.targetBudgetMinor ||
@@ -291,6 +301,7 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
         if (await input.canSend(latest) !== true) unverified();
         const at = now();
         if ((input.evidenceMode === "spend-trend" && !configuredCreatorSpendTrendLive(env, clientId)) || bangkokDay(at) !== input.reportingDate || latest.reportingDate !== input.reportingDate ||
+          (roomTrend && (configuredCreatorAutoBudgetMode(env, clientId) !== "live" || latest.deliveryVerified !== true || latest.liveDeliveryState !== "LIVE" || !latest.liveSessionId)) ||
           Date.parse(input.notAfter) - at.getTime() < 10_000 || !fresh(latest.observedAt, at.getTime(), 25_000) ||
           before.budgetMinor !== input.expectedBudgetMinor || before.fingerprint !== input.fingerprint ||
           !["DISABLED", "UNKNOWN"].includes(before.native) || input.targetBudgetMinor <= latest.spendMinor ||

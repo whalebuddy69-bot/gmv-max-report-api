@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createCreatorContinuousAutoBudgetService } from "./creatorContinuousAutoBudget.service";
 import type { CreatorContinuousAutoBudgetSession, createCreatorContinuousAutoBudgetStore } from "./creatorContinuousAutoBudget.store";
+import { LIVE_ROOM_SPEND_TREND, VERIFIED_ROOM_CREATOR_IDS, type ContinuousCreatorBudgetScope, type ContinuousEvidence } from "./creatorBudgetScope";
 import { createCreatorWebBudgetService, type WebBudgetAdapters, type WebBudgetContext, type WebBudgetPolicy,
   type WebBudgetRecord, type WebBudgetStore } from "./creatorWebBudget.service";
 
@@ -15,7 +16,7 @@ const CONFIRM = { expectedCampaignId: CAMPAIGN, expectedLiveSessionId: ROOM, exp
   expectedPolicyRevision: CAP_REVISION, nativeAutoOff: true, noConcurrentChanges: true } as const;
 const ts = (ms: number) => new Date(ms).toISOString();
 
-function fixture(mode: "shadow" | "live" = "live", evidence: "verified-room" | "spend-trend" = "verified-room") {
+function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence = "verified-room", clientId: ContinuousCreatorBudgetScope = "punpan_020") {
   let clock = Date.parse("2026-11-07T14:14:00.000Z");
   let session: CreatorContinuousAutoBudgetSession | null = null;
   let context: WebBudgetContext = {
@@ -65,7 +66,7 @@ function fixture(mode: "shadow" | "live" = "live", evidence: "verified-room" | "
     getLatest: vi.fn(async () => session),
     arm: vi.fn(async input => {
       if (session && (session.status !== "STOPPED" || session.operationId)) return null;
-      return session = { ...input, evidenceMode: input.evidenceMode ?? "verified-room", clientId: "punpan_020", status: "ACTIVE", authorizedAt: ts(clock),
+      return session = { ...input, evidenceMode: input.evidenceMode ?? "verified-room", clientId, status: "ACTIVE", authorizedAt: ts(clock),
         operationId: null, lastOutcome: null, lastVerifiedAt: null, stopReason: null };
     }),
     adoptBaseline: vi.fn(async (prior, next) => session?.sessionId === prior.sessionId && session.status === "ACTIVE" && !session.operationId
@@ -100,14 +101,14 @@ function fixture(mode: "shadow" | "live" = "live", evidence: "verified-room" | "
   const observe = vi.fn(async (_tick: unknown) => {});
   const legacyBusy = vi.fn(async () => false);
   const now = () => new Date(clock);
-  const writer = createCreatorWebBudgetService({ store: ledger, adapters, mode: () => "live", now });
-  const service = createCreatorContinuousAutoBudgetService({ mode: () => mode, discover, adapters, sessions, writer,
+  const writer = createCreatorWebBudgetService({ clientId, store: ledger, adapters, mode: () => "live", now });
+  const service = createCreatorContinuousAutoBudgetService({ clientId, mode: () => mode, discover, adapters, sessions, writer,
     ledger, recheckOwner: async (owner, authorizedAt) => owner === OWNER && authorizedAt === session?.authorizedAt,
     legacyBusy, evidenceMode: () => evidence, observeTick: observe, now });
   return { service, sessions, discover, dispatch, ledger, adapters, legacyBusy, writes, lineOutbox, observe, readContext: () => context,
     nextReservedSpend: (spend: number) => { nextReservedSpend = spend; },
     arm: () => service.arm(OWNER, evidence === "spend-trend" ? { expectedCampaignId: CAMPAIGN, expectedBudgetMinor: ORIGINAL_BUDGET,
-      expectedPolicyRevision: CAP_REVISION, evidenceMode: evidence } : CONFIRM, async () => true),
+      expectedPolicyRevision: CAP_REVISION, evidenceMode: evidence } : evidence === LIVE_ROOM_SPEND_TREND ? { ...CONFIRM, evidenceMode: evidence } : CONFIRM, async () => true),
     refresh: (deltaMs = 0, changes: Partial<WebBudgetContext> = {}) => {
       clock += deltaMs;
       context = { ...context, observedAt: ts(clock), ...changes };
@@ -117,6 +118,38 @@ function fixture(mode: "shadow" | "live" = "live", evidence: "verified-room" | "
 }
 
 describe("Ppan continuous budget automation", () => {
+  it.each(VERIFIED_ROOM_CREATOR_IDS)("requires the exact room plus a rising spend pair and attestation for %s", async clientId => {
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, clientId);
+    f.refresh(0, { providerSpendObservedAt: null, nativeAutoState: "UNKNOWN", liveDeliveryState: "UNKNOWN", deliveryVerified: false, liveSessionId: null });
+    expect(await f.service.status(true, OWNER)).toMatchObject({ clientId, canArm: false, blockers: ["LIVE_DELIVERY_UNVERIFIED"] });
+    await expect(f.arm()).rejects.toMatchObject({ code: "AUTO_BUDGET_NOT_READY" });
+    await expect(fixture("live", "spend-trend", clientId).arm()).rejects.toMatchObject({ code: "AUTO_BUDGET_NOT_READY" });
+    expect(f.dispatch).not.toHaveBeenCalled();
+    f.refresh(0, { liveDeliveryState: "LIVE", deliveryVerified: true, liveSessionId: ROOM });
+    await expect(f.service.arm(OWNER, CONFIRM, async () => true)).rejects.toMatchObject({ code: "AUTO_BUDGET_NOT_READY" });
+    await expect(f.arm()).resolves.toMatchObject({ sessionId: expect.any(String) });
+    f.refresh(60_000);
+    await f.service.tick();
+    f.refresh(60_000);
+    await f.service.tick();
+    expect(f.dispatch).not.toHaveBeenCalled();
+    f.refresh(60_000, { spendMinor: ORIGINAL_THRESHOLD + 500 });
+    await f.service.tick();
+    expect(f.writes).toEqual([780000]);
+    expect(f.lineOutbox.size).toBe(1);
+    expect(f.dispatch).toHaveBeenCalledWith(expect.objectContaining({ evidenceMode: LIVE_ROOM_SPEND_TREND, nativeAutoOff: true, source: "auto" }));
+  });
+  it("does not carry a rising pair past a lost room, a room switch, or native Auto conflict", async () => {
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, "bubpa_shop189");
+    await f.arm();
+    f.refresh(60_000); await f.service.tick();
+    f.refresh(60_000, { spendMinor: ORIGINAL_THRESHOLD + 500, nativeAutoState: "ENABLED" }); await f.service.tick();
+    f.refresh(60_000, { nativeAutoState: "UNKNOWN", spendMinor: ORIGINAL_THRESHOLD + 1000 }); await f.service.tick();
+    f.refresh(60_000, { deliveryVerified: false, liveSessionId: null, spendMinor: ORIGINAL_THRESHOLD + 1500 }); await f.service.tick();
+    f.refresh(60_000, { deliveryVerified: true, liveSessionId: OTHER_ROOM, spendMinor: ORIGINAL_THRESHOLD + 2000 }); await f.service.tick();
+    expect(f.dispatch).not.toHaveBeenCalled();
+    expect(await f.sessions.getLatest()).toMatchObject({ stopReason: "LIVE_ENDED", status: "STOPPED" });
+  });
   it("summarizes only the operator's continuous ledger and never checks TikTok or preflights", async () => {
     const f = fixture("live");
     expect(await f.service.status(false, OWNER, "summary")).toMatchObject({ overviewState: null, continuousSession: null });

@@ -3,21 +3,26 @@ import {
   WebBudgetError, WebBudgetRecord, WebBudgetStore,
 } from "./creatorWebBudget.service";
 import { PPAN_CAMPAIGN_ACTION_FENCE_SQL, PPAN_CAMPAIGN_BUDGET_LOCK_SQL, PPAN_CAMPAIGN_OPERATIONS } from "./creatorCampaignActions.store";
+import type { CreatorBudgetScope } from "./creatorBudgetScope";
 
-export type CreatorWebBudgetLedgerClient = "punpan_020" | "srihiw" | "nnshop5719" | "ashopbytheta";
+export type CreatorWebBudgetLedgerClient = CreatorBudgetScope;
 const PPAN_LEDGER = { clientId: "punpan_020", table: "creator_web_budget_operations", fence: "creator_web_budget_one_active_fence" } as const;
 const SRIHIW_LEDGER = { clientId: "srihiw", table: "creator_web_budget_srihiw_operations", fence: "creator_web_budget_srihiw_one_active_fence" } as const;
 const NNSHOP_LEDGER = { clientId: "nnshop5719", table: "creator_web_budget_nnshop5719_operations",
   fence: "creator_web_budget_nnshop5719_one_active_fence" } as const;
 const ASHOP_LEDGER = { clientId: "ashopbytheta", table: "creator_web_budget_ashopbytheta_operations",
   fence: "creator_web_budget_ashopbytheta_one_active_fence" } as const;
-type LedgerScope = typeof PPAN_LEDGER | typeof SRIHIW_LEDGER | typeof NNSHOP_LEDGER | typeof ASHOP_LEDGER;
+const MYU_LEDGER = { clientId: "myushop4", table: "creator_web_budget_myushop4_operations", fence: "creator_web_budget_myushop4_one_active_fence" } as const;
+const BUBPA_LEDGER = { clientId: "bubpa_shop189", table: "creator_web_budget_bubpa_shop189_operations", fence: "creator_web_budget_bubpa_shop189_one_active_fence" } as const;
+type LedgerScope = typeof PPAN_LEDGER | typeof SRIHIW_LEDGER | typeof NNSHOP_LEDGER | typeof ASHOP_LEDGER | typeof MYU_LEDGER | typeof BUBPA_LEDGER;
 
 function ledgerScope(clientId: CreatorWebBudgetLedgerClient): LedgerScope {
   if (clientId === "punpan_020") return PPAN_LEDGER;
   if (clientId === "srihiw") return SRIHIW_LEDGER;
   if (clientId === "nnshop5719") return NNSHOP_LEDGER;
   if (clientId === "ashopbytheta") return ASHOP_LEDGER;
+  if (clientId === "myushop4") return MYU_LEDGER;
+  if (clientId === "bubpa_shop189") return BUBPA_LEDGER;
   throw new Error("Unconfigured Creator budget ledger");
 }
 

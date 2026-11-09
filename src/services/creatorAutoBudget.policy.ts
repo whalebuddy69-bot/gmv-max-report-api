@@ -3,9 +3,10 @@ import {
   WEB_BUDGET_CAMPAIGN_ID, WEB_BUDGET_MAX_MINOR, WEB_BUDGET_OPERATION_ID,
   type WebBudgetContext, type WebBudgetPolicy,
 } from "./creatorWebBudget.service";
-import type { CreatorWebBudgetDatabase, CreatorWebBudgetLedgerClient } from "./creatorWebBudget.store";
+import type { CreatorWebBudgetDatabase } from "./creatorWebBudget.store";
+import type { LegacyAutoBudgetScope } from "./creatorBudgetScope";
 
-export type CreatorAutoBudgetClientId = CreatorWebBudgetLedgerClient;
+export type CreatorAutoBudgetClientId = LegacyAutoBudgetScope;
 export const CREATOR_AUTO_BUDGET_MAX_GRANT_MS = 2 * 60 * 60 * 1000;
 const MIN_REMAINING_MS = 15_000;
 const READ_FRESH_MS = 30_000;

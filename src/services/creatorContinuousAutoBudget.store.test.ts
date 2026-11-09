@@ -8,6 +8,7 @@ import {
 } from "./creatorContinuousAutoBudget.store";
 import { createCreatorWebBudgetStore } from "./creatorWebBudget.store";
 import type { WebBudgetProposal } from "./creatorWebBudget.service";
+import { LIVE_ROOM_SPEND_TREND, VERIFIED_ROOM_CREATOR_IDS } from "./creatorBudgetScope";
 
 const CAMPAIGN = "12000000000001";
 const ROOM = "12000000000002";
@@ -48,6 +49,32 @@ function operation(session: CreatorContinuousAutoBudgetSession, target = Number(
 }
 
 describe("Ppan continuous Auto session", () => {
+  it("bootstraps each new verified-room scope independently and never accepts a legacy spend-trend permit", async () => {
+    const h = setup();
+    const records: Array<{ sessions: typeof h.sessions; row: CreatorContinuousAutoBudgetSession; operationId: string }> = [];
+    for (const id of VERIFIED_ROOM_CREATOR_IDS) {
+      const ledger = createCreatorWebBudgetStore(h.database, id), sessions = createCreatorContinuousAutoBudgetStore(h.database, id);
+      await ledger.ensureSchema(); await sessions.ensureSchema(); await sessions.ensureSchema();
+      expect(await sessions.arm(trendArm())).toBeNull();
+      expect(await sessions.arm(arm())).toBeNull();
+      const row = (await sessions.arm(arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, baselineBudgetMinor: 250000 })))!;
+      expect(row).toMatchObject({ clientId: id, liveSessionId: ROOM, evidenceMode: LIVE_ROOM_SPEND_TREND });
+      const table = { ashopbytheta: "creator_ashop_cauto_auto_budget_sessions", myushop4: "creator_myu_cauto_auto_budget_sessions",
+        bubpa_shop189: "creator_bubpa_cauto_auto_budget_sessions" }[id];
+      await expect(h.db.query(`UPDATE ${table} SET evidence_mode='spend-trend', live_session_id=NULL,
+        native_auto_off_attested=false,no_concurrent_changes_attested=false WHERE session_id=$1`, [row.sessionId])).rejects.toMatchObject({ code: "23514" });
+      for (const other of records) {
+        expect(await sessions.stop(other.row.ownerId, other.row.sessionId)).toBeNull();
+        expect(await sessions.reserve(row, other.operationId, 300000)).toBeNull();
+      }
+      const proposal = operation(row);
+      await ledger.create(proposal);
+      expect(await sessions.reserve(row, proposal.operationId, proposal.targetBudgetMinor)).toMatchObject({ operationId: proposal.operationId });
+      records.push({ sessions, row, operationId: proposal.operationId });
+    }
+    for (const { sessions, row, operationId } of records) expect(await sessions.getActive()).toMatchObject({ clientId: row.clientId, operationId });
+  }, 30_000);
+
   it("keeps Srihiw session, attempts and writer proof independent, even with identical baseline data", async () => {
     const h = setup(), sri = createCreatorContinuousAutoBudgetStore(h.database, "srihiw"), sriWriter = createCreatorWebBudgetStore(h.database, "srihiw");
     await h.web.ensureSchema(); await sriWriter.ensureSchema(); await h.sessions.ensureSchema(); await sri.ensureSchema(); await sri.ensureSchema();

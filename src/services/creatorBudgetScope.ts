@@ -1,8 +1,32 @@
 import type { WebBudgetMode } from "./creatorWebBudget.service";
 
-export const EXTRA_CREATOR_BUDGET_SCOPE_IDS = ["srihiw", "nnshop5719", "ashopbytheta"] as const;
+export const EXTRA_CREATOR_BUDGET_SCOPE_IDS = ["srihiw", "nnshop5719", "ashopbytheta", "myushop4", "bubpa_shop189"] as const;
 export type ExtraCreatorBudgetScope = (typeof EXTRA_CREATOR_BUDGET_SCOPE_IDS)[number];
 export type CreatorBudgetScope = "punpan_020" | ExtraCreatorBudgetScope;
+export const VERIFIED_ROOM_CREATOR_IDS = ["ashopbytheta", "myushop4", "bubpa_shop189"] as const;
+export type VerifiedRoomCreator = (typeof VERIFIED_ROOM_CREATOR_IDS)[number];
+export type LegacyAutoBudgetScope = "punpan_020" | "srihiw" | "nnshop5719" | "ashopbytheta";
+export type ContinuousCreatorBudgetScope = "punpan_020" | "srihiw" | VerifiedRoomCreator;
+export const LIVE_ROOM_SPEND_TREND = "verified-room-spend-trend" as const;
+export type ContinuousEvidence = "verified-room" | "spend-trend" | typeof LIVE_ROOM_SPEND_TREND;
+
+export function isVerifiedRoomCreator(id: unknown): id is VerifiedRoomCreator {
+  return typeof id === "string" && (VERIFIED_ROOM_CREATOR_IDS as readonly string[]).includes(id);
+}
+
+export function isLegacyAutoBudgetScope(id: unknown): id is LegacyAutoBudgetScope {
+  return id === "punpan_020" || id === "srihiw" || id === "nnshop5719" || id === "ashopbytheta";
+}
+
+export function isContinuousCreatorBudgetScope(id: unknown): id is ContinuousCreatorBudgetScope {
+  return id === "punpan_020" || id === "srihiw" || isVerifiedRoomCreator(id);
+}
+
+export function supportsContinuousEvidence(id: ContinuousCreatorBudgetScope, evidence: ContinuousEvidence) {
+  if (id === "punpan_020") return evidence === "verified-room" || evidence === "spend-trend";
+  if (id === "srihiw") return evidence === "spend-trend";
+  return isVerifiedRoomCreator(id) && evidence === LIVE_ROOM_SPEND_TREND;
+}
 
 const SCOPES = Object.freeze({
   punpan_020: { path: "ppan", manualMode: "CREATOR_WEB_BUDGET_MODE", manualLive: null,
@@ -13,6 +37,10 @@ const SCOPES = Object.freeze({
     autoMode: "CREATOR_AUTO_BUDGET_NNSHOP5719_MODE", autoLive: "CREATOR_AUTO_BUDGET_NNSHOP5719_LIVE_ENABLED" },
   ashopbytheta: { path: "ashopbytheta", manualMode: "CREATOR_WEB_ASHOPBYTHETA_BUDGET_MODE", manualLive: "CREATOR_WEB_ASHOPBYTHETA_BUDGET_LIVE_ENABLED",
     autoMode: "CREATOR_AUTO_BUDGET_ASHOPBYTHETA_MODE", autoLive: "CREATOR_AUTO_BUDGET_ASHOPBYTHETA_LIVE_ENABLED" },
+  myushop4: { path: "myushop4", manualMode: "CREATOR_WEB_MYUSHOP4_BUDGET_MODE", manualLive: "CREATOR_WEB_MYUSHOP4_BUDGET_LIVE_ENABLED",
+    autoMode: "CREATOR_AUTO_BUDGET_MYUSHOP4_MODE", autoLive: "CREATOR_AUTO_BUDGET_MYUSHOP4_LIVE_ENABLED" },
+  bubpa_shop189: { path: "bubpa_shop189", manualMode: "CREATOR_WEB_BUBPA_SHOP189_BUDGET_MODE", manualLive: "CREATOR_WEB_BUBPA_SHOP189_BUDGET_LIVE_ENABLED",
+    autoMode: "CREATOR_AUTO_BUDGET_BUBPA_SHOP189_MODE", autoLive: "CREATOR_AUTO_BUDGET_BUBPA_SHOP189_LIVE_ENABLED" },
 } as const);
 
 export function isExtraCreatorBudgetScope(id: unknown): id is ExtraCreatorBudgetScope {
@@ -43,7 +71,7 @@ export function configuredCreatorAutoBudgetMode(env: NodeJS.ProcessEnv = process
   if (!exact || env.CREATOR_READ_ENABLED !== "true") return "disabled";
   const wanted = env[exact.autoMode];
   if (wanted === "shadow") return "shadow";
-  if (wanted === "live" && env.CREATOR_AUTO_BUDGET_LIVE_ENABLED === "true" &&
+  if (wanted === "live" && (isVerifiedRoomCreator(clientId) || env.CREATOR_AUTO_BUDGET_LIVE_ENABLED === "true") &&
     (exact.autoLive === null || env[exact.autoLive] === "true") && configuredCreatorWebBudgetMode(env, clientId) === "live") return "live";
   return "disabled";
 }

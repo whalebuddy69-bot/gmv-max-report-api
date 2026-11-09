@@ -15,12 +15,14 @@ import { bangkokDay, createCreatorReader, createExtraCreatorReader } from "./cre
 import { parseAutomationViewerIds } from "../routes/automation.route";
 import { User } from "../entities/User";
 import { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode, configuredPpanSpendTrendLive, configuredCreatorSpendTrendLive,
-  isExtraCreatorBudgetScope, type CreatorBudgetScope } from "./creatorBudgetScope";
+  isExtraCreatorBudgetScope, isLegacyAutoBudgetScope, isContinuousCreatorBudgetScope, isVerifiedRoomCreator,
+  LIVE_ROOM_SPEND_TREND,
+  type ContinuousCreatorBudgetScope, type CreatorBudgetScope } from "./creatorBudgetScope";
 export { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode } from "./creatorBudgetScope";
 
 export function createCreatorWebBudgetRuntime() {
   const ledgerReady = new Set<CreatorBudgetScope>();
-  const continuousReady = new Set<"punpan_020"|"srihiw">();
+  const continuousReady = new Set<ContinuousCreatorBudgetScope>();
   let autoLedgerReady = false, timer: ReturnType<typeof setInterval> | undefined;
   const grants = createCreatorAutoBudgetGrantStore(AppDataSource);
   const sessions = createCreatorContinuousAutoBudgetStore(AppDataSource);
@@ -40,9 +42,9 @@ export function createCreatorWebBudgetRuntime() {
     const store = createCreatorWebBudgetStore(AppDataSource, clientId);
     const service = createCreatorWebBudgetService({ clientId, store, adapters,
       mode: () => ledgerReady.has(clientId) ? configuredCreatorWebBudgetMode(process.env, clientId) : "disabled" });
-    const autoService = createCreatorAutoBudgetService({ clientId, grants, writer: service, ledger: store, adapters, recheckOwner,
-      mode: () => autoLedgerReady && ledgerReady.has(clientId) ? (clientId === "punpan_020" || clientId === "srihiw" ? "shadow" : configuredCreatorAutoBudgetMode(process.env, clientId)) : "disabled",
-      discover: async () => (await reader()).campaign?.campaignId ?? null });
+    const autoService = isLegacyAutoBudgetScope(clientId) ? createCreatorAutoBudgetService({ clientId, grants, writer: service, ledger: store, adapters, recheckOwner,
+      mode: () => autoLedgerReady && ledgerReady.has(clientId) ? (isContinuousCreatorBudgetScope(clientId) ? "shadow" : configuredCreatorAutoBudgetMode(process.env, clientId)) : "disabled",
+      discover: async () => (await reader()).campaign?.campaignId ?? null }) : undefined;
     return { clientId, store, service, autoService };
   }
   const ppanReader = createCreatorReader({ loadToken: loadCreatorToken });
@@ -57,14 +59,15 @@ export function createCreatorWebBudgetRuntime() {
       return configured === "live" && process.env.CREATOR_AUTO_BUDGET_PPAN_CONTINUOUS_LIVE_ENABLED !== "true" ? "shadow" : configured;
     }, discover: async () => (await ppanReader()).campaign?.campaignId ?? null,
     legacyBusy: () => legacyBusy("punpan_020") });
-  async function legacyBusy(clientId: "punpan_020"|"srihiw") {
+  async function legacyBusy(clientId: ContinuousCreatorBudgetScope) {
+    if (!isLegacyAutoBudgetScope(clientId)) return false; // no legacy grant schema or route ever included this scope
     if (!autoLedgerReady) return true;
     const at = new Date();
     const rows = await Promise.all([bangkokDay(at), bangkokDay(new Date(at.getTime() - 86_400_000))].map(day => grants.get(clientId, day)));
     return rows.some(row => !!row && ((row.status === "ARMED" && Date.parse(row.expiresAt) > at.getTime()) ||
       (!!row.operationId && !row.settledAt)));
   }
-  const continuousScopes = [{ id: "punpan_020" as "punpan_020"|"srihiw", store: sessions, service: continuousAutoService }];
+  const continuousScopes = [{ id: "punpan_020" as ContinuousCreatorBudgetScope, store: sessions, service: continuousAutoService }];
   const allRuntimes = [ppan];
   const extraScopes: ScopedCreatorBudgetServices = {};
   const metadata = parseExtraAutomationClients(process.env.CREATOR_AUTOMATION_EXTRA_READ_CLIENTS);
@@ -76,15 +79,20 @@ export function createCreatorWebBudgetRuntime() {
     const reader = createExtraCreatorReader({ loadToken }, clientId, binding);
     const runtime = makeRuntime(clientId, adapters, reader);
     allRuntimes.push(runtime);
-    if (clientId === "srihiw") {
-      const srihiwSessions = createCreatorContinuousAutoBudgetStore(AppDataSource, "srihiw");
-      const srihiwAuto = createCreatorContinuousAutoBudgetService({ clientId, sessions: srihiwSessions,
-        writer: runtime.service, ledger: runtime.store, adapters, recheckOwner, evidenceMode: () => "spend-trend",
-        mode: () => !continuousReady.has(clientId) || !ledgerReady.has(clientId) ? "disabled" :
-          configuredCreatorSpendTrendLive(process.env, clientId) ? "live" : configuredCreatorAutoBudgetMode(process.env, clientId) === "shadow" ? "shadow" : "disabled",
+    if (isContinuousCreatorBudgetScope(clientId)) {
+      const scopedSessions = createCreatorContinuousAutoBudgetStore(AppDataSource, clientId);
+      const scopedAuto = createCreatorContinuousAutoBudgetService({ clientId, sessions: scopedSessions,
+        writer: runtime.service, ledger: runtime.store, adapters, recheckOwner,
+        evidenceMode: () => isVerifiedRoomCreator(clientId) ? LIVE_ROOM_SPEND_TREND : "spend-trend",
+        mode: () => {
+          if (!continuousReady.has(clientId) || !ledgerReady.has(clientId)) return "disabled";
+          const configured = configuredCreatorAutoBudgetMode(process.env, clientId);
+          if (isVerifiedRoomCreator(clientId)) return configured;
+          return configuredCreatorSpendTrendLive(process.env, clientId) ? "live" : configured === "shadow" ? "shadow" : "disabled";
+        },
         discover: async () => (await reader()).campaign?.campaignId ?? null, legacyBusy: () => legacyBusy(clientId) });
-      continuousScopes.push({ id: clientId, store: srihiwSessions, service: srihiwAuto });
-      extraScopes[clientId] = { ...runtime, continuousAutoService: srihiwAuto };
+      continuousScopes.push({ id: clientId, store: scopedSessions, service: scopedAuto });
+      extraScopes[clientId] = { ...runtime, continuousAutoService: scopedAuto };
     } else extraScopes[clientId] = runtime;
   }
   const router = createCreatorWebBudgetRouter({ service: ppan.service, autoService: ppan.autoService, continuousAutoService,
@@ -117,7 +125,7 @@ export function createCreatorWebBudgetRuntime() {
         try { await store.ensureSchema(); ledgerReady.add(clientId); }
         catch { ledgerReady.delete(clientId); }
       }));
-      if (continuousScopes.some(({id}) => configuredCreatorSpendTrendLive(process.env, id)) || allRuntimes.some(({ clientId }) => ledgerReady.has(clientId) && configuredCreatorAutoBudgetMode(process.env, clientId) !== "disabled")) {
+      if (continuousScopes.some(({id}) => configuredCreatorSpendTrendLive(process.env, id)) || allRuntimes.some(({ clientId, autoService }) => !!autoService && ledgerReady.has(clientId) && configuredCreatorAutoBudgetMode(process.env, clientId) !== "disabled")) {
         try { await grants.ensureSchema(); autoLedgerReady = true; }
         catch { autoLedgerReady = false; }
       }
@@ -129,7 +137,7 @@ export function createCreatorWebBudgetRuntime() {
         try { await diagnostics.ensureSchema(); diagnosticsReady = true; } catch { diagnosticsReady = false; }
       }
       if ((autoLedgerReady || continuousReady.size > 0) && !timer) timer = setInterval(() => {
-        for (const { autoService } of allRuntimes) void autoService.tick().catch(() => undefined);
+        for (const { autoService } of allRuntimes) void autoService?.tick().catch(() => undefined);
         for (const {id, service} of continuousScopes) if (continuousReady.has(id)) void service.tick().catch(() => undefined);
       }, 60_000).unref();
       return ledgerReady.size > 0;

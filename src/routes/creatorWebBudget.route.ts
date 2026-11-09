@@ -9,7 +9,8 @@ import { parseAutomationViewerIds } from "./automation.route";
 import type { createCreatorWebCapAdapters } from "../services/creatorWebBudget.adapters";
 import type { createCreatorAutoBudgetService } from "../services/creatorAutoBudget.service";
 import type { createCreatorContinuousAutoBudgetService } from "../services/creatorContinuousAutoBudget.service";
-import { EXTRA_CREATOR_BUDGET_SCOPE_IDS, isExtraCreatorBudgetScope, type ExtraCreatorBudgetScope } from "../services/creatorBudgetScope";
+import { EXTRA_CREATOR_BUDGET_SCOPE_IDS, isExtraCreatorBudgetScope, isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND,
+  type ExtraCreatorBudgetScope } from "../services/creatorBudgetScope";
 
 export const CREATOR_WEB_BUDGET_ORIGIN = "https://report.whalebuddy69.com";
 const JSON_TYPE = /^application\/json(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i;
@@ -136,8 +137,7 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
   }
   const continuousFor = (req: Request) => {
     const id = firstSegment(req);
-    if (id === "srihiw") return configuredExtra(id)?.continuousAutoService;
-    return !isExtraCreatorBudgetScope(id) ? continuousAutoService : undefined;
+    return isExtraCreatorBudgetScope(id) ? configuredExtra(id)?.continuousAutoService : continuousAutoService;
   };
   router.get("/auto/diagnostics", get, onlyOperator, handle((_req, id) => {
     if (!autoDiagnostics) throw new WebBudgetError("AUTO_DIAGNOSTICS_UNAVAILABLE", 503, "สถานะรอบตรวจยังไม่พร้อม");
@@ -151,7 +151,20 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
     const value: unknown = req.body;
     const continuous = continuousFor(req);
     const base = ["expectedCampaignId", "expectedBudgetMinor", "expectedPolicyRevision"];
-    if (continuous && fields(value, [...base, "evidenceMode"]) && value.evidenceMode === "spend-trend") {
+    if (isVerifiedRoomCreator(firstSegment(req)) && !continuous) {
+      throw new WebBudgetError("AUTO_BUDGET_NOT_CONFIGURED", 404, "ยังไม่ได้ตั้งค่า Auto สำหรับ Creator นี้");
+    }
+    if (continuous && isVerifiedRoomCreator(firstSegment(req))) {
+      if (!fields(value, [...base, "expectedLiveSessionId", "nativeAutoOff", "noConcurrentChanges", "evidenceMode"]) ||
+        value.evidenceMode !== LIVE_ROOM_SPEND_TREND || value.nativeAutoOff !== true || value.noConcurrentChanges !== true ||
+        typeof value.expectedCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedCampaignId) ||
+        typeof value.expectedLiveSessionId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedLiveSessionId) ||
+        !safeAmount(value.expectedBudgetMinor) || !safeAmount(value.expectedPolicyRevision)) badInput();
+      return continuous.arm(id, { expectedCampaignId: value.expectedCampaignId, expectedLiveSessionId: value.expectedLiveSessionId,
+        expectedBudgetMinor: value.expectedBudgetMinor, expectedPolicyRevision: value.expectedPolicyRevision,
+        evidenceMode: LIVE_ROOM_SPEND_TREND, nativeAutoOff: true, noConcurrentChanges: true }, () => recheck(req, id));
+    }
+    if (continuous && !isVerifiedRoomCreator(firstSegment(req)) && fields(value, [...base, "evidenceMode"]) && value.evidenceMode === "spend-trend") {
       if (typeof value.expectedCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedCampaignId)
         || !safeAmount(value.expectedBudgetMinor) || !safeAmount(value.expectedPolicyRevision)) badInput();
       return continuous.arm(id, { expectedCampaignId: value.expectedCampaignId, expectedBudgetMinor: value.expectedBudgetMinor,

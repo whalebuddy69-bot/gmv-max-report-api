@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isContinuousCreatorBudgetScope, LIVE_ROOM_SPEND_TREND, supportsContinuousEvidence, type ContinuousEvidence } from "./creatorBudgetScope";
 import { bangkokDay } from "./creatorRead.service";
 import { previewCreatorAutoBudget } from "./creatorAutoBudget.policy";
 import type { AutoBudgetOverviewState } from "./creatorAutoBudget.service";
@@ -9,9 +10,9 @@ import { WEB_BUDGET_CAMPAIGN_ID, WEB_BUDGET_MAX_MINOR, WebBudgetError,
 
 type Sessions = ReturnType<typeof createCreatorContinuousAutoBudgetStore>;
 type Session = NonNullable<Awaited<ReturnType<Sessions["getLatest"]>>>;
-type EvidenceMode = "verified-room" | "spend-trend";
+type EvidenceMode = ContinuousEvidence;
 type ArmInput = { expectedCampaignId: string; expectedBudgetMinor: number; expectedPolicyRevision: number } & (
-  { expectedLiveSessionId: string; nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: never } |
+  { expectedLiveSessionId: string; nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: typeof LIVE_ROOM_SPEND_TREND } |
   { evidenceMode: "spend-trend"; expectedLiveSessionId?: never; nativeAutoOff?: never; noConcurrentChanges?: never });
 type Mode = "disabled" | "shadow" | "live";
 const unavailable = () => new WebBudgetError("AUTO_BUDGET_NOT_READY", 409, "ข้อมูลสำหรับเปิด Auto ยังไม่ครบ จึงยังไม่ส่งคำสั่งจริง");
@@ -39,6 +40,9 @@ function blockers(ctx: WebBudgetContext, policy: WebBudgetPolicy, fenced: boolea
   if (evidence === "spend-trend") {
     if (ctx.nativeAutoState !== "DISABLED" && ctx.nativeAutoState !== "UNKNOWN") codes.push("NATIVE_AUTO_CONFLICT");
     if (verifiedEnded(ctx)) codes.push("LIVE_ENDED");
+  } else if (evidence === LIVE_ROOM_SPEND_TREND) {
+    if (ctx.nativeAutoState !== "DISABLED" && ctx.nativeAutoState !== "UNKNOWN") codes.push("NATIVE_AUTO_CONFLICT");
+    if (!hasRoom(ctx) || (session && ctx.liveSessionId !== session.liveSessionId)) codes.push("LIVE_DELIVERY_UNVERIFIED");
   } else {
     if (ctx.nativeAutoState !== "DISABLED") codes.push("NATIVE_AUTO_UNVERIFIED");
     if (!spendReady(ctx, at, session?.lastVerifiedAt)) codes.push(ctx.providerSpendObservedAt ? "SPEND_UPDATE_PENDING" : "SPEND_WATERMARK_MISSING");
@@ -66,7 +70,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
   observeTick?: (event: PpanAutoTickObservation) => Promise<unknown>;
   clientId?: CreatorContinuousAutoBudgetClient; evidenceMode?: () => EvidenceMode; now?: () => Date;
 }) {
-  if (clientId !== CLIENT && clientId !== "srihiw") throw new Error("CREATOR_CONTINUOUS_AUTO_SCOPE_UNSUPPORTED");
+  if (!isContinuousCreatorBudgetScope(clientId)) throw new Error("CREATOR_CONTINUOUS_AUTO_SCOPE_UNSUPPORTED");
   const rounding = clientId === CLIENT ? "floor-satang" as const : undefined;
   const preview = (ctx: WebBudgetContext, policy: WebBudgetPolicy, at: Date) => previewCreatorAutoBudget({ now: at, context: ctx, policy, rounding });
   // Deliberately process-local. A restart or incomplete read requires a fresh
@@ -78,7 +82,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       pulse = undefined;
       return null;
     }
-    const key = `${row.sessionId}:${ctx.reportingDate}:${ctx.fingerprint}:${anchor}`;
+    const key = `${row.sessionId}:${ctx.reportingDate}:${ctx.fingerprint}:${anchor}:${row.evidenceMode === LIVE_ROOM_SPEND_TREND ? ctx.liveSessionId : ""}`;
     const previous = pulse, gap = previous ? timestamp - previous.at : NaN;
     if (previous?.key === key && gap >= 0 && gap < 40_000 && ctx.spendMinor >= previous.spend) return null;
     pulse = { key, at: timestamp, spend: ctx.spendMinor };
@@ -100,7 +104,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     const continuousSession = own && ownStatus ? { sessionId: own.sessionId, status: ownStatus,
       startedAt: own.authorizedAt, reason: own.stopReason ?? (own.lastOutcome === "OUTCOME_UNKNOWN" ? own.lastOutcome : null) } : null;
     const base = { clientId, strategy: "continuous" as const, mode: currentMode, grant: null, continuousSession,
-      ...(evidence === "spend-trend" ? { evidenceMode: evidence } : {}),
+      ...(evidence !== "verified-room" ? { evidenceMode: evidence } : {}),
       canStop: !!own && own.status !== "STOPPED" };
     if (view === "summary") {
       let overviewState: AutoBudgetOverviewState = null;
@@ -121,7 +125,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       const canArm = currentMode === "live" && operator && state.ok && (!row || (row.status === "STOPPED" && !row.operationId)) &&
         canStart(context, policy, fenced, at, evidence, rounding) && !await legacyBusy();
       const reasons = blockers(context, policy, fenced, at, evidence, row?.status === "ACTIVE" ? row : undefined);
-      if (evidence === "spend-trend" && row?.status === "ACTIVE" && !row.operationId && verdict.status === "WOULD_INCREASE" && !reasons.length) reasons.push("SPEND_TREND_PENDING");
+      if (evidence !== "verified-room" && row?.status === "ACTIVE" && !row.operationId && verdict.status === "WOULD_INCREASE" && !reasons.length) reasons.push("SPEND_TREND_PENDING");
       return { ...base, canArm, preview: { status: verdict.status, campaignId: context.campaignId, currentBudgetMinor: context.budgetMinor,
         liveSessionId: hasRoom(context) ? context.liveSessionId : null,
         spendMinor: context.spendMinor, policyRevision: policy.revision, thresholdMinor: Number((BigInt(context.budgetMinor) * 8n + 9n) / 10n),
@@ -134,7 +138,8 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
   async function arm(ownerId: number, input: ArmInput, recheckOperator: () => Promise<boolean>) {
     const evidence = evidenceMode();
     const trend = input.evidenceMode === "spend-trend";
-    if (mode() !== "live" || (!trend && clientId !== CLIENT) || !WEB_BUDGET_CAMPAIGN_ID.test(input.expectedCampaignId) || trend !== (evidence === "spend-trend") ||
+    if (mode() !== "live" || !supportsContinuousEvidence(clientId, evidence) || !WEB_BUDGET_CAMPAIGN_ID.test(input.expectedCampaignId) ||
+      input.evidenceMode !== (evidence === "verified-room" ? undefined : evidence) ||
       (trend ? input.expectedLiveSessionId !== undefined || input.nativeAutoOff !== undefined || input.noConcurrentChanges !== undefined
         : !WEB_BUDGET_CAMPAIGN_ID.test(input.expectedLiveSessionId) || input.nativeAutoOff !== true || input.noConcurrentChanges !== true) || await legacyBusy()) throw unavailable();
     const campaignId = await discover();
@@ -145,7 +150,8 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     const row = await sessions.arm({ sessionId: randomUUID(), ownerId, campaignId,
       policyRevision: policy.revision, baselineBudgetMinor: context.budgetMinor, baselineFingerprint: context.fingerprint,
       ...(trend ? { evidenceMode: "spend-trend" as const, liveSessionId: null, nativeAutoOffAttested: false as const, noConcurrentChangesAttested: false as const }
-        : { liveSessionId: input.expectedLiveSessionId, nativeAutoOffAttested: true as const, noConcurrentChangesAttested: true as const }) });
+        : { ...(evidence === LIVE_ROOM_SPEND_TREND ? { evidenceMode: evidence } : {}), liveSessionId: input.expectedLiveSessionId,
+          nativeAutoOffAttested: true as const, noConcurrentChangesAttested: true as const }) });
     if (!row) throw new WebBudgetError("AUTO_BUDGET_SESSION_EXISTS", 409, "มีรอบ Auto หรือรายการที่ยังต้องตรวจสอบอยู่แล้ว");
     return { sessionId: row.sessionId, startedAt: row.authorizedAt };
   }
@@ -185,6 +191,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       if (!row) { pulse = undefined; reason = "NOT_ARMED"; return; }
       sessionId = row.sessionId;
       const evidence = row.evidenceMode ?? "verified-room", trend = evidence === "spend-trend";
+      const roomTrend = evidence === LIVE_ROOM_SPEND_TREND, needsPair = trend || roomTrend;
       if (row.status === "ACTIVE" && (mode() !== "live" || evidenceMode() !== evidence)) {
         reason = "AUTO_DISABLED";
         await sessions.stop(row.ownerId, row.sessionId, "AUTO_DISABLED");
@@ -192,7 +199,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       if (row.operationId) { pulse = undefined; await reconcile(row); reason = row.lastOutcome === "OUTCOME_UNKNOWN" ? "OUTCOME_UNKNOWN" : "PENDING"; return; }
       if (row.status !== "ACTIVE" || mode() !== "live" || evidenceMode() !== evidence) { pulse = undefined; if (reason !== "AUTO_DISABLED") reason = "SESSION_STOPPED"; return; }
       if (!await recheckOwner(row.ownerId, row.authorizedAt)) { await sessions.stop(row.ownerId, row.sessionId, "AUTHORITY_REVOKED"); reason = "AUTHORITY_REVOKED"; return; }
-      if (await legacyBusy()) { reason = "LEGACY_BUSY"; return; }
+      if (await legacyBusy()) { if (roomTrend) pulse = undefined; reason = "LEGACY_BUSY"; return; }
       reason = "CONTEXT_UNAVAILABLE";
       const campaign = await discover();
       if (campaign !== row.campaignId) { pulse = undefined; await sessions.stop(row.ownerId, row.sessionId, "CAMPAIGN_ENDED"); reason = "CAMPAIGN_ENDED"; return; }
@@ -217,25 +224,27 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       const current = row;
       const blocked = blockers(context, policy, fenced, at, evidence, current)[0];
       if (blocked) { pulse = undefined; reason = blocked; return; }
-      const previousSpend = trend ? observeTrend(current, context) : null;
+      const previousSpend = needsPair ? observeTrend(current, context) : null;
       if (verdict.status !== "WOULD_INCREASE") {
         reason = verdict.status === "BELOW_THRESHOLD" ? "BELOW_THRESHOLD" : verdict.status === "CAMPAIGN_CAP_EXCEEDED" || verdict.status === "CLIENT_DAILY_CAP_EXCEEDED" ? "CAP_REACHED" : "TARGET_UNAVAILABLE";
         return;
       }
-      if (trend && previousSpend === null) { reason = "SPEND_TREND_PENDING"; return; }
+      if (needsPair && previousSpend === null) { reason = "SPEND_TREND_PENDING"; return; }
       if (mode() !== "live" || evidenceMode() !== evidence) { reason = "AUTO_DISABLED"; return; }
       const op = await writer.prepare(row.ownerId, { expectedCampaignId: row.campaignId,
         expectedBudgetMinor: row.baselineBudgetMinor, targetBudgetMinor: verdict.targetBudgetMinor }, "auto");
       if (!await sessions.reserve(row, op.operationId, verdict.targetBudgetMinor)) { reason = "WRITE_LOCKED"; return; }
-      if (trend) pulse = undefined; // Even a proven never-sent attempt needs a new pair.
+      if (needsPair) pulse = undefined; // A second increase always needs a new pair.
       const allowed = async () => mode() === "live" && evidenceMode() === evidence && await recheckOwner(current.ownerId, current.authorizedAt) && await sessions.isReserved(current, op.operationId);
       const result = await writer.confirm(row.ownerId, { operationId: op.operationId,
-        ...(trend ? { evidenceMode: "spend-trend" as const } : { nativeAutoOff: true as const, noConcurrentChanges: true as const }) }, allowed,
+        ...(trend ? { evidenceMode: "spend-trend" as const } : { ...(roomTrend ? { evidenceMode: LIVE_ROOM_SPEND_TREND } : {}),
+          nativeAutoOff: true as const, noConcurrentChanges: true as const }) }, allowed,
         async (latest, latestPolicy) => {
           const nowAt = now(), decision = preview(latest, latestPolicy, nowAt);
-          const signal = trend ? previousSpend !== null && latest.reportingDate === context.reportingDate &&
-            instant(latest.observedAt) >= instant(context.observedAt) && latest.spendMinor > previousSpend
-            : hasRoom(latest) && latest.liveSessionId === current.liveSessionId;
+          const sameRoom = hasRoom(latest) && latest.liveSessionId === current.liveSessionId;
+          const rising = previousSpend !== null && latest.reportingDate === context.reportingDate &&
+            instant(latest.observedAt) >= instant(context.observedAt) && latest.spendMinor > previousSpend;
+          const signal = trend ? rising : sameRoom && (!roomTrend || (rising && latest.spendMinor >= context.spendMinor));
           const same = latest.campaignId === current.campaignId && latest.budgetMinor === current.baselineBudgetMinor &&
             latest.fingerprint === current.baselineFingerprint && latestPolicy.revision === current.policyRevision;
           const eligible = decision.status === "WOULD_INCREASE" && decision.targetBudgetMinor === verdict.targetBudgetMinor &&
