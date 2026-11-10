@@ -12,6 +12,7 @@ const ROOM = "2234567890123456";
 const OTHER_ROOM = "3234567890123456";
 const THIRD_ROOM = "4234567890123456";
 const SETTINGS = "d".repeat(64);
+const NON_ROI_SETTINGS = "c".repeat(64);
 const ORIGINAL_BUDGET = 650_000;
 const ORIGINAL_THRESHOLD = 520_000;
 const CAP_REVISION = 7;
@@ -25,6 +26,7 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
   let context: WebBudgetContext = {
     campaignId: CAMPAIGN, reportingDate: "2026-11-07", observedAt: ts(clock), budgetMinor: ORIGINAL_BUDGET,
     spendMinor: ORIGINAL_THRESHOLD, aggregateSpendMinor: ORIGINAL_THRESHOLD + 2_000, fingerprint: "a".repeat(64), settingsFingerprint: SETTINGS,
+    nonRoiSettingsFingerprint: NON_ROI_SETTINGS,
     nativeAutoState: "DISABLED", liveDeliveryState: "LIVE", deliveryVerified: true, liveSessionId: ROOM,
     providerSpendObservedAt: ts(clock - 1000),
   };
@@ -78,7 +80,8 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
       ? save({ liveSessionId }) : null),
     advanceContinuousSession: vi.fn(async (prior, next) => session?.sessionId === prior.sessionId && session.status === "ACTIVE" && !session.operationId && session.keepAutoAcrossRooms
       ? save({ liveSessionId: next.liveSessionId, lastBoundRoomStartedAt: next.lastBoundRoomStartedAt, baselineBudgetMinor: next.budgetMinor,
-        baselineFingerprint: next.fingerprint, baselineSettingsFingerprint: next.settingsFingerprint, policyRevision: next.policyRevision }) : null),
+        baselineFingerprint: next.fingerprint, baselineSettingsFingerprint: next.settingsFingerprint,
+        baselineNonRoiSettingsFingerprint: next.nonRoiSettingsFingerprint, policyRevision: next.policyRevision }) : null),
     reserve: vi.fn(async (prior, id) => session && session.sessionId === prior.sessionId && session.status === "ACTIVE" && !session.operationId
       ? save({ operationId: id, lastOutcome: null }) : null),
     isReserved: vi.fn(async (prior, id) => isPending(prior, id) && session?.status === "ACTIVE"),
@@ -99,7 +102,8 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
     return { outcome: "APPLIED_VERIFIED", observedBudgetMinor: context.budgetMinor, observedFingerprint: fingerprint };
   });
   const preArmContext = () => ({ campaignId: CAMPAIGN, observedAt: context.observedAt, reportingDate: context.reportingDate,
-    budgetMinor: context.budgetMinor, fingerprint: context.fingerprint, settingsFingerprint: context.settingsFingerprint, nativeAutoState: context.nativeAutoState,
+    budgetMinor: context.budgetMinor, fingerprint: context.fingerprint, settingsFingerprint: context.settingsFingerprint,
+    nonRoiSettingsFingerprint: context.nonRoiSettingsFingerprint, nativeAutoState: context.nativeAutoState,
     scheduleStartAt: "2026-11-07T14:16:00.000Z", scheduleEndAt: null });
   const adapters: WebBudgetAdapters = {
     readPolicy: vi.fn(async () => policy),
@@ -216,13 +220,57 @@ describe("Ppan continuous budget automation", () => {
     f.refresh(60_000); await f.service.tick();
     expect(await f.service.status(true, OWNER, "detect-live")).toMatchObject({ blockers: ["CAMPAIGN_NOT_VISIBLE"], continuousSession: { reason: "CAMPAIGN_NOT_VISIBLE" } });
     f.discover.mockResolvedValue(CAMPAIGN);
-    f.refresh(60_000, { settingsFingerprint: "e".repeat(64), fingerprint: "f".repeat(64) }); await f.service.tick();
+    f.refresh(60_000, { settingsFingerprint: "e".repeat(64), nonRoiSettingsFingerprint: "e".repeat(64), fingerprint: "f".repeat(64) }); await f.service.tick();
     expect((await f.service.status(true, OWNER, "detect-live")).continuousSession).toMatchObject({ reason: "CAMPAIGN_SETTINGS_CHANGED", status: "ARMED" });
-    f.refresh(60_000, { settingsFingerprint: SETTINGS, fingerprint: "a".repeat(64) });
+    f.refresh(60_000, { settingsFingerprint: SETTINGS, nonRoiSettingsFingerprint: NON_ROI_SETTINGS, fingerprint: "a".repeat(64) });
     f.setPolicy({ revision: CAP_REVISION + 1, campaignCapMinor: ORIGINAL_BUDGET, clientDailyCapMinor: ORIGINAL_BUDGET });
     await f.service.tick();
     expect(await f.sessions.getLatest()).toMatchObject({ sessionId: armed.sessionId, status: "ACTIVE", policyRevision: CAP_REVISION + 1 });
     expect(f.dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each(["punpan_020", "srihiw", "nnshop5719", "ashopbytheta", "myushop4", "bubpa_shop189", "koolkool888"] as const)(
+    "keeps %s armed through pre-LIVE, ROI, budget, cap and a new room without using old spend evidence", async clientId => {
+      const f = fixture("live", LIVE_ROOM_SPEND_TREND, clientId, true, true);
+      f.refresh(0, { liveSessionId: null, liveDeliveryState: "UNKNOWN", deliveryVerified: false });
+      const { sessionId } = await f.armPersistent(null);
+      const roiSettings = "e".repeat(64), manualBudget = 700_000, target = 840_000;
+      f.setPolicy({ revision: CAP_REVISION + 1, campaignCapMinor: 820_000, clientDailyCapMinor: 820_000 });
+      f.refresh(60_000, { budgetMinor: manualBudget, settingsFingerprint: roiSettings, fingerprint: "f".repeat(64) });
+      await f.service.tick();
+      expect(await f.sessions.getLatest()).toMatchObject({ sessionId, status: "ACTIVE", liveSessionId: null, policyRevision: CAP_REVISION + 1,
+        baselineBudgetMinor: manualBudget, baselineSettingsFingerprint: roiSettings, baselineNonRoiSettingsFingerprint: NON_ROI_SETTINGS });
+      f.refresh(60_000, { liveSessionId: OTHER_ROOM, liveDeliveryState: "LIVE", deliveryVerified: true,
+        liveSessionStartedAt: "2026-11-07T14:15:00.000Z", spendMinor: 565_000, aggregateSpendMinor: 565_000, roomSpendMinor: 550_000 });
+      await f.service.tick();
+      f.refresh(60_000); await f.service.tick();
+      expect(f.ledger.create).not.toHaveBeenCalled();
+      expect(await f.service.status(true, OWNER, "detect-live")).toMatchObject({ continuousSession: { status: "ARMED", reason: "CAP_REACHED" } });
+      f.setPolicy({ revision: CAP_REVISION + 2, campaignCapMinor: 900_000, clientDailyCapMinor: 900_000 });
+      f.refresh(60_000, { settingsFingerprint: SETTINGS, fingerprint: "e".repeat(64), spendMinor: 570_000, aggregateSpendMinor: 570_000, roomSpendMinor: 555_000 });
+      await f.service.tick(); // adoption never sends
+      f.refresh(60_000, { spendMinor: 575_000, aggregateSpendMinor: 575_000, roomSpendMinor: 560_000 }); await f.service.tick();
+      expect(f.ledger.create).not.toHaveBeenCalled();
+      f.refresh(60_000, { spendMinor: 580_000, aggregateSpendMinor: 580_000, roomSpendMinor: 565_000 }); await f.service.tick();
+      expect(f.writes).toEqual([target]);
+      expect(await f.sessions.getLatest()).toMatchObject({ sessionId, status: "ACTIVE", policyRevision: CAP_REVISION + 2, liveSessionId: OTHER_ROOM });
+      await f.service.stop(OWNER, sessionId);
+      f.refresh(60_000); await f.service.tick();
+      expect(f.writes).toEqual([target]);
+    });
+
+  it("keeps an older active session on hold until it can independently seed the non-ROI baseline", async () => {
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, "myushop4", true, true);
+    f.refresh(0, { liveSessionStartedAt: "2026-11-07T13:00:00.000Z", roomSpendMinor: 500_000 });
+    const { sessionId } = await f.armPersistent(ROOM);
+    delete (await f.sessions.getLatest())!.baselineNonRoiSettingsFingerprint;
+    f.refresh(60_000, { settingsFingerprint: "e".repeat(64), fingerprint: "f".repeat(64) }); await f.service.tick();
+    expect(await f.service.status(true, OWNER, "detect-live")).toMatchObject({ blockers: ["AUTO_BASELINE_REVIEW"],
+      continuousSession: { status: "ARMED", reason: "AUTO_BASELINE_REVIEW" }, canStop: true });
+    expect(f.sessions.advanceContinuousSession).not.toHaveBeenCalled();
+    f.refresh(60_000, { settingsFingerprint: SETTINGS, fingerprint: "a".repeat(64) }); await f.service.tick();
+    expect(await f.sessions.getLatest()).toMatchObject({ sessionId, status: "ACTIVE", baselineNonRoiSettingsFingerprint: NON_ROI_SETTINGS });
+    expect(f.ledger.create).not.toHaveBeenCalled();
   });
 
   it("keeps persistent Auto after a proven NOT_SENT preflight and starts a fresh pair", async () => {

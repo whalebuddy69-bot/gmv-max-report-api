@@ -24,6 +24,8 @@ export interface WebBudgetPolicy {
 interface WebBudgetCampaignEvidence {
   campaignId: string; reportingDate: string; observedAt: string; budgetMinor: number; fingerprint: string;
   settingsFingerprint?: string;
+  /** Adoption evidence only; never substitutes for the ROI-inclusive writer fingerprint. */
+  nonRoiSettingsFingerprint?: string;
   nativeAutoState: "DISABLED" | "UNKNOWN" | "ENABLED" | "CONFLICT";
 }
 export interface WebBudgetPreArmContext extends WebBudgetCampaignEvidence {

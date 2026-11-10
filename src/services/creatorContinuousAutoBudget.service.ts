@@ -86,6 +86,16 @@ function canStart(ctx: WebBudgetContext, policy: WebBudgetPolicy, fenced: boolea
 
 const validAmount = (value: number) => Number.isSafeInteger(value) && value > 0 && value <= WEB_BUDGET_MAX_MINOR;
 const validSettingsFingerprint = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+function persistentSettingsHold(ctx: Pick<WebBudgetPreArmContext, "settingsFingerprint" | "nonRoiSettingsFingerprint">, row?: Session | null) {
+  if (!validSettingsFingerprint(ctx.settingsFingerprint) || !validSettingsFingerprint(ctx.nonRoiSettingsFingerprint)) return "CONTEXT_UNAVAILABLE";
+  if (!row?.keepAutoAcrossRooms) return null;
+  // Older armed sessions only pinned the ROI-inclusive hash. Never establish
+  // the new baseline from changed, unverifiable settings for those sessions.
+  if (row.baselineNonRoiSettingsFingerprint === undefined) {
+    return ctx.settingsFingerprint === row.baselineSettingsFingerprint ? null : "AUTO_BASELINE_REVIEW";
+  }
+  return ctx.nonRoiSettingsFingerprint === row.baselineNonRoiSettingsFingerprint ? null : "CAMPAIGN_SETTINGS_CHANGED";
+}
 function freshPolicy(policy: WebBudgetPolicy, at: Date) {
   const age = at.getTime() - instant(policy.readAt);
   return validAmount(policy.campaignCapMinor) && validAmount(policy.clientDailyCapMinor) && Number.isSafeInteger(policy.revision) &&
@@ -188,9 +198,10 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     if (context.campaignId !== campaign || !freshContext(context, at) || !validAmount(context.budgetMinor) ||
       !validSettingsFingerprint(context.fingerprint) || !freshPolicy(policy, at)) return hold("CONTEXT_UNAVAILABLE");
     if (context.nativeAutoState !== "DISABLED" && context.nativeAutoState !== "UNKNOWN") return hold("NATIVE_AUTO_CONFLICT");
-    if (!validSettingsFingerprint(context.settingsFingerprint) || context.settingsFingerprint !== row.baselineSettingsFingerprint) {
-      return hold("BASELINE_CHANGED", "CAMPAIGN_SETTINGS_CHANGED");
-    }
+    const { settingsFingerprint, nonRoiSettingsFingerprint } = context;
+    if (!validSettingsFingerprint(settingsFingerprint) || !validSettingsFingerprint(nonRoiSettingsFingerprint)) return hold("CONTEXT_UNAVAILABLE");
+    const settingsHold = persistentSettingsHold(context, row);
+    if (settingsHold) return hold(settingsHold === "CONTEXT_UNAVAILABLE" ? "CONTEXT_UNAVAILABLE" : "BASELINE_CHANGED", settingsHold);
     if (fenced || policy.locked) return hold("WRITE_LOCKED");
     let room = row.liveSessionId, start = row.lastBoundRoomStartedAt;
     const current = verifiedDetectedRoom(context, at) ? context : null;
@@ -210,9 +221,11 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
         verifiedEnded(prior.context)) room = null;
     }
     if (room !== row.liveSessionId || start !== row.lastBoundRoomStartedAt || context.budgetMinor !== row.baselineBudgetMinor ||
-      context.fingerprint !== row.baselineFingerprint || policy.revision !== row.policyRevision) {
+      context.fingerprint !== row.baselineFingerprint || policy.revision !== row.policyRevision ||
+      settingsFingerprint !== row.baselineSettingsFingerprint || nonRoiSettingsFingerprint !== row.baselineNonRoiSettingsFingerprint) {
       const advanced = await sessions.advanceContinuousSession(row, { liveSessionId: room, lastBoundRoomStartedAt: start,
-        budgetMinor: context.budgetMinor, fingerprint: context.fingerprint, settingsFingerprint: context.settingsFingerprint, policyRevision: policy.revision });
+        budgetMinor: context.budgetMinor, fingerprint: context.fingerprint, settingsFingerprint,
+        nonRoiSettingsFingerprint, policyRevision: policy.revision });
       return advanced ? hold(room ? "SPEND_UPDATE_PENDING" : "LIVE_DELIVERY_UNVERIFIED") : hold("WRITE_LOCKED");
     }
     if (!current || !room || !full) return hold(current ? "SPEND_UPDATE_PENDING" : "LIVE_DELIVERY_UNVERIFIED");
@@ -263,8 +276,8 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
           const { context, policy, fenced } = exact;
           const verdict = preview(context, policy, at);
           const reasons: string[] = blockers(context, policy, fenced, at, LIVE_ROOM_SPEND_TREND);
-          if (!validSettingsFingerprint(context.settingsFingerprint) || (own?.status === "ACTIVE" && own.keepAutoAcrossRooms &&
-            context.settingsFingerprint !== own.baselineSettingsFingerprint)) reasons.push("CAMPAIGN_SETTINGS_CHANGED");
+          const settingsHold = persistentSettingsHold(context, own?.status === "ACTIVE" ? own : null);
+          if (settingsHold) reasons.push(settingsHold);
           if (boundRoom && verdict.status === "WOULD_INCREASE" && !reasons.length) reasons.push("SPEND_TREND_PENDING");
           return { ...base, evidenceMode: LIVE_ROOM_SPEND_TREND,
             canArm: canRequest && !reasons.length && canStart(context, policy, fenced, at, LIVE_ROOM_SPEND_TREND, rounding) && !await legacyBusy(), blockers: reasons,
@@ -276,8 +289,8 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
         const { context, policy, fenced } = await readDetected(campaign, boundRoom), checkedAt = now();
         if (!context || !validScheduledContext(context, campaign, checkedAt)) return { ...base, canArm: false, preview: null, blockers: ["CONTEXT_UNAVAILABLE"] };
         const reasons = scheduledBlockers(context, policy, fenced, checkedAt, rounding);
-        if (!validSettingsFingerprint(context.settingsFingerprint) || (own?.status === "ACTIVE" && own.keepAutoAcrossRooms &&
-          context.settingsFingerprint !== own.baselineSettingsFingerprint)) reasons.push("CAMPAIGN_SETTINGS_CHANGED");
+        const settingsHold = persistentSettingsHold(context, own?.status === "ACTIVE" ? own : null);
+        if (settingsHold && !reasons.includes(settingsHold)) reasons.push(settingsHold);
         const matched = verifiedDetectedRoom(context, checkedAt) && expected(context) ? context : null;
         if (!matched && boundRoom) reasons.push("LIVE_DELIVERY_UNVERIFIED");
         if (!matched && context.roomEvidenceIssue === "STALE_ONGOING" && !canRequest) reasons.push("LIVE_ROOM_REPORT_STALE");
@@ -345,7 +358,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     const ready = autoDetectLive ? await readDetected(campaignId, input.expectedLiveSessionId ?? undefined).then(({ context, policy, fenced }) => {
       const at = now();
       if (!context || !validScheduledContext(context, campaignId, at) || scheduledBlockers(context, policy, fenced, at, rounding).length ||
-        (keepAutoAcrossRooms && !validSettingsFingerprint(context.settingsFingerprint))) return null;
+        (keepAutoAcrossRooms && persistentSettingsHold(context))) return null;
       if (!wait) {
         if (!verifiedDetectedRoom(context, at) || context.liveSessionId !== input.expectedLiveSessionId) return null;
         lastBoundRoomStartedAt = context.liveSessionStartedAt;
@@ -367,6 +380,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
           nativeAutoOffAttested: true as const, noConcurrentChangesAttested: true as const,
           ...(autoDetectLive ? { autoDetectLive: true as const } : {}), ...(allowExhaustedRecovery ? { allowExhaustedRecovery: true as const } : {}),
           ...(keepAutoAcrossRooms ? { keepAutoAcrossRooms: true as const, baselineSettingsFingerprint: context.settingsFingerprint,
+            baselineNonRoiSettingsFingerprint: context.nonRoiSettingsFingerprint,
             ...(lastBoundRoomStartedAt ? { lastBoundRoomStartedAt } : {}) } : {}) }) });
     if (!row) throw new WebBudgetError("AUTO_BUDGET_SESSION_EXISTS", 409, "มีรอบ Auto หรือรายการที่ยังต้องตรวจสอบอยู่แล้ว");
     return { sessionId: row.sessionId, startedAt: row.authorizedAt, ...(wait ? { waitingForLive: true as const } : {}) };
@@ -550,7 +564,9 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
             : latest.spendMinor > previousSpend.spend && (!autoDetect || (latest.roomSpendMinor ?? -1) > (previousSpend.roomSpend ?? Infinity)));
           const signal = trend ? qualified : sameRoom && (!roomTrend || (qualified && latest.spendMinor >= context.spendMinor));
           const same = latest.campaignId === current.campaignId && latest.budgetMinor === current.baselineBudgetMinor &&
-            latest.fingerprint === current.baselineFingerprint && latestPolicy.revision === current.policyRevision;
+            latest.fingerprint === current.baselineFingerprint && latestPolicy.revision === current.policyRevision &&
+            (!persistent || (latest.settingsFingerprint === current.baselineSettingsFingerprint &&
+              latest.nonRoiSettingsFingerprint === current.baselineNonRoiSettingsFingerprint));
           const eligible = decision.status === "WOULD_INCREASE" && decision.targetBudgetMinor === verdict.targetBudgetMinor &&
             !blockers(latest, latestPolicy, false, nowAt, evidence, current).length;
           if (trend && (!signal || !same || !eligible)) throw new WebBudgetError(!signal ? "PPAN_TREND_PREFLIGHT_SIGNAL" :

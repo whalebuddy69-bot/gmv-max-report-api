@@ -177,22 +177,55 @@ describe("exact GMV campaign delivery telemetry", () => {
     expect(await h.adapters.readPreArmContext!(CAMPAIGN)).not.toHaveProperty("campaignDeliveryStatus");
   });
 
-  it("separates budget revision from settings across pre-arm, room-only and strict provider reads", async () => {
+  it("separates ROI-only adoption evidence from the exact writer fingerprint across all provider reads", async () => {
     const h = harness({ extraClient: "ashopbytheta", room: "ONGOING", detectRoom: true, roomCost: "20.00" });
     const before = await h.adapters.readScheduledLiveContext!(CAMPAIGN, ROOM, true);
     expect(before.settingsFingerprint).toMatch(/^[0-9a-f]{64}$/);
-    expect((await h.adapters.readPreArmContext!(CAMPAIGN))?.settingsFingerprint).toBe(before.settingsFingerprint);
-    expect((await h.adapters.readAutoDetectContext!(CAMPAIGN))?.settingsFingerprint).toBe(before.settingsFingerprint);
+    expect(before.nonRoiSettingsFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    const expected = { settingsFingerprint: before.settingsFingerprint, nonRoiSettingsFingerprint: before.nonRoiSettingsFingerprint };
+    expect(await h.adapters.readPreArmContext!(CAMPAIGN)).toMatchObject(expected);
+    expect(await h.adapters.readAutoDetectContext!(CAMPAIGN)).toMatchObject(expected);
     h.edit(3000);
     h.setSecondaryStatus("CAMPAIGN_STATUS_BUDGET_EXCEED");
     h.setDetailSecondaryStatus("CAMPAIGN_STATUS_BUDGET_EXCEED");
     const budgetEdit = await h.adapters.readScheduledLiveContext!(CAMPAIGN, ROOM, true);
-    expect(budgetEdit.settingsFingerprint).toBe(before.settingsFingerprint);
+    expect(budgetEdit).toMatchObject(expected);
     expect(budgetEdit.fingerprint).not.toBe(before.fingerprint);
     h.setRoi(16);
     const settingsEdit = await h.adapters.readScheduledLiveContext!(CAMPAIGN, ROOM, true);
-    expect(settingsEdit.settingsFingerprint).not.toBe(before.settingsFingerprint);
-    expect((await h.adapters.readPreArmContext!(CAMPAIGN))?.settingsFingerprint).toBe(settingsEdit.settingsFingerprint);
+    expect(settingsEdit.settingsFingerprint).not.toBe(budgetEdit.settingsFingerprint);
+    expect(settingsEdit.fingerprint).not.toBe(budgetEdit.fingerprint);
+    expect(settingsEdit.nonRoiSettingsFingerprint).toBe(before.nonRoiSettingsFingerprint);
+    expect(await h.adapters.readPreArmContext!(CAMPAIGN)).toMatchObject({ settingsFingerprint: settingsEdit.settingsFingerprint,
+      nonRoiSettingsFingerprint: settingsEdit.nonRoiSettingsFingerprint, fingerprint: settingsEdit.fingerprint });
+    expect(h.providerPosts()).toHaveLength(0);
+  });
+
+  it.each([
+    ["campaign name", { campaign_name: "Another campaign name" }],
+    ["schedule", { schedule_start_time: "2025-03-15 08:15:00" }],
+    ["native budget policy", { auto_budget_enabled: true }],
+    ["nested promotion ROI", { promotion_days: { is_enabled: false, adjusted_roas_bid: 12 } }],
+  ] as const)("keeps a %s change in the non-ROI evidence", async (_label, campaignInfo) => {
+    const h = harness(), edited = harness({ campaignInfo });
+    const before = await h.adapters.readPreArmContext!(CAMPAIGN), after = await edited.adapters.readPreArmContext!(CAMPAIGN);
+    expect(before?.nonRoiSettingsFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(after?.nonRoiSettingsFingerprint).not.toBe(before?.nonRoiSettingsFingerprint);
+    expect(after?.settingsFingerprint).not.toBe(before?.settingsFingerprint);
+    expect(after?.fingerprint).not.toBe(before?.fingerprint);
+    expect((await edited.adapters.readScheduledLiveContext!(CAMPAIGN)).nonRoiSettingsFingerprint).toBe(after?.nonRoiSettingsFingerprint);
+    expect(edited.providerPosts()).toHaveLength(0);
+  });
+
+  it("rejects the budget writer before POST if ROI changes after the proposal", async () => {
+    const h = harness({ scheduledLive: true, room: "ONGOING", detectRoom: true, roomCost: "20.00" });
+    const input = await h.input(336_000, "auto");
+    const old = await h.adapters.readScheduledLiveContext!(CAMPAIGN, ROOM, true);
+    h.setRoi(16); // Provider timestamp is deliberately unchanged in this fixture.
+    const latest = await h.adapters.readScheduledLiveContext!(CAMPAIGN, ROOM, true);
+    expect(latest.nonRoiSettingsFingerprint).toBe(old.nonRoiSettingsFingerprint);
+    expect(latest.fingerprint).not.toBe(input.fingerprint);
+    expect(await h.adapters.dispatch({ ...input, evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true })).toEqual({ outcome: "NOT_SENT" });
     expect(h.providerPosts()).toHaveLength(0);
   });
 });
@@ -203,7 +236,7 @@ describe("exact read-only scheduled Auto context", () => {
       schedule_type: "SCHEDULE_START_END", schedule_start_time: "2025-03-15 10:00:00", schedule_end_time: "2025-03-15 12:00:00" } });
     await expect(h.adapters.readPreArmContext!(CAMPAIGN)).resolves.toEqual({ campaignId: CAMPAIGN,
       reportingDate: TODAY, observedAt: NOW, budgetMinor: 280_000, fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
-      settingsFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/), nativeAutoState: "UNKNOWN",
+      settingsFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/), nonRoiSettingsFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/), nativeAutoState: "UNKNOWN",
       scheduleStartAt: "2025-03-15T10:00:00.000Z", scheduleEndAt: "2025-03-15T12:00:00.000Z" });
     expect(h.calls.map(x => [x.method, x.path])).toEqual([["GET", "/open_api/v1.3/advertiser/info/"],
       ["GET", "/open_api/v1.3/gmv_max/campaign/get/"], ["GET", "/open_api/v1.3/campaign/gmv_max/info/"]]);

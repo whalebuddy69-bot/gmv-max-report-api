@@ -16,6 +16,8 @@ const BEFORE = "a".repeat(64);
 const AFTER = "b".repeat(64);
 const NEXT = "c".repeat(64);
 const SETTINGS = "d".repeat(64);
+const NON_ROI_SETTINGS = "e".repeat(64);
+const ROI_CHANGED_SETTINGS = "f".repeat(64);
 const FIRST_ROOM_AT = "2026-11-09T00:00:00.000Z";
 const NEXT_ROOM_AT = "2026-11-10T00:00:00.000Z";
 const dbs: PGlite[] = [];
@@ -157,7 +159,9 @@ describe("Ppan continuous Auto session", () => {
     await sessions.ensureSchema();
     const draft = arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, liveSessionId: null });
     const old = (await sessions.arm(draft))!;
-    await h.db.exec(`ALTER TABLE ${table} DROP CONSTRAINT creator_ashop_cauto_session_keep_rooms_v7,
+    await h.db.exec(`ALTER TABLE ${table} DROP CONSTRAINT creator_ashop_cauto_session_non_roi_settings_v8,
+      DROP COLUMN baseline_non_roi_settings_fingerprint,
+      DROP CONSTRAINT creator_ashop_cauto_session_keep_rooms_v7,
       DROP CONSTRAINT creator_ashop_cauto_session_awaiting_live_v4,
       DROP COLUMN keep_auto_across_rooms,DROP COLUMN last_bound_room_started_at,DROP COLUMN baseline_settings_fingerprint,
       ADD CONSTRAINT creator_ashop_cauto_session_awaiting_live_v4 CHECK (
@@ -297,6 +301,50 @@ describe("Ppan continuous Auto session", () => {
       .toEqual([{ retry_released: true }, { retry_released: false }]);
   });
 
+  it("pins an existing persistent session only under unchanged full settings, then adopts only exact ROI-only changes", async () => {
+    const h = setup(), id = "bubpa_shop189", table = "creator_bubpa_cauto_auto_budget_sessions";
+    const ledger = createCreatorWebBudgetStore(h.database, id), sessions = createCreatorContinuousAutoBudgetStore(h.database, id);
+    await ledger.ensureSchema(); await sessions.ensureSchema();
+    const draft = arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true, keepAutoAcrossRooms: true,
+      baselineSettingsFingerprint: SETTINGS, lastBoundRoomStartedAt: FIRST_ROOM_AT, baselineBudgetMinor: 250_000 });
+    const original = (await sessions.arm(draft))!;
+    await h.db.exec(`ALTER TABLE ${table} DROP CONSTRAINT creator_bubpa_cauto_session_non_roi_settings_v8,
+      DROP COLUMN baseline_non_roi_settings_fingerprint`);
+    await sessions.ensureSchema(); await sessions.ensureSchema();
+    expect(await sessions.getActive()).toEqual(original);
+    const initial = { liveSessionId: ROOM, budgetMinor: 250_000, fingerprint: BEFORE,
+      settingsFingerprint: SETTINGS, policyRevision: 2, nonRoiSettingsFingerprint: NON_ROI_SETTINGS };
+    const roiEdit = { ...initial, fingerprint: AFTER, settingsFingerprint: ROI_CHANGED_SETTINGS };
+    expect(await sessions.advanceContinuousSession(original, roiEdit)).toBeNull(); // no old non-ROI proof
+    expect(await sessions.advanceContinuousSession(original, { ...initial, nonRoiSettingsFingerprint: "invalid" })).toBeNull();
+    const pinned = (await sessions.advanceContinuousSession(original, initial))!;
+    expect(pinned).toEqual({ ...original, baselineNonRoiSettingsFingerprint: NON_ROI_SETTINGS });
+    expect(await sessions.advanceContinuousSession(original, { ...initial, nonRoiSettingsFingerprint: NEXT })).toBeNull(); // stale prior NULL
+    expect(await sessions.advanceContinuousSession(pinned, { ...initial, nonRoiSettingsFingerprint: NEXT })).toBeNull();
+    expect(await sessions.advanceContinuousSession(pinned, { ...roiEdit, nonRoiSettingsFingerprint: NEXT })).toBeNull();
+    expect(await sessions.advanceContinuousSession(pinned, { ...roiEdit, nonRoiSettingsFingerprint: undefined })).toBeNull();
+    expect(await sessions.advanceContinuousSession(pinned, { ...roiEdit, fingerprint: BEFORE })).toBeNull();
+    const adopted = (await sessions.advanceContinuousSession(pinned, roiEdit))!;
+    expect(adopted).toEqual({ ...pinned, baselineSettingsFingerprint: ROI_CHANGED_SETTINGS, baselineFingerprint: AFTER });
+    expect(await sessions.advanceContinuousSession(pinned, { ...roiEdit, fingerprint: NEXT })).toBeNull(); // stale old full hash
+    expect(await sessions.advanceContinuousSession({ ...adopted, baselineSettingsFingerprint: SETTINGS }, { ...roiEdit, fingerprint: NEXT })).toBeNull();
+
+    const op = operation(adopted); await ledger.create(op); await sessions.reserve(adopted, op.operationId, op.targetBudgetMinor);
+    expect(await sessions.advanceContinuousSession(adopted, { ...initial, fingerprint: NEXT })).toBeNull();
+    expect(await sessions.getActive()).toMatchObject({ operationId: op.operationId, baselineSettingsFingerprint: ROI_CHANGED_SETTINGS,
+      baselineNonRoiSettingsFingerprint: NON_ROI_SETTINGS });
+  });
+
+  it("stores a verified non-ROI settings pin only on explicitly persistent arms", async () => {
+    const h = setup(), sessions = createCreatorContinuousAutoBudgetStore(h.database, "myushop4");
+    await sessions.ensureSchema();
+    const base = arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true, baselineNonRoiSettingsFingerprint: NON_ROI_SETTINGS });
+    expect(await sessions.arm(base)).toBeNull();
+    const persistent = { ...base, keepAutoAcrossRooms: true as const, baselineSettingsFingerprint: SETTINGS, lastBoundRoomStartedAt: FIRST_ROOM_AT };
+    expect(await sessions.arm({ ...persistent, baselineNonRoiSettingsFingerprint: "invalid" })).toBeNull();
+    expect(await sessions.arm(persistent)).toMatchObject({ baselineSettingsFingerprint: SETTINGS, baselineNonRoiSettingsFingerprint: NON_ROI_SETTINGS });
+  });
+
   it("atomically voids only an exact unreserved expired proposal for a persistent session before retrying", async () => {
     const h = setup(), id = "bubpa_shop189";
     const ledger = createCreatorWebBudgetStore(h.database, id), sessions = createCreatorContinuousAutoBudgetStore(h.database, id);
@@ -355,7 +403,7 @@ describe("Ppan continuous Auto session", () => {
       const pending = (await sessions.getActive())!;
       expect(pending).toMatchObject({ ...old, status: "ACTIVE", operationId: pendingId });
       expect((await h.db.query(`SELECT * FROM ${table}`)).rows).toEqual([{ ...before, auto_detect_live: false, allow_exhausted_recovery: false,
-        keep_auto_across_rooms: false, last_bound_room_started_at: null, baseline_settings_fingerprint: null }]);
+        keep_auto_across_rooms: false, last_bound_room_started_at: null, baseline_settings_fingerprint: null, baseline_non_roi_settings_fingerprint: null }]);
       expect(pending.autoDetectLive).toBeUndefined();
       expect(pending.allowExhaustedRecovery).toBeUndefined();
       await expect(h.db.query(`UPDATE ${table} SET auto_detect_live=true WHERE session_id=$1`, [old.sessionId]))

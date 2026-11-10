@@ -29,6 +29,7 @@ export interface CreatorContinuousAutoBudgetArmInput {
   keepAutoAcrossRooms?: true;
   lastBoundRoomStartedAt?: string;
   baselineSettingsFingerprint?: string;
+  baselineNonRoiSettingsFingerprint?: string;
 }
 export interface CreatorContinuousAutoBudgetSession extends CreatorContinuousAutoBudgetArmInput {
   clientId: CreatorContinuousAutoBudgetClient;
@@ -418,6 +419,36 @@ BEGIN
 END
 $creator_continuous_keep_rooms$;`;
 
+// Add the narrow digest without guessing values for already-armed sessions.
+// A matching full settings hash must bootstrap the pin from fresh evidence.
+const CREATOR_CONTINUOUS_NON_ROI_SETTINGS_SCHEMA_SQL = `
+DO $creator_continuous_non_roi_settings$
+DECLARE
+  sessions constant regclass := 'creator_continuous_auto_budget_sessions'::regclass;
+  expected_guard constant text := '((baseline_non_roi_settings_fingerprint IS NULL) OR (keep_auto_across_rooms AND (baseline_non_roi_settings_fingerprint ~ ''^[a-f0-9]{64}$''::text)))';
+  current_guard text;
+  column_present boolean;
+  valid_column boolean;
+BEGIN
+  FOR pass IN 1..2 LOOP
+    SELECT true,a.atttypid='text'::regtype AND NOT a.attnotnull AND d.adbin IS NULL
+      INTO column_present,valid_column
+      FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+      WHERE a.attrelid=sessions AND a.attname='baseline_non_roi_settings_fingerprint' AND NOT a.attisdropped;
+    SELECT pg_get_expr(conbin,conrelid) INTO current_guard FROM pg_constraint WHERE conrelid=sessions
+      AND conname='creator_continuous_session_non_roi_settings_v8' AND convalidated AND contype='c';
+    IF valid_column AND current_guard=expected_guard THEN RETURN; END IF;
+    IF pass=1 THEN LOCK TABLE creator_continuous_auto_budget_sessions IN ACCESS EXCLUSIVE MODE; END IF;
+  END LOOP;
+  IF column_present OR current_guard IS NOT NULL THEN RAISE EXCEPTION 'Unrecognized Creator non-ROI settings fingerprint'; END IF;
+  ALTER TABLE creator_continuous_auto_budget_sessions
+    ADD COLUMN baseline_non_roi_settings_fingerprint text,
+    ADD CONSTRAINT creator_continuous_session_non_roi_settings_v8 CHECK (
+      baseline_non_roi_settings_fingerprint IS NULL OR (keep_auto_across_rooms AND baseline_non_roi_settings_fingerprint ~ '^[a-f0-9]{64}$')
+    );
+END
+$creator_continuous_non_roi_settings$;`;
+
 type Runner = ReturnType<CreatorWebBudgetDatabase["createQueryRunner"]>;
 function rows(value: unknown): Record<string, unknown>[] {
   if (!Array.isArray(value)) throw new Error("CREATOR_CONTINUOUS_AUTO_STORE_SHAPE");
@@ -443,8 +474,10 @@ function validArm(value: CreatorContinuousAutoBudgetArmInput | null | undefined,
     positive(value.baselineBudgetMinor, WEB_BUDGET_MAX_MINOR) && identifier(value.baselineFingerprint, FINGERPRINT) &&
     (value.autoDetectLive === undefined || (value.autoDetectLive === true && value.evidenceMode === LIVE_ROOM_SPEND_TREND && allowsScheduledCreatorAuto(clientId))) &&
     (value.allowExhaustedRecovery === undefined || (value.allowExhaustedRecovery === true && value.autoDetectLive === true)) &&
-    (value.keepAutoAcrossRooms === undefined ? value.lastBoundRoomStartedAt === undefined && value.baselineSettingsFingerprint === undefined :
+    (value.keepAutoAcrossRooms === undefined ? value.lastBoundRoomStartedAt === undefined && value.baselineSettingsFingerprint === undefined &&
+      value.baselineNonRoiSettingsFingerprint === undefined :
       value.keepAutoAcrossRooms === true && value.autoDetectLive === true && identifier(value.baselineSettingsFingerprint, FINGERPRINT) &&
+      (value.baselineNonRoiSettingsFingerprint === undefined || identifier(value.baselineNonRoiSettingsFingerprint, FINGERPRINT)) &&
       (value.lastBoundRoomStartedAt === undefined ? value.liveSessionId === null : validAuthorizedAt(value.lastBoundRoomStartedAt))) &&
     (value.evidenceMode === "spend-trend"
       ? value.liveSessionId === null && value.nativeAutoOffAttested === false && value.noConcurrentChangesAttested === false
@@ -482,11 +515,13 @@ function map(row: Record<string, unknown>, clientId: CreatorContinuousAutoBudget
     ...(row.keep_auto_across_rooms === true ? { keepAutoAcrossRooms: true as const } : {}),
     ...(row.last_bound_room_started_at === null ? {} : { lastBoundRoomStartedAt: timestamp(row.last_bound_room_started_at) }),
     ...(row.baseline_settings_fingerprint === null ? {} : { baselineSettingsFingerprint: row.baseline_settings_fingerprint }),
+    ...(row.baseline_non_roi_settings_fingerprint === null ? {} : { baselineNonRoiSettingsFingerprint: row.baseline_non_roi_settings_fingerprint }),
     baselineBudgetMinor: integerFromDb(row.baseline_budget_minor),
     baselineFingerprint: row.baseline_fingerprint, nativeAutoOffAttested: row.native_auto_off_attested,
     noConcurrentChangesAttested: row.no_concurrent_changes_attested, authorizedAt, status, operationId, lastOutcome, lastVerifiedAt, stopReason };
   if (row.evidence_mode === undefined || typeof row.auto_detect_live !== "boolean" || typeof row.allow_exhausted_recovery !== "boolean" ||
     typeof row.keep_auto_across_rooms !== "boolean" ||
+    (row.baseline_non_roi_settings_fingerprint !== null && !identifier(row.baseline_non_roi_settings_fingerprint, FINGERPRINT)) ||
     !validScopedSession(value as CreatorContinuousAutoBudgetSession, clientId) ||
     (status !== "ACTIVE" && status !== "BLOCKED" && status !== "STOPPED") ||
     (operationId !== null && !identifier(operationId, WEB_BUDGET_OPERATION_ID)) ||
@@ -568,6 +603,7 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
       await runner.query(CREATOR_CONTINUOUS_AUTO_DETECT_SCHEMA_SQL);
       await runner.query(CREATOR_CONTINUOUS_EXHAUSTED_RECOVERY_SCHEMA_SQL);
       await runner.query(CREATOR_CONTINUOUS_KEEP_ROOMS_SCHEMA_SQL);
+      await runner.query(CREATOR_CONTINUOUS_NON_ROI_SETTINGS_SCHEMA_SQL);
     }); },
     async getActive() {
       // Includes stopped sessions whose already reserved operation still needs reconciliation.
@@ -584,15 +620,16 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
       return run(async runner => one(await runner.query(`INSERT INTO ${SESSION}
         (session_id,client_id,owner_id,campaign_id,policy_revision,baseline_budget_minor,baseline_fingerprint,live_session_id,
          authorized_at,native_auto_off_attested,no_concurrent_changes_attested,evidence_mode,auto_detect_live,allow_exhausted_recovery,
-         keep_auto_across_rooms,last_bound_room_started_at,baseline_settings_fingerprint)
-        SELECT $1::uuid,'punpan_020',$2,$3,$4,$5,$6,$7,date_trunc('milliseconds',clock_timestamp()),$8,$9,$10,$11,$12,$13,$14::timestamptz,$15
+         keep_auto_across_rooms,last_bound_room_started_at,baseline_settings_fingerprint,baseline_non_roi_settings_fingerprint)
+        SELECT $1::uuid,'punpan_020',$2,$3,$4,$5,$6,$7,date_trunc('milliseconds',clock_timestamp()),$8,$9,$10,$11,$12,$13,$14::timestamptz,$15,$16
         WHERE NOT EXISTS (SELECT 1 FROM creator_continuous_auto_budget_attempts
           WHERE client_id='punpan_020' AND campaign_id=$3 AND baseline_fingerprint=$6 AND (NOT retry_released OR ($10<>'spend-trend' AND NOT $13::boolean)))
         ON CONFLICT DO NOTHING RETURNING *`,
       [input.sessionId, input.ownerId, input.campaignId, input.policyRevision, input.baselineBudgetMinor,
         input.baselineFingerprint, input.liveSessionId, input.nativeAutoOffAttested, input.noConcurrentChangesAttested,
         input.evidenceMode ?? "verified-room", input.autoDetectLive === true, input.allowExhaustedRecovery === true,
-        input.keepAutoAcrossRooms === true, input.lastBoundRoomStartedAt ?? null, input.baselineSettingsFingerprint ?? null])));
+        input.keepAutoAcrossRooms === true, input.lastBoundRoomStartedAt ?? null, input.baselineSettingsFingerprint ?? null,
+        input.baselineNonRoiSettingsFingerprint ?? null])));
     },
     async bindLiveSession(session: CreatorContinuousAutoBudgetSession, liveSessionId: string) {
       if (!allowsScheduledCreatorAuto(clientId) || !validSession(session) || !awaitingLive(session) || session.status !== "ACTIVE" || session.keepAutoAcrossRooms ||
@@ -609,24 +646,35 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
     },
     async advanceContinuousSession(session: CreatorContinuousAutoBudgetSession, next: {
       liveSessionId: string | null; lastBoundRoomStartedAt?: string; budgetMinor: number; fingerprint: string; settingsFingerprint: string; policyRevision: number;
+      nonRoiSettingsFingerprint?: string;
     }) {
-      if (!validSession(session) || session.keepAutoAcrossRooms !== true || session.status !== "ACTIVE" || session.operationId !== null ||
-        !positive(next.policyRevision) || next.policyRevision < session.policyRevision || next.settingsFingerprint !== session.baselineSettingsFingerprint ||
+      if (!validSession(session) || session.keepAutoAcrossRooms !== true || session.status !== "ACTIVE" || session.operationId !== null) return null;
+      const priorNonRoi = session.baselineNonRoiSettingsFingerprint;
+      const nextNonRoi = next.nonRoiSettingsFingerprint;
+      const settingsChanged = next.settingsFingerprint !== session.baselineSettingsFingerprint;
+      if (!positive(next.policyRevision) || next.policyRevision < session.policyRevision || !identifier(next.settingsFingerprint, FINGERPRINT) ||
+        (nextNonRoi !== undefined && (!identifier(nextNonRoi, FINGERPRINT) || (priorNonRoi !== undefined && nextNonRoi !== priorNonRoi))) ||
+        (settingsChanged && (priorNonRoi === undefined || nextNonRoi !== priorNonRoi)) ||
         !positive(next.budgetMinor, WEB_BUDGET_MAX_MINOR) || !identifier(next.fingerprint, FINGERPRINT) ||
-        (next.budgetMinor !== session.baselineBudgetMinor && next.fingerprint === session.baselineFingerprint) ||
+        ((next.budgetMinor !== session.baselineBudgetMinor || settingsChanged) && next.fingerprint === session.baselineFingerprint) ||
         (next.liveSessionId !== null && !identifier(next.liveSessionId, WEB_BUDGET_CAMPAIGN_ID))) return null;
       const attachNew = next.liveSessionId !== null && next.liveSessionId !== session.liveSessionId;
       const priorLaunch = session.lastBoundRoomStartedAt;
       const nextLaunch = next.lastBoundRoomStartedAt ?? (attachNew ? undefined : priorLaunch);
       if (attachNew ? (!nextLaunch || !validAuthorizedAt(nextLaunch) || (priorLaunch && nextLaunch <= priorLaunch)) : nextLaunch !== priorLaunch) return null;
       if (next.liveSessionId === session.liveSessionId && next.budgetMinor === session.baselineBudgetMinor &&
-        next.fingerprint === session.baselineFingerprint && next.policyRevision === session.policyRevision) return null;
+        next.fingerprint === session.baselineFingerprint && next.policyRevision === session.policyRevision &&
+        !settingsChanged && (nextNonRoi === undefined || nextNonRoi === priorNonRoi)) return null;
       // Advances observation only; never changes authority, lease, verification or an unresolved operation.
       return run(async runner => one(await runner.query(`UPDATE ${SESSION} s
         SET live_session_id=$14::text,last_bound_room_started_at=$15::timestamptz,
-          baseline_budget_minor=$16,baseline_fingerprint=$17,policy_revision=$18::bigint,updated_at=clock_timestamp()
+          baseline_budget_minor=$16,baseline_fingerprint=$17,policy_revision=$18::bigint,baseline_settings_fingerprint=$19,
+          baseline_non_roi_settings_fingerprint=COALESCE(s.baseline_non_roi_settings_fingerprint,$20::text),updated_at=clock_timestamp()
         WHERE ${EXACT_BASE} AND s.live_session_id IS NOT DISTINCT FROM $8::text
           AND s.last_bound_room_started_at IS NOT DISTINCT FROM $9::timestamptz AND s.baseline_settings_fingerprint=$10
+          AND s.baseline_non_roi_settings_fingerprint IS NOT DISTINCT FROM $21::text
+          AND ($20::text IS NULL OR s.baseline_non_roi_settings_fingerprint IS NULL OR s.baseline_non_roi_settings_fingerprint=$20)
+          AND (s.baseline_settings_fingerprint=$19 OR (s.baseline_non_roi_settings_fingerprint=$20 AND s.baseline_fingerprint<>$17))
           AND s.allow_exhausted_recovery=$11::boolean AND s.last_verified_at IS NOT DISTINCT FROM $12::timestamptz
           AND s.last_outcome IS NOT DISTINCT FROM $13::text AND s.keep_auto_across_rooms AND s.auto_detect_live
           AND s.evidence_mode='${LIVE_ROOM_SPEND_TREND}' AND s.native_auto_off_attested AND s.no_concurrent_changes_attested
@@ -638,8 +686,9 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
             AND a.campaign_id=s.campaign_id AND a.baseline_fingerprint=$17 AND NOT a.retry_released)
           AND NOT EXISTS (SELECT 1 FROM creator_web_budget_operations w WHERE w.client_id=s.client_id
             AND (w.status='OUTCOME_UNKNOWN' OR (w.status='PROCESSING' AND (w.mode='live' OR w.expires_at > clock_timestamp()))))
-        RETURNING s.*`, [...args(session), priorLaunch ?? null, next.settingsFingerprint, session.allowExhaustedRecovery === true,
-        session.lastVerifiedAt, session.lastOutcome, next.liveSessionId, nextLaunch ?? null, next.budgetMinor, next.fingerprint, next.policyRevision])));
+        RETURNING s.*`, [...args(session), priorLaunch ?? null, session.baselineSettingsFingerprint, session.allowExhaustedRecovery === true,
+        session.lastVerifiedAt, session.lastOutcome, next.liveSessionId, nextLaunch ?? null, next.budgetMinor, next.fingerprint, next.policyRevision,
+        next.settingsFingerprint, nextNonRoi ?? null, priorNonRoi ?? null])));
     },
     async adoptBaseline(session: CreatorContinuousAutoBudgetSession, next: { budgetMinor: number; fingerprint: string; policyRevision: number }) {
       if (!validSession(session) || session.evidenceMode !== "spend-trend" || session.status !== "ACTIVE" ||

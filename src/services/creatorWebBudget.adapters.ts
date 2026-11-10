@@ -18,7 +18,7 @@ const MAX_BODY = 1_048_576;
 type Data = Record<string, unknown>;
 type Native = "DISABLED" | "UNKNOWN" | "ENABLED" | "CONFLICT";
 type CampaignListObservation = { stamp: string; campaignDeliveryStatus?: WebBudgetContext["campaignDeliveryStatus"] };
-type Sample = { budgetMinor: number; stamp: string; unchanged: string; fingerprint: string; native: Native;
+type Sample = { budgetMinor: number; stamp: string; unchanged: string; nonRoiSettingsFingerprint: string; fingerprint: string; native: Native;
   scheduleStartAt: string; scheduleEndAt: string | null; campaignDeliveryStatus?: WebBudgetContext["campaignDeliveryStatus"] };
 type Policy = Awaited<ReturnType<WebBudgetAdapters["readPolicy"]>>;
 
@@ -260,8 +260,12 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     if (listed === null) unverified();
     const { stamp, campaignDeliveryStatus: delivery } = listed;
     const native = nativeState(data), unchanged = hash(untouched);
+    // Preserve the exact existing writer/readback fingerprint. The separate
+    // persistent-session evidence excludes only the validated top-level ROI.
+    const { roas_bid: _roi, ...nonRoiSettings } = untouched;
+    const nonRoiSettingsFingerprint = hash(nonRoiSettings);
     // Delivery is provider-derived and can change without any campaign edit.
-    return { budgetMinor, stamp, unchanged, native, fingerprint: hash([budgetMinor, stamp, unchanged]), scheduleStartAt, scheduleEndAt,
+    return { budgetMinor, stamp, unchanged, nonRoiSettingsFingerprint, native, fingerprint: hash([budgetMinor, stamp, unchanged]), scheduleStartAt, scheduleEndAt,
       ...(delivery === undefined ? {} : { campaignDeliveryStatus: delivery }) };
   }
 
@@ -292,7 +296,7 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     if (!live || (live.scheduleEndAt !== null && Date.parse(live.scheduleEndAt) <= observed.getTime())) return null;
     if (live.budgetMinor > WEB_BUDGET_MAX_MINOR) unverified();
     return { campaignId: expectedCampaignId, reportingDate, observedAt: observed.toISOString(), budgetMinor: live.budgetMinor,
-      fingerprint: live.fingerprint, settingsFingerprint: live.unchanged, nativeAutoState: live.native,
+      fingerprint: live.fingerprint, settingsFingerprint: live.unchanged, nonRoiSettingsFingerprint: live.nonRoiSettingsFingerprint, nativeAutoState: live.native,
       scheduleStartAt: live.scheduleStartAt, scheduleEndAt: live.scheduleEndAt };
   }
 
@@ -338,7 +342,8 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
       { deliveryVerified: false, liveDeliveryState: "UNKNOWN" as const, liveSessionId: null };
     return { campaignId: expectedCampaignId, reportingDate: raw.reportingDate as string, observedAt: raw.observedAt,
       budgetMinor: live.budgetMinor, spendMinor: c.spendMinor, aggregateSpendMinor: quality.aggregateSpendMinor,
-      fingerprint: live.fingerprint, settingsFingerprint: live.unchanged, nativeAutoState: live.native, providerSpendObservedAt: null,
+      fingerprint: live.fingerprint, settingsFingerprint: live.unchanged, nonRoiSettingsFingerprint: live.nonRoiSettingsFingerprint,
+      nativeAutoState: live.native, providerSpendObservedAt: null,
       ...(live.campaignDeliveryStatus === undefined ? {} : { campaignDeliveryStatus: live.campaignDeliveryStatus }), ...room, sample: live };
   }
 
