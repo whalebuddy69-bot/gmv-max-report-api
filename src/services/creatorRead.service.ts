@@ -8,6 +8,7 @@ export const CREATOR_APP_ID = "7667234745498992657";
 const BASE = "https://business-api.tiktok.com/open_api/v1.3";
 const ENDPOINTS = new Set(["/gmv_max/campaign/get/", "/campaign/gmv_max/info/", "/report/integrated/get/"]);
 const GMV_DAY_REPORT = "/gmv_max/report/get/";
+const MAX_ENABLED_DETAIL_CANDIDATES = 3;
 type Row = Record<string, any>;
 export class CreatorReadError extends Error {
   constructor(readonly code: string) { super(code); }
@@ -41,6 +42,9 @@ export function campaignSchedule(info: Record<string, unknown>): { scheduleStart
   if (info.schedule_type !== "SCHEDULE_START_END" && info.schedule_type !== "START_END") return unavailable;
   const end = scheduleIso(info.schedule_end_time);
   return end && end > start ? { scheduleStartAt: start, scheduleEndAt: end } : unavailable;
+}
+function scheduleEnded(end: unknown, at: Date): boolean {
+  return typeof end === "string" && Date.parse(end) <= at.getTime();
 }
 // The verified without-Shop Creator campaign returns literal string "0" in
 // top-level Shop fields. Zero is not a valid positive TikTok resource ID.
@@ -126,10 +130,11 @@ function createReader({ loadToken, fetchImpl = fetch, now = () => new Date(), sl
     const accessToken = await loadToken();
     if (typeof accessToken !== "string" || accessToken.length < 16) throw new CreatorReadError("CREDENTIAL_UNAVAILABLE");
     const deadline = Date.now() + 18_000;
+    const maxCalls = manualPpanZero ? 13 : 10;
     let calls = 0, lastStart = 0;
     async function get(endpoint: string, params: Row): Promise<Row> {
       if (!(ENDPOINTS.has(endpoint) || (verifyAdvertiser && endpoint === "/advertiser/info/") || (manualPpanZero && endpoint === GMV_DAY_REPORT)) ||
-        ++calls > (manualPpanZero ? 13 : 10) || Date.now() >= deadline) throw new CreatorReadError("REQUEST_BOUNDARY");
+        ++calls > maxCalls || Date.now() >= deadline) throw new CreatorReadError("REQUEST_BOUNDARY");
       if (lastStart) await sleep(Math.max(0, 500 - (Date.now() - lastStart)));
       lastStart = Date.now();
       const url = new URL(BASE + endpoint);
@@ -166,7 +171,7 @@ function createReader({ loadToken, fetchImpl = fetch, now = () => new Date(), sl
         filtering: { gmv_max_promotion_types: ["LIVE_GMV_MAX"] },
         fields: ["advertiser_id", "campaign_id", "campaign_name", "operation_status"], page, page_size: 100 });
       const info = data.page_info;
-      if (verifyAdvertiser && data.advertiser_id !== undefined && data.advertiser_id !== binding.advertiserId) {
+      if (data.advertiser_id !== undefined && data.advertiser_id !== binding.advertiserId) {
         throw new CreatorReadError("CAMPAIGN_SCOPE_UNVERIFIED");
       }
       if (!Array.isArray(data.list) || data.list.length > 100 || info?.page !== page || !Number.isSafeInteger(info?.total_page)
@@ -184,31 +189,50 @@ function createReader({ loadToken, fetchImpl = fetch, now = () => new Date(), sl
     }
     if (campaigns.length !== expectedCount) throw new CreatorReadError("CAMPAIGN_TOTAL_UNVERIFIED");
     const enabled = campaigns.filter(row => row.operation_status === "ENABLE");
-    if (enabled.length > 1) throw new CreatorReadError("MULTIPLE_ENABLED_CAMPAIGNS_REVIEW_REQUIRED");
+    const ambiguous = () => { throw new CreatorReadError("MULTIPLE_ENABLED_CAMPAIGNS_REVIEW_REQUIRED"); };
+    const observationTime = () => {
+      const at = now();
+      if (bangkokDay(at) !== date) throw new CreatorReadError("REPORTING_DAY_CHANGED_RETRY");
+      return at;
+    };
     if (!enabled.length) {
-      if (bangkokDay(now()) !== date) throw new CreatorReadError("REPORTING_DAY_CHANGED_RETRY");
-      return { ...base, observedAt: now().toISOString() };
+      return { ...base, observedAt: observationTime().toISOString() };
     }
-    const campaignId = enabled[0].campaign_id;
-    const info = await get("/campaign/gmv_max/info/", { advertiser_id: binding.advertiserId, campaign_id: campaignId });
-    // The supplied TikTok account number is display metadata. The advertiser
-    // and exact BC-authorized identity, not that number, scope the provider read.
-    if (info.campaign_id !== campaignId || info.advertiser_id !== binding.advertiserId || info.shopping_ads_type !== "LIVE" || info.operation_status !== "ENABLE"
-      || !noShop(info.store_id) || !noShop(info.store_authorized_bc_id)
-      || !Array.isArray(info.identity_list) || info.identity_list.length !== 1
-      || info.identity_list[0]?.identity_id !== binding.identityId || info.identity_list[0].identity_type !== binding.identityType
-      || info.identity_list[0].identity_authorized_bc_id !== binding.identityAuthorizedBcId
-      || (monitorOnly && binding.tiktokAccountId !== null &&
-        [info.tiktok_account_id, info.identity_list[0].tiktok_account_id].some(value => value !== undefined && value !== binding.tiktokAccountId))
-      || !noShop(info.identity_list[0].store_id) || !noShop(info.identity_list[0].identity_authorized_shop_id)) throw new CreatorReadError("CREATOR_IDENTITY_BINDING_UNVERIFIED");
+    const compareSchedules = enabled.length > 1;
+    // Never spend the reserved report-page budget on campaign detail fan-out.
+    if (compareSchedules && (enabled.length > MAX_ENABLED_DETAIL_CANDIDATES || calls + enabled.length + (manualPpanZero ? 6 : 3) > maxCalls)) ambiguous();
+    const verified: Array<{ campaignId: string; info: Row; schedule: ReturnType<typeof campaignSchedule> }> = [];
+    for (const row of enabled) {
+      const campaignId = row.campaign_id;
+      const info = await get("/campaign/gmv_max/info/", { advertiser_id: binding.advertiserId, campaign_id: campaignId });
+      // The advertiser and exact BC-authorized no-Shop identity must be proven
+      // even for a row we might discard. A different account's end is no proof.
+      if (info.campaign_id !== campaignId || info.advertiser_id !== binding.advertiserId || info.shopping_ads_type !== "LIVE" || info.operation_status !== "ENABLE"
+        || !noShop(info.store_id) || !noShop(info.store_authorized_bc_id)
+        || !Array.isArray(info.identity_list) || info.identity_list.length !== 1
+        || info.identity_list[0]?.identity_id !== binding.identityId || info.identity_list[0].identity_type !== binding.identityType
+        || info.identity_list[0].identity_authorized_bc_id !== binding.identityAuthorizedBcId
+        || ((monitorOnly || compareSchedules) && binding.tiktokAccountId !== null &&
+          [info.tiktok_account_id, info.identity_list[0].tiktok_account_id].some(value => value !== undefined && value !== binding.tiktokAccountId))
+        || !noShop(info.identity_list[0].store_id) || !noShop(info.identity_list[0].identity_authorized_shop_id)) throw new CreatorReadError("CREATOR_IDENTITY_BINDING_UNVERIFIED");
+      const schedule = campaignSchedule(info);
+      // A lone legacy row may omit a schedule; unknown never resolves ambiguity.
+      if (compareSchedules && schedule.scheduleStartAt === null) ambiguous();
+      verified.push({ campaignId, info, schedule });
+    }
+    const selectedAt = observationTime();
+    const candidates = verified.filter(({ schedule }) => !scheduleEnded(schedule.scheduleEndAt, selectedAt));
+    if (candidates.length > 1) ambiguous();
+    if (!candidates.length) return { ...base, observedAt: selectedAt.toISOString() };
+    const { campaignId, info, schedule } = candidates[0];
     if (typeof info.roas_bid !== "number" || !Number.isFinite(info.roas_bid) || info.roas_bid <= 0) throw new CreatorReadError("ROI_TARGET_UNVERIFIED");
     const budget = minor(info.budget);
     if (budget <= 0) throw new CreatorReadError("BUDGET_UNVERIFIED");
-    base.campaign = { campaignId, campaignName: clean(info.campaign_name)?.split(accessToken).join("[REDACTED]") ?? null, status: "ACTIVE", operationStatus: "ENABLE", currency: "THB",
-      dailyBudgetMinor: budget, targetRoi: info.roas_bid, spendMinor: null, gmvMinor: null, roi: null, liveViews: null,
-      ...campaignSchedule(info) };
+    const campaign: Row = { campaignId, campaignName: clean(info.campaign_name)?.split(accessToken).join("[REDACTED]") ?? null,
+      status: "ACTIVE", operationStatus: "ENABLE", currency: "THB", dailyBudgetMinor: budget, targetRoi: info.roas_bid,
+      spendMinor: null, gmvMinor: null, roi: null, liveViews: null, ...schedule };
     const native = info.auto_budget?.auto_budget_enabled ?? info.auto_budget_enabled;
-    base.nativeAutoBudgetState = native === true ? "ENABLED" : native === false ? "DISABLED" : "UNKNOWN";
+    const quality = { ...base.quality };
     try {
       let aggregate = 0, rowCount = 0, expectedRows: number | undefined, reportPages: number | undefined;
       const dimensions = new Set<string>();
@@ -255,15 +279,19 @@ function createReader({ loadToken, fetchImpl = fetch, now = () => new Date(), sl
         await verifyPpanManualZero(get, CREATOR_BINDING, date, campaignId, spendByCampaign);
         target = 0;
       }
-      base.campaign.spendMinor = target;
-      base.quality.aggregateSpendMinor = aggregate;
-      base.quality.aggregateSpendComplete = true;
-    } catch (error) { base.quality.spendError = error instanceof CreatorReadError ? error.code : "SPEND_UNAVAILABLE"; }
-    if (bangkokDay(now()) !== date) throw new CreatorReadError("REPORTING_DAY_CHANGED_RETRY");
-    return { ...base, observedAt: now().toISOString() };
+      campaign.spendMinor = target;
+      quality.aggregateSpendMinor = aggregate;
+      quality.aggregateSpendComplete = true;
+    } catch (error) { quality.spendError = error instanceof CreatorReadError ? error.code : "SPEND_UNAVAILABLE"; }
+    const observedAt = observationTime();
+    if (scheduleEnded(schedule.scheduleEndAt, observedAt)) return { ...base, observedAt: observedAt.toISOString() };
+    return { ...base, campaign, quality, nativeAutoBudgetState: native === true ? "ENABLED" : native === false ? "DISABLED" : "UNKNOWN",
+      observedAt: observedAt.toISOString() };
   }
   return async function snapshot(): Promise<Row> {
-    if (cached && Date.now() - cached.at < 10_000 && cached.value.reportingDate === bangkokDay(now())) return cached.value;
+    const at = now();
+    if (cached && Date.now() - cached.at < 10_000 && cached.value.reportingDate === bangkokDay(at) &&
+      !scheduleEnded(cached.value.campaign?.scheduleEndAt, at)) return cached.value;
     if (!inFlight) inFlight = read().then(value => { cached = { at: Date.now(), value }; return value; }).finally(() => { inFlight = undefined; });
     return inFlight;
   };
