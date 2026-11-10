@@ -5,6 +5,7 @@ import { createCreatorContinuousAutoBudgetStore, type CreatorContinuousAutoBudge
 import { createCreatorWebBudgetStore } from "./creatorWebBudget.store";
 import type { WebBudgetProposal } from "./creatorWebBudget.service";
 import { createPpanAutoObservabilityStore } from "./ppanAutoObservability.store";
+import { LIVE_ROOM_SPEND_TREND } from "./creatorBudgetScope";
 
 const CAMPAIGN = "12000000000001";
 const ROOM = "12000000000002";
@@ -44,6 +45,22 @@ function draft(session: CreatorContinuousAutoBudgetSession, change: Partial<WebB
 }
 
 describe("Ppan Auto observability", () => {
+  it("defers only the older persistent context-read alert and retains the independent heartbeat and other health alerts", async () => {
+    const h = fixture(); await h.sessions.ensureSchema(); await h.obs.ensureSchema();
+    const session = (await h.sessions.arm({ sessionId: randomUUID(), ownerId: OWNER, campaignId: CAMPAIGN, liveSessionId: null,
+      policyRevision: 2, baselineBudgetMinor: 900_000, baselineFingerprint: OLD_FINGERPRINT, nativeAutoOffAttested: true,
+      noConcurrentChangesAttested: true, evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true, keepAutoAcrossRooms: true,
+      baselineSettingsFingerprint: OLD_FINGERPRINT }))!;
+    await h.db.query("UPDATE creator_continuous_auto_budget_sessions SET authorized_at=clock_timestamp()-interval '10 minutes' WHERE session_id=$1", [session.sessionId]);
+    await h.obs.recordTick({ sessionId: session.sessionId, checkedAt: new Date(Date.now() - 240_000).toISOString(), reason: "CONTEXT_UNAVAILABLE" });
+    expect((await h.obs.watchState(true)).incident?.kind).toBe("HEARTBEAT_STALE");
+    await h.obs.recordTick({ sessionId: session.sessionId, checkedAt: new Date(Date.now() - 20_000).toISOString(), reason: "CONTEXT_UNAVAILABLE" });
+    expect((await h.obs.watchState()).incident?.kind).toBe("CHECKS_FAILING");
+    expect((await h.obs.watchState(true)).incident).toBeNull();
+    await h.obs.recordTick({ sessionId: session.sessionId, checkedAt: new Date().toISOString(), reason: "LINE_NOT_READY" });
+    expect((await h.obs.watchState(true)).incident?.kind).toBe("CHECKS_FAILING");
+  });
+
   it("stores only completed ticks for the latest exact session and keeps the last valid read across later failures", async () => {
     const h = fixture(); await h.sessions.ensureSchema(); await h.web.ensureSchema();
     await expect(h.obs.status(OWNER)).rejects.toThrow("PPAN_AUTO_OBSERVABILITY_UNAVAILABLE");

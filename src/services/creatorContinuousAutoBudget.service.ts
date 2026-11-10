@@ -10,6 +10,14 @@ import { WEB_BUDGET_CAMPAIGN_ID, WEB_BUDGET_MAX_MINOR, WebBudgetError,
 
 type Sessions = ReturnType<typeof createCreatorContinuousAutoBudgetStore>;
 type Session = NonNullable<Awaited<ReturnType<Sessions["getLatest"]>>>;
+type CheckOutcome = "CHECK_FAILED" | "CHECK_VERIFIED" | "NORMAL_HOLD";
+export interface CreatorAutoCheckObservation {
+  sessionId: string;
+  ownerId: number;
+  authorizedAt: string;
+  checkedAt: string;
+  outcome: CheckOutcome;
+}
 type EvidenceMode = ContinuousEvidence;
 type ArmInput = { expectedCampaignId: string; expectedBudgetMinor: number; expectedPolicyRevision: number } & (
   { expectedLiveSessionId: string | null; nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: typeof LIVE_ROOM_SPEND_TREND; autoDetectLive?: true; allowExhaustedRecovery?: true; keepAutoAcrossRooms?: true } |
@@ -118,12 +126,13 @@ function scheduledBlockers(ctx: WebBudgetPreArmContext, policy: WebBudgetPolicy,
   return reasons;
 }
 
-export function createCreatorContinuousAutoBudgetService({ mode, discover, adapters, sessions, writer, ledger, recheckOwner, legacyBusy, observeTick,
+export function createCreatorContinuousAutoBudgetService({ mode, discover, adapters, sessions, writer, ledger, recheckOwner, legacyBusy, observeTick, observeCheckHealth,
   clientId = CLIENT, evidenceMode = () => "verified-room", scheduledLive, now = () => new Date() }: {
   mode: () => Mode; discover: () => Promise<string | null>; adapters: WebBudgetAdapters; sessions: Sessions;
   writer: ReturnType<typeof createCreatorWebBudgetService>; ledger: WebBudgetStore;
   recheckOwner: (id: number, authorizedAt: string) => Promise<boolean>; legacyBusy: () => Promise<boolean>;
   observeTick?: (event: PpanAutoTickObservation) => Promise<unknown>;
+  observeCheckHealth?: (event: CreatorAutoCheckObservation) => Promise<unknown>;
   clientId?: CreatorContinuousAutoBudgetClient; evidenceMode?: () => EvidenceMode; scheduledLive?: () => boolean; now?: () => Date;
 }) {
   if (!isContinuousCreatorBudgetScope(clientId)) throw new Error("CREATOR_CONTINUOUS_AUTO_SCOPE_UNSUPPORTED");
@@ -193,23 +202,25 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     const full = await read(campaign, LIVE_ROOM_SPEND_TREND, undefined, true).catch(() => null);
     const checked = full ?? await readDetected(campaign);
     const { context, policy, fenced } = checked, at = now();
-    const hold = (reason: PpanAutoTickReason, detail?: string) => ({ full: null, reason, detail });
-    if (!context) return hold("CAMPAIGN_ENDED", "CAMPAIGN_NOT_VISIBLE");
+    const hold = (reason: PpanAutoTickReason, readOutcome: CheckOutcome, detail?: string) => ({ full: null, reason, detail, readOutcome });
+    if (!context) return hold("CAMPAIGN_ENDED", "NORMAL_HOLD", "CAMPAIGN_NOT_VISIBLE");
     if (context.campaignId !== campaign || !freshContext(context, at) || !validAmount(context.budgetMinor) ||
-      !validSettingsFingerprint(context.fingerprint) || !freshPolicy(policy, at)) return hold("CONTEXT_UNAVAILABLE");
-    if (context.nativeAutoState !== "DISABLED" && context.nativeAutoState !== "UNKNOWN") return hold("NATIVE_AUTO_CONFLICT");
+      !validSettingsFingerprint(context.fingerprint) || !freshPolicy(policy, at)) return hold("CONTEXT_UNAVAILABLE", "CHECK_FAILED");
+    if (context.nativeAutoState !== "DISABLED" && context.nativeAutoState !== "UNKNOWN") return hold("NATIVE_AUTO_CONFLICT", "NORMAL_HOLD");
     const { settingsFingerprint, nonRoiSettingsFingerprint } = context;
-    if (!validSettingsFingerprint(settingsFingerprint) || !validSettingsFingerprint(nonRoiSettingsFingerprint)) return hold("CONTEXT_UNAVAILABLE");
+    if (!validSettingsFingerprint(settingsFingerprint) || !validSettingsFingerprint(nonRoiSettingsFingerprint)) return hold("CONTEXT_UNAVAILABLE", "CHECK_FAILED");
     const settingsHold = persistentSettingsHold(context, row);
-    if (settingsHold) return hold(settingsHold === "CONTEXT_UNAVAILABLE" ? "CONTEXT_UNAVAILABLE" : "BASELINE_CHANGED", settingsHold);
-    if (fenced || policy.locked) return hold("WRITE_LOCKED");
+    if (settingsHold) return hold("BASELINE_CHANGED", "NORMAL_HOLD", settingsHold);
+    if (fenced || policy.locked) return hold("WRITE_LOCKED", "NORMAL_HOLD");
     let room = row.liveSessionId, start = row.lastBoundRoomStartedAt;
     const current = verifiedDetectedRoom(context, at) ? context : null;
-    if (current && current.liveSessionId === room && current.liveSessionStartedAt !== start) return hold("LIVE_DELIVERY_UNVERIFIED");
+    let knownIdle = context.roomReportEmpty === true || verifiedEnded(context) ||
+      ("scheduleStartAt" in context && instant(context.scheduleStartAt) > at.getTime());
+    if (current && current.liveSessionId === room && current.liveSessionStartedAt !== start) return hold("LIVE_DELIVERY_UNVERIFIED", "CHECK_FAILED");
     if (current && current.liveSessionId !== room) {
       // Do not re-attach to a previously ended room or go back to an earlier
       // room just because TikTok is momentarily serving an old report.
-      if (start && instant(current.liveSessionStartedAt) <= instant(start)) return hold("LIVE_DELIVERY_UNVERIFIED");
+      if (start && instant(current.liveSessionStartedAt) <= instant(start)) return hold("LIVE_DELIVERY_UNVERIFIED", "CHECK_FAILED");
       room = current.liveSessionId;
       start = current.liveSessionStartedAt;
     } else if (!current && room) {
@@ -218,18 +229,21 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       const prior = await readDetected(campaign, room).catch(() => null);
       if (prior?.context && validScheduledContext(prior.context, campaign, now()) &&
         prior.context.fingerprint === context.fingerprint && prior.context.settingsFingerprint === context.settingsFingerprint &&
-        verifiedEnded(prior.context)) room = null;
+        verifiedEnded(prior.context)) { room = null; knownIdle = true; }
     }
+    const readOutcome: CheckOutcome = current ? (full && typeof current.roomSpendMinor === "number" &&
+      Number.isSafeInteger(current.roomSpendMinor) && current.roomSpendMinor >= 0 ? "CHECK_VERIFIED" : "CHECK_FAILED")
+      : knownIdle ? "NORMAL_HOLD" : "CHECK_FAILED";
     if (room !== row.liveSessionId || start !== row.lastBoundRoomStartedAt || context.budgetMinor !== row.baselineBudgetMinor ||
       context.fingerprint !== row.baselineFingerprint || policy.revision !== row.policyRevision ||
       settingsFingerprint !== row.baselineSettingsFingerprint || nonRoiSettingsFingerprint !== row.baselineNonRoiSettingsFingerprint) {
       const advanced = await sessions.advanceContinuousSession(row, { liveSessionId: room, lastBoundRoomStartedAt: start,
         budgetMinor: context.budgetMinor, fingerprint: context.fingerprint, settingsFingerprint,
         nonRoiSettingsFingerprint, policyRevision: policy.revision });
-      return advanced ? hold(room ? "SPEND_UPDATE_PENDING" : "LIVE_DELIVERY_UNVERIFIED") : hold("WRITE_LOCKED");
+      return advanced ? hold(room ? "SPEND_UPDATE_PENDING" : "LIVE_DELIVERY_UNVERIFIED", readOutcome) : hold("WRITE_LOCKED", "NORMAL_HOLD");
     }
-    if (!current || !room || !full) return hold(current ? "SPEND_UPDATE_PENDING" : "LIVE_DELIVERY_UNVERIFIED");
-    return { full, reason: "SPEND_UPDATE_PENDING" as const, detail: undefined };
+    if (!current || !room || !full || readOutcome === "CHECK_FAILED") return hold(current ? "SPEND_UPDATE_PENDING" : "LIVE_DELIVERY_UNVERIFIED", readOutcome);
+    return { full, reason: "SPEND_UPDATE_PENDING" as const, detail: undefined, readOutcome };
   }
 
   async function status(operator: boolean, ownerId?: number, view?: "summary" | "detect-live") {
@@ -415,8 +429,10 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
   async function tick() {
     if (busy) return;
     busy = true;
+    const tickStartedAt = now().toISOString();
     let reason: PpanAutoTickReason = "ERROR", sessionId: string | null = null, lastValidReadAt: string | null = null;
     let publicDetail: string | undefined;
+    let checkHealth: CreatorAutoCheckObservation | undefined;
     try {
       const row = await sessions.getLatest();
       if (!row) { pulse = undefined; reason = "NOT_ARMED"; return; }
@@ -432,9 +448,12 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       if (row.status !== "ACTIVE" || !allowedEvidence(evidence)) { pulse = undefined; if (reason !== "AUTO_DISABLED") reason = "SESSION_STOPPED"; return; }
       if (!await recheckOwner(row.ownerId, row.authorizedAt)) { await sessions.stop(row.ownerId, row.sessionId, "AUTHORITY_REVOKED"); reason = "AUTHORITY_REVOKED"; return; }
       if (await legacyBusy()) { if (roomTrend) pulse = undefined; reason = "LEGACY_BUSY"; return; }
+      if (persistent && observeCheckHealth) checkHealth = { sessionId: row.sessionId, ownerId: row.ownerId,
+        authorizedAt: row.authorizedAt, checkedAt: tickStartedAt, outcome: "CHECK_FAILED" };
       reason = "CONTEXT_UNAVAILABLE";
       const campaign = await discover();
       if (campaign !== row.campaignId) {
+        if (checkHealth) checkHealth.outcome = "NORMAL_HOLD"; // a successful list read, not a provider error
         pulse = undefined; reason = "CAMPAIGN_ENDED";
         if (persistent) publicDetail = "CAMPAIGN_NOT_VISIBLE";
         else await sessions.stop(row.ownerId, row.sessionId, "CAMPAIGN_ENDED");
@@ -443,8 +462,9 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       // Legacy auto-detect binds only one room. Only the separate persistent
       // opt-in can move to a replacement room for the same campaign.
       const autoDetect = row.autoDetectLive === true;
-      if (autoDetect && !canAutoDetect()) { pulse = undefined; return; }
+      if (autoDetect && !canAutoDetect()) { pulse = undefined; checkHealth = undefined; return; }
       const tracking = persistent ? await trackPersistent(row, campaign) : null;
+      if (checkHealth && tracking) checkHealth.outcome = tracking.readOutcome;
       if (tracking && !tracking.full) {
         pulse = undefined; reason = tracking.reason; publicDetail = tracking.detail; return;
       }
@@ -508,8 +528,9 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
         return; // Never send on the first verified room/spend reading.
       }
       const { context, policy, fenced } = detectedFull ?? await read(campaign, evidence, row.liveSessionId ?? undefined), at = now();
-      if (context.campaignId !== campaign || !freshContext(context, at)) { pulse = undefined; return; }
+      if (context.campaignId !== campaign || !freshContext(context, at)) { pulse = undefined; if (checkHealth) checkHealth.outcome = "CHECK_FAILED"; return; }
       const verdict = preview(context, policy, at);
+      if (checkHealth && (verdict.status === "CONTEXT_UNVERIFIED" || verdict.status === "POLICY_UNAVAILABLE")) checkHealth.outcome = "CHECK_FAILED";
       if (verdict.status !== "CONTEXT_UNVERIFIED") lastValidReadAt = context.observedAt;
       reason = "ERROR";
       if (verifiedEnded(context) || (!trend && hasRoom(context) && context.liveSessionId !== row.liveSessionId)) {
@@ -584,7 +605,10 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
         "LIVE_DELIVERY_UNVERIFIED", "SPEND_UPDATE_PENDING", "SPEND_TREND_PENDING", "BELOW_THRESHOLD", "CAP_REACHED", "TARGET_UNAVAILABLE",
         "LEGACY_BUSY"].includes(reason) ? reason : undefined);
       lastTick = sessionId && display ? { sessionId, at: now().getTime(), reason: display } : undefined;
-      if (observeTick) await observeTick({ checkedAt: now().toISOString(), reason, sessionId, lastValidReadAt }).catch(() => undefined);
+      await Promise.all([
+        observeTick?.({ checkedAt: now().toISOString(), reason, sessionId, lastValidReadAt }).catch(() => undefined),
+        checkHealth && observeCheckHealth?.(checkHealth).catch(() => undefined),
+      ]);
     }
   }
   return { status, arm, stop, tick };

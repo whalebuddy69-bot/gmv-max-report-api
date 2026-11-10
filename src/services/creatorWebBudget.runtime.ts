@@ -1,17 +1,19 @@
 import { AppDataSource } from "../db/dataSource";
 import { createExtraCreatorTokenLoader, loadCreatorToken } from "../routes/creatorRead.route";
 import { createCreatorWebBudgetRouter, type ScopedCreatorBudgetServices } from "../routes/creatorWebBudget.route";
-import { createCreatorWebBudgetAdapters, createCreatorWebCapAdapters, readPpanAutoLineStatus } from "./creatorWebBudget.adapters";
+import { createCreatorWebBudgetAdapters, createCreatorWebCapAdapters, queueCreatorAutoCheckFailureAlert, readPpanAutoLineStatus } from "./creatorWebBudget.adapters";
 import { createCreatorWebBudgetService } from "./creatorWebBudget.service";
 import { createCreatorWebBudgetStore } from "./creatorWebBudget.store";
 import { parseExtraAutomationClients, parseVerifiedAutomationBindings } from "./creatorAutomationRegistry.service";
 import { createCreatorAutoBudgetGrantStore } from "./creatorAutoBudget.policy";
 import { createCreatorAutoBudgetService } from "./creatorAutoBudget.service";
-import { createCreatorContinuousAutoBudgetService } from "./creatorContinuousAutoBudget.service";
+import { createCreatorContinuousAutoBudgetService, type CreatorAutoCheckObservation } from "./creatorContinuousAutoBudget.service";
 import { createCreatorContinuousAutoBudgetStore } from "./creatorContinuousAutoBudget.store";
+import { createCreatorAutoCheckHealthStore } from "./creatorAutoCheckHealth.store";
+import { verifiedCreatorAutoAlertIdentity } from "./creatorAutoAdvertiserName.service";
 import { createPpanAutoObservabilityStore } from "./ppanAutoObservability.store";
 import { createPpanAutoWatchRouter } from "../routes/ppanAutoWatch.route";
-import { bangkokDay, createCreatorReader, createExtraCreatorReader } from "./creatorRead.service";
+import { bangkokDay, CREATOR_BINDING, createCreatorReader, createExtraCreatorReader } from "./creatorRead.service";
 import { parseAutomationViewerIds } from "../routes/automation.route";
 import { User } from "../entities/User";
 import { configuredCreatorAutoBudgetMode, configuredCreatorScheduledAutoLive, configuredCreatorWebBudgetMode, configuredPpanSpendTrendLive, configuredCreatorSpendTrendLive,
@@ -27,8 +29,9 @@ export function createCreatorWebBudgetRuntime() {
   const grants = createCreatorAutoBudgetGrantStore(AppDataSource);
   const sessions = createCreatorContinuousAutoBudgetStore(AppDataSource);
   const diagnostics = createPpanAutoObservabilityStore(AppDataSource);
+  const checkHealth = createCreatorAutoCheckHealthStore(AppDataSource);
   const lineConfirmed = new Set<string>();
-  let diagnosticsReady = false;
+  let diagnosticsReady = false, checkHealthReady = false;
   const viewerIds = () => process.env.CREATOR_AUTOMATION_VIEWER_USER_IDS;
   const operatorIds = () => process.env.CREATOR_AUTOMATION_OPERATOR_USER_IDS;
   async function recheckOwner(id: number, authorizedAt: string) {
@@ -36,6 +39,18 @@ export function createCreatorWebBudgetRuntime() {
     if (!allowed()) return false;
     const user = await AppDataSource.getRepository(User).findOne({ where: { id }, select: { id: true, isActive: true, passwordChangedAt: true } });
     return user?.isActive === true && user.passwordChangedAt instanceof Date && user.passwordChangedAt.getTime() <= Date.parse(authorizedAt) && allowed();
+  }
+  function observeCheckHealth(clientId: ContinuousCreatorBudgetScope, advertiserId: string) {
+    const identity = verifiedCreatorAutoAlertIdentity(clientId, advertiserId);
+    return async (event: CreatorAutoCheckObservation) => {
+      if (!checkHealthReady || !identity) return;
+      await checkHealth.record(clientId, event);
+      const pending = await checkHealth.pending(clientId);
+      if (!pending || pending.sessionId !== event.sessionId || !await recheckOwner(event.ownerId, event.authorizedAt)) return;
+      // A lost response is retried with the same scoped ID and immutable text.
+      await queueCreatorAutoCheckFailureAlert(clientId, { ...identity, incidentId: pending.incidentId });
+      await checkHealth.markDelivered(clientId, pending);
+    };
   }
   function makeRuntime(clientId: CreatorBudgetScope, adapters: ReturnType<typeof createCreatorWebBudgetAdapters>,
     reader: ReturnType<typeof createCreatorReader>) {
@@ -53,6 +68,7 @@ export function createCreatorWebBudgetRuntime() {
   const scheduledLive = (id: ContinuousCreatorBudgetScope) => continuousReady.has(id) && ledgerReady.has(id) && configuredCreatorScheduledAutoLive(process.env, id);
   const continuousAutoService = createCreatorContinuousAutoBudgetService({ sessions, writer: ppan.service, ledger: ppan.store,
     observeTick: event => diagnosticsReady ? diagnostics.recordTick(event) : Promise.resolve(),
+    observeCheckHealth: observeCheckHealth("punpan_020", CREATOR_BINDING.advertiserId),
     adapters: ppanAdapters, recheckOwner, scheduledLive: () => scheduledLive("punpan_020"), evidenceMode: () => configuredPpanSpendTrendLive() ? "spend-trend" : "verified-room", mode: () => {
       if (!continuousReady.has("punpan_020") || !ledgerReady.has("punpan_020")) return "disabled";
       if (configuredPpanSpendTrendLive()) return "live";
@@ -84,6 +100,7 @@ export function createCreatorWebBudgetRuntime() {
       const scopedSessions = createCreatorContinuousAutoBudgetStore(AppDataSource, clientId);
       const scopedAuto = createCreatorContinuousAutoBudgetService({ clientId, sessions: scopedSessions,
         writer: runtime.service, ledger: runtime.store, adapters, recheckOwner,
+        observeCheckHealth: observeCheckHealth(clientId, binding.advertiserId),
         scheduledLive: () => scheduledLive(clientId),
         evidenceMode: () => clientId === "srihiw" ? "spend-trend" : LIVE_ROOM_SPEND_TREND,
         mode: () => {
@@ -119,7 +136,7 @@ export function createCreatorWebBudgetRuntime() {
   return {
     router,
     watchRouter: createPpanAutoWatchRouter({ enabled: () => diagnosticsReady && process.env.CREATOR_READ_ENABLED === "true",
-      key: () => process.env.CREATOR_READ_BRIDGE_KEY ?? "", snapshot: () => diagnostics.watchState() }),
+      key: () => process.env.CREATOR_READ_BRIDGE_KEY ?? "", snapshot: () => diagnostics.watchState(checkHealthReady) }),
     async initialize(): Promise<boolean> {
       await Promise.all(allRuntimes.map(async ({ clientId, store }) => {
         // Even with all Ppan write/read switches off, a previous continuous
@@ -138,6 +155,9 @@ export function createCreatorWebBudgetRuntime() {
       }
       if (continuousReady.has("punpan_020")) {
         try { await diagnostics.ensureSchema(); diagnosticsReady = true; } catch { diagnosticsReady = false; }
+      }
+      if (continuousReady.size > 0) {
+        try { await checkHealth.ensureSchema(); checkHealthReady = true; } catch { checkHealthReady = false; }
       }
       if ((autoLedgerReady || continuousReady.size > 0) && !timer) timer = setInterval(() => {
         for (const { autoService } of allRuntimes) void autoService?.tick().catch(() => undefined);

@@ -95,7 +95,7 @@ function createPolicyRequest({ fetchImpl, env, clientId }: { fetchImpl: typeof f
   const fixedPath = creatorBudgetPolicyPath(clientId);
   if (!fixedPath) unverified();
   const url = POLICY_ORIGIN + fixedPath;
-  return async function policyRequest(path: "" | "/lease" | "/finish" | "/cap" | `/line-result/${string}`, body?: Data) {
+  return async function policyRequest(path: "" | "/lease" | "/finish" | "/cap" | "/check-failure-alert" | `/line-result/${string}`, body?: Data) {
     const key = env.CREATOR_WEB_POLICY_BRIDGE_KEY;
     if (!key || !/^[A-Za-z0-9_-]{43,100}$/.test(key) ||
       [env.CREATOR_READ_BRIDGE_KEY, env.CREATOR_BUDGET_TEST_KEY, env.INTERNAL_API_KEY, env.JWT_SECRET].includes(key)) unverified();
@@ -115,6 +115,19 @@ function createPolicyRequest({ fetchImpl, env, clientId }: { fetchImpl: typeof f
     }
     return data;
   };
+}
+
+/** Hand off a durable check incident; an acknowledgement is not a delivery receipt. */
+export async function queueCreatorAutoCheckFailureAlert(clientId: PolicyClient, input: {
+  incidentId: string; advertiserName: string; tiktokUsername: string;
+}, fetchImpl = fetch, env = process.env) {
+  const { incidentId, advertiserName, tiktokUsername } = input;
+  if (!UUID.test(incidentId) || typeof advertiserName !== "string" || !advertiserName || advertiserName.length > 120 ||
+    advertiserName.trim() !== advertiserName || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(advertiserName) ||
+    typeof tiktokUsername !== "string" || !/^[a-z0-9._]{1,40}$/.test(tiktokUsername)) unverified();
+  const reply = await createPolicyRequest({ fetchImpl, env, clientId })("/check-failure-alert", { incidentId, advertiserName, tiktokUsername, failedChecks: 10 });
+  if (reply.schemaVersion !== 1 || reply.clientId !== clientId || reply.incidentId !== incidentId ||
+    !["PENDING", "ACCEPTED", "UNCONFIRMED", "EXPIRED"].includes(String(reply.status))) unverified();
 }
 
 export async function readPpanAutoLineStatus(operationId: string, fetchImpl = fetch, env = process.env) {

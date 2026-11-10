@@ -108,6 +108,14 @@ describe("two-source current Creator room Auto evidence", () => {
     expect(h.fetchImpl).toHaveBeenCalledTimes(1);
   });
 
+  it("distinguishes an exact empty report from unreadable data without proving a room ended", async () => {
+    const h = setup(payload([]), { identity: IDENTITY });
+    await expect(h.read(AUTO_INPUT)).resolves.toEqual({ ...UNKNOWN, roomReportEmpty: true });
+    await expect(h.read({ ...AUTO_INPUT, expectedLiveSessionId: ROOM })).resolves.toEqual(UNKNOWN);
+    await expect(setup(payload([], { total_number: 1 }), { identity: IDENTITY }).read(AUTO_INPUT)).resolves.toEqual(UNKNOWN);
+    await expect(setup(payload([], {}, { advertiser_id: ADVERTISERS[1] }), { identity: IDENTITY }).read(AUTO_INPUT)).resolves.toEqual(UNKNOWN);
+  });
+
   it("cannot use any auto-detected result without a pinned authorized identity", async () => {
     const h = setup(payload([gm()]));
     await expect(h.read(AUTO_INPUT)).resolves.toEqual(UNKNOWN);

@@ -26,9 +26,12 @@ export type CreatorVerifiedLiveRoom = Readonly<{
   liveSessionStartedAt?: string;
   roomSpendMinor?: number;
   roomEvidenceIssue?: "STALE_ONGOING";
+  /** A successful, exactly scoped empty report, not evidence that a bound room ended. */
+  roomReportEmpty?: true;
 }>;
 
 const UNKNOWN: CreatorVerifiedLiveRoom = Object.freeze({ liveDeliveryState: "UNKNOWN", liveSessionId: null, deliveryVerified: false });
+const EMPTY_REPORT: CreatorVerifiedLiveRoom = Object.freeze({ ...UNKNOWN, roomReportEmpty: true });
 const STALE_ONGOING: CreatorVerifiedLiveRoom = Object.freeze({ ...UNKNOWN, roomEvidenceIssue: "STALE_ONGOING" });
 const NOT_LIVE: CreatorVerifiedLiveRoom = Object.freeze({ liveDeliveryState: "NOT_LIVE", liveSessionId: null, deliveryVerified: true });
 const isRecord = (value: unknown): value is Row => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -114,6 +117,9 @@ type AutoCandidate = { id: string; launched: number; spend?: number };
 function autoCandidate(payload: unknown, input: CreatorVerifiedLiveRoomInput, observedAt: Date): CreatorVerifiedLiveRoom | AutoCandidate {
   if (!isRecord(payload) || payload.code !== 0 || !isRecord(payload.data)) return UNKNOWN;
   const { list, page_info: page } = payload.data;
+  if (input.expectedLiveSessionId === undefined && sameScope(payload.data, input) && Array.isArray(list) && list.length === 0 &&
+    isRecord(page) && page.page === 1 && (page.page_size === undefined || page.page_size === PAGE_SIZE) &&
+    (page.total_page === 0 || page.total_page === 1) && page.total_number === 0) return EMPTY_REPORT;
   if (!sameScope(payload.data, input) || !Array.isArray(list) || list.length < 1 || list.length > PAGE_SIZE || !isRecord(page) ||
       page.page !== 1 || page.page_size !== PAGE_SIZE || page.total_page !== 1 || page.total_number !== list.length) return UNKNOWN;
   const seen = new Set<string>();

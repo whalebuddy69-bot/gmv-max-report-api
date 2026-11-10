@@ -120,10 +120,10 @@ LEFT JOIN ${EPOCH_TABLE} e ON e.client_id='${SCOPE}'`;
 // An independent monitor can read the same stable incident and reuse its single persisted retry key.
 // Do not use this service's in-process timer to claim availability monitoring when the process is down.
 const ALERT_CANDIDATE = `WITH latest AS (
-  SELECT session_id,authorized_at,status,operation_id,last_outcome FROM creator_continuous_auto_budget_sessions
+  SELECT session_id,authorized_at,status,operation_id,last_outcome,keep_auto_across_rooms FROM creator_continuous_auto_budget_sessions
   WHERE client_id='${SCOPE}' ORDER BY created_order DESC LIMIT 1
 ), findings AS (
-  SELECT s.session_id,f.kind,f.incident_key,f.priority
+  SELECT s.session_id,f.kind,f.incident_key,f.priority,s.keep_auto_across_rooms,h.reason AS health_reason
   FROM latest s LEFT JOIN ${HEALTH_TABLE} h ON h.client_id='${SCOPE}' AND h.session_id=s.session_id
   LEFT JOIN ${EPOCH_TABLE} e ON e.client_id='${SCOPE}'
   CROSS JOIN LATERAL (VALUES
@@ -224,14 +224,17 @@ export function createPpanAutoObservabilityStore(database: CreatorWebBudgetDatab
         return candidate;
       }, true);
     },
-    async watchState(): Promise<PpanAutoWatchState> {
+    async watchState(replacePersistentReadAlert = false): Promise<PpanAutoWatchState> {
       return run(async runner => {
         const [row] = asRows(await runner.query(`${ALERT_CANDIDATE}
           SELECT s.session_id,s.status,f.kind,f.incident_key FROM latest s LEFT JOIN LATERAL (
             SELECT f.kind,f.incident_key FROM findings f WHERE NOT EXISTS (SELECT 1 FROM ${ALERT_TABLE} a
               WHERE a.client_id='${SCOPE}' AND a.session_id=f.session_id AND a.kind=f.kind AND a.incident_key=f.incident_key
-                AND a.accepted_at IS NOT NULL) ORDER BY f.priority LIMIT 1
-          ) f ON true`));
+                AND a.accepted_at IS NOT NULL)
+              AND NOT ($1::boolean AND f.kind='CHECKS_FAILING' AND f.keep_auto_across_rooms
+                AND f.health_reason IS NOT DISTINCT FROM 'CONTEXT_UNAVAILABLE')
+            ORDER BY f.priority LIMIT 1
+          ) f ON true`, [replacePersistentReadAlert]));
         if (!row) return { armState: "INACTIVE", sessionId: null, incident: null };
         if (!exactId(row.session_id) || !["ACTIVE","BLOCKED","STOPPED"].includes(String(row.status))) throw new Error("PPAN_AUTO_OBSERVABILITY_SHAPE");
         const incident = row.kind == null ? null : { sessionId: row.session_id, kind: row.kind, incidentKey: row.incident_key };

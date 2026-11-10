@@ -110,7 +110,8 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
     readContext: vi.fn(async () => context),
     ...(scheduled ? { readPreArmContext: vi.fn(async () => preArmContext()) } : {}),
     ...(autoDetect ? { readAutoDetectContext: vi.fn(async () => ({ ...preArmContext(), deliveryVerified: context.deliveryVerified,
-      liveDeliveryState: context.liveDeliveryState, liveSessionId: context.liveSessionId, liveSessionStartedAt: context.liveSessionStartedAt })),
+      liveDeliveryState: context.liveDeliveryState, liveSessionId: context.liveSessionId, liveSessionStartedAt: context.liveSessionStartedAt,
+      roomReportEmpty: context.roomReportEmpty })),
       readScheduledLiveContext: vi.fn(async () => context) } : {}),
     acquireLease: vi.fn(async operationId => ({ ...policy, locked: true, operationId, expiresAt: ts(clock + 60_000) })),
     finishLease: vi.fn(async (operationId, outcome) => { if (outcome === "APPLIED_VERIFIED") lineOutbox.add(operationId); }),
@@ -118,13 +119,14 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
   };
   const discover = vi.fn<() => Promise<string | null>>(async () => CAMPAIGN);
   const observe = vi.fn(async (_tick: unknown) => {});
+  const observeCheckHealth = vi.fn(async (_tick: unknown) => {});
   const legacyBusy = vi.fn(async () => false);
   const now = () => new Date(clock);
   const writer = createCreatorWebBudgetService({ clientId, store: ledger, adapters, mode: () => "live", now });
   const service = createCreatorContinuousAutoBudgetService({ clientId, mode: () => mode, discover, adapters, sessions, writer,
     ledger, recheckOwner: async (owner, authorizedAt) => owner === OWNER && authorizedAt === session?.authorizedAt,
-    legacyBusy, evidenceMode: () => evidence, ...(scheduled ? { scheduledLive: () => mode === "live" } : {}), observeTick: observe, now });
-  return { service, sessions, discover, dispatch, ledger, adapters, legacyBusy, writes, lineOutbox, observe, readContext: () => context,
+    legacyBusy, evidenceMode: () => evidence, ...(scheduled ? { scheduledLive: () => mode === "live" } : {}), observeTick: observe, observeCheckHealth, now });
+  return { service, sessions, discover, dispatch, ledger, adapters, legacyBusy, writes, lineOutbox, observe, observeCheckHealth, readContext: () => context,
     armWaiting: () => service.arm(OWNER, { ...CONFIRM, expectedLiveSessionId: null, evidenceMode: LIVE_ROOM_SPEND_TREND }, async () => true),
     armDetecting: (room: string | null, allowExhaustedRecovery?: true) => service.arm(OWNER, { ...CONFIRM, expectedLiveSessionId: room,
       evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true, ...(allowExhaustedRecovery ? { allowExhaustedRecovery } : {}) }, async () => true),
@@ -143,6 +145,31 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
 }
 
 describe("Ppan continuous budget automation", () => {
+  it("reports failed data checks independently of normal pre-LIVE, inactive and budget-ceiling holds", async () => {
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, "myushop4", true, true);
+    f.refresh(0, { liveSessionId: null, liveDeliveryState: "UNKNOWN", deliveryVerified: false });
+    const { sessionId } = await f.armPersistent(null);
+    const tick = (outcome: string) => expect(f.observeCheckHealth).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId, outcome }));
+    f.refresh(60_000); vi.mocked(f.adapters.readScheduledLiveContext!).mockRejectedValueOnce(new Error("future schedule")); await f.service.tick();
+    tick("NORMAL_HOLD");
+    f.refresh(120_000, { roomReportEmpty: true }); await f.service.tick(); tick("NORMAL_HOLD");
+    f.refresh(60_000, { roomReportEmpty: undefined }); await f.service.tick(); tick("CHECK_FAILED");
+    f.refresh(60_000); f.discover.mockRejectedValueOnce(new Error("unavailable campaign API"));
+    await expect(f.service.tick()).rejects.toThrow("unavailable campaign API"); tick("CHECK_FAILED");
+    f.refresh(60_000); f.discover.mockResolvedValueOnce(null); await f.service.tick(); tick("NORMAL_HOLD");
+    f.refresh(60_000, { liveSessionId: ROOM, liveSessionStartedAt: "2026-11-07T14:18:00.000Z", liveDeliveryState: "LIVE", deliveryVerified: true });
+    vi.mocked(f.adapters.readScheduledLiveContext!).mockRejectedValueOnce(new Error("spend report unavailable")); await f.service.tick(); tick("CHECK_FAILED");
+    f.setPolicy({ revision: CAP_REVISION + 1, campaignCapMinor: ORIGINAL_BUDGET, clientDailyCapMinor: ORIGINAL_BUDGET });
+    f.refresh(60_000, { roomSpendMinor: 450_000 }); await f.service.tick(); tick("CHECK_VERIFIED");
+    f.refresh(60_000); await f.service.tick(); tick("CHECK_VERIFIED");
+    expect(await f.service.status(true, OWNER, "detect-live")).toMatchObject({ continuousSession: { status: "ARMED", reason: "CAP_REACHED" } });
+    expect(f.dispatch).not.toHaveBeenCalled();
+    await f.service.stop(OWNER, sessionId);
+    const before = f.observeCheckHealth.mock.calls.length;
+    f.refresh(60_000); await f.service.tick();
+    expect(f.observeCheckHealth).toHaveBeenCalledTimes(before);
+  });
+
   it("uses the same rounded-down Ppan target in verified LIVE preview, arm, and final leased write", async () => {
     const f = fixture("live", "spend-trend", "punpan_020", true, true);
     const budgetMinor = 1_289_944, targetBudgetMinor = 1_547_932;

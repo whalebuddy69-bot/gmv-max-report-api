@@ -38,6 +38,7 @@ export interface WebBudgetRoomEvidence {
   liveSessionStartedAt?: string;
   roomSpendMinor?: number;
   roomEvidenceIssue?: "STALE_ONGOING";
+  roomReportEmpty?: true;
 }
 export interface WebBudgetContext extends WebBudgetCampaignEvidence, WebBudgetRoomEvidence {
   spendMinor: number; aggregateSpendMinor: number;

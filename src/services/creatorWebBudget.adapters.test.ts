@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CREATOR_BINDING } from "./creatorRead.service";
-import { createCreatorWebBudgetAdapters, createCreatorWebCapAdapters } from "./creatorWebBudget.adapters";
+import { createCreatorWebBudgetAdapters, createCreatorWebCapAdapters, queueCreatorAutoCheckFailureAlert } from "./creatorWebBudget.adapters";
 import type { WebBudgetSource } from "./creatorWebBudget.service";
 import { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode, configuredPpanSpendTrendLive, creatorBudgetPolicyPath,
   LIVE_ROOM_SPEND_TREND, type CreatorBudgetScope } from "./creatorBudgetScope";
@@ -21,6 +21,28 @@ const pageInfo = (count: number, page = 1, pages = 1) => ({ page, total_page: pa
 const SCHEDULED_SCOPES = [["punpan_020", {}], ["srihiw", { extra: true }], ["nnshop5719", { extraClient: "nnshop5719" }],
   ["ashopbytheta", { extraClient: "ashopbytheta" }], ["myushop4", { extraClient: "myushop4" }],
   ["bubpa_shop189", { extraClient: "bubpa_shop189" }], ["koolkool888", { extraClient: "koolkool888" }]] as const;
+
+describe("Auto failed-check LINE handoff", () => {
+  const event = { incidentId: OP, advertiserName: "บัญชีโฆษณา Kool", tiktokUsername: "koolkool888" };
+  const env = { CREATOR_WEB_POLICY_BRIDGE_KEY: KEY };
+  it("sends exactly the names and the incident to the scoped Render bridge", async () => {
+    const request = (async (url, init) => {
+      expect(String(url)).toBe("https://whale-buddy-ads-control-plane.onrender.com/internal/automation/koolkool888/policy/check-failure-alert");
+      expect(init?.method).toBe("POST"); expect(init?.redirect).toBe("error");
+      expect(new Headers(init?.headers).get("x-creator-web-key")).toBe(KEY);
+      expect(JSON.parse(String(init?.body))).toEqual({ ...event, failedChecks: 10 });
+      return Response.json({ schemaVersion: 1, clientId: "koolkool888", incidentId: OP, status: "PENDING" });
+    }) satisfies typeof fetch;
+    await expect(queueCreatorAutoCheckFailureAlert("koolkool888", event, request, env)).resolves.toBeUndefined();
+  });
+  it("does not acknowledge another incident/scope or a rejected notification", async () => {
+    const result = { schemaVersion: 1, clientId: "koolkool888", incidentId: OP, status: "PENDING" };
+    for (const data of [{ ...result, clientId: "myushop4" }, { ...result, incidentId: CAMPAIGN }, { ...result, status: "UNKNOWN" }]) {
+      await expect(queueCreatorAutoCheckFailureAlert("koolkool888", event, async () => Response.json(data), env)).rejects.toThrow("WEB_BUDGET_ADAPTER_UNVERIFIED");
+    }
+    await expect(queueCreatorAutoCheckFailureAlert("koolkool888", event, async () => Response.json(result, { status: 409 }), env)).rejects.toThrow();
+  });
+});
 
 function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: boolean; spendTrend?: boolean; sriTrend?: boolean; legacy?: boolean; policyKey?: string;
   providerResult?: "unknown" | "reject" | "roi-drift" | "reject-with-drift"; readAt?: string;
