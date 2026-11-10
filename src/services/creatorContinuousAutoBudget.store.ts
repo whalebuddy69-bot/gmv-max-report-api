@@ -531,7 +531,8 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
   // Translate only literal, reviewed scopes. Keep existing tables unchanged
   // and new SQL identifiers short enough to avoid PostgreSQL truncation.
   const prefix = clientId === "srihiw" ? "creator_srihiw_continuous_" : clientId === "ashopbytheta" ? "creator_ashop_cauto_" :
-    clientId === "myushop4" ? "creator_myu_cauto_" : clientId === "bubpa_shop189" ? "creator_bubpa_cauto_" : "creator_nn_cauto_";
+    clientId === "myushop4" ? "creator_myu_cauto_" : clientId === "bubpa_shop189" ? "creator_bubpa_cauto_" :
+      clientId === "koolkool888" ? "creator_kool_cauto_" : "creator_nn_cauto_";
   const roomOnly = isVerifiedRoomCreator(clientId) || clientId === "nnshop5719";
   const scopedSql = (sql: string) => clientId === CLIENT ? sql : sql
     .replaceAll("creator_continuous_", prefix)

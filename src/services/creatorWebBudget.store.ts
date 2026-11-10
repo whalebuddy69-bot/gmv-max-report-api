@@ -14,7 +14,8 @@ const ASHOP_LEDGER = { clientId: "ashopbytheta", table: "creator_web_budget_asho
   fence: "creator_web_budget_ashopbytheta_one_active_fence" } as const;
 const MYU_LEDGER = { clientId: "myushop4", table: "creator_web_budget_myushop4_operations", fence: "creator_web_budget_myushop4_one_active_fence" } as const;
 const BUBPA_LEDGER = { clientId: "bubpa_shop189", table: "creator_web_budget_bubpa_shop189_operations", fence: "creator_web_budget_bubpa_shop189_one_active_fence" } as const;
-type LedgerScope = typeof PPAN_LEDGER | typeof SRIHIW_LEDGER | typeof NNSHOP_LEDGER | typeof ASHOP_LEDGER | typeof MYU_LEDGER | typeof BUBPA_LEDGER;
+const KOOL_LEDGER = { clientId: "koolkool888", table: "creator_web_budget_koolkool888_operations", fence: "creator_web_budget_koolkool888_one_active_fence" } as const;
+type LedgerScope = typeof PPAN_LEDGER | typeof SRIHIW_LEDGER | typeof NNSHOP_LEDGER | typeof ASHOP_LEDGER | typeof MYU_LEDGER | typeof BUBPA_LEDGER | typeof KOOL_LEDGER;
 
 function ledgerScope(clientId: CreatorWebBudgetLedgerClient): LedgerScope {
   if (clientId === "punpan_020") return PPAN_LEDGER;
@@ -23,6 +24,7 @@ function ledgerScope(clientId: CreatorWebBudgetLedgerClient): LedgerScope {
   if (clientId === "ashopbytheta") return ASHOP_LEDGER;
   if (clientId === "myushop4") return MYU_LEDGER;
   if (clientId === "bubpa_shop189") return BUBPA_LEDGER;
+  if (clientId === "koolkool888") return KOOL_LEDGER;
   throw new Error("Unconfigured Creator budget ledger");
 }
 

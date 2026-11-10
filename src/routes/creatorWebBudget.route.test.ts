@@ -67,7 +67,7 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
     stop: vi.fn(async (_owner: number, _grantId: string) => ({ stopped: true })),
     tick: vi.fn(async () => {}),
   };
-  const mockScoped = (clientId: "nnshop5719" | "ashopbytheta" | "myushop4" | "bubpa_shop189") => ({
+  const mockScoped = (clientId: "nnshop5719" | "ashopbytheta" | "myushop4" | "bubpa_shop189" | "koolkool888") => ({
     service: { ...srihiwService,
       status: vi.fn(async () => ({ clientId, mode: "disabled" as const, cap: null, canPrepare: false, capEditAllowed: false })),
       confirm: vi.fn(vi.mocked(service.confirm).getMockImplementation()),
@@ -91,10 +91,10 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
   const sriAuto = { ...continuous, arm: vi.fn(continuous.arm.getMockImplementation()), stop: vi.fn(continuous.stop.getMockImplementation()),
     status: vi.fn(async (...args: Parameters<typeof continuous.status>) => ({ ...await continuous.status(...args), clientId: "srihiw" as const, evidenceMode: "spend-trend" as const })) };
   const diagnostics = vi.fn(async (_owner: number) => ({ history: [] }));
-  const roomScope = (clientId: "ashopbytheta" | "myushop4" | "bubpa_shop189") => ({ ...continuous,
+  const roomScope = (clientId: "ashopbytheta" | "myushop4" | "bubpa_shop189" | "koolkool888") => ({ ...continuous,
     arm: vi.fn(continuous.arm.getMockImplementation()), stop: vi.fn(continuous.stop.getMockImplementation()),
     status: vi.fn(async (...args: Parameters<typeof continuous.status>) => ({ ...await continuous.status(...args), clientId })) });
-  const shopRoom = roomScope("ashopbytheta"), myuRoom = roomScope("myushop4"), bubpaRoom = roomScope("bubpa_shop189");
+  const shopRoom = roomScope("ashopbytheta"), myuRoom = roomScope("myushop4"), bubpaRoom = roomScope("bubpa_shop189"), koolRoom = roomScope("koolkool888");
   app.use("/automation/budget", createCreatorWebBudgetRouter({ viewerIds: () => viewerIds, operatorIds: () => operatorIds, service,
     autoService, capEditor, extraConfigured: () => extraCapConfigured,
     continuousAutoService: withContinuous ? continuous : undefined,
@@ -102,14 +102,15 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
     extraScopes: { srihiw: { service: srihiwService, continuousAutoService: withSrihiwContinuous ? sriAuto : undefined }, nnshop5719: nn,
       ashopbytheta: { ...ashop, continuousAutoService: withVerifiedContinuous ? shopRoom : undefined },
       ...(withVerifiedContinuous ? { myushop4: { service: mockScoped("myushop4").service, continuousAutoService: myuRoom },
-        bubpa_shop189: { service: mockScoped("bubpa_shop189").service, continuousAutoService: bubpaRoom } } : {}) } }));
+        bubpa_shop189: { service: mockScoped("bubpa_shop189").service, continuousAutoService: bubpaRoom },
+        koolkool888: { service: mockScoped("koolkool888").service, continuousAutoService: koolRoom } } : {}) } }));
   // Prove this route does not run the general application parser first.
   app.use(express.json());
   server = await new Promise<Server>(resolve => { const instance = app.listen(0, "127.0.0.1", () => resolve(instance)); });
   const { port } = server.address() as { port: number };
   const base = `http://127.0.0.1:${port}/automation/budget`;
   const post = (route: string, body = JSON.stringify(PREPARE), headers = HEADERS) => fetch(base + route, { method: "POST", headers, body });
-  return { service, srihiwService, autoService, base, post, capEditor, nn, ashop, continuous, sriAuto, diagnostics, shopRoom, myuRoom, bubpaRoom };
+  return { service, srihiwService, autoService, base, post, capEditor, nn, ashop, continuous, sriAuto, diagnostics, shopRoom, myuRoom, bubpaRoom, koolRoom };
 }
 
 describe("Automation web budget HTTP boundary", () => {
@@ -125,6 +126,22 @@ describe("Automation web budget HTTP boundary", () => {
       expect(scope.arm).toHaveBeenCalledTimes(1);
       expect(scope.arm).toHaveBeenCalledWith(27, verified, expect.any(Function));
     }
+    expect(h.continuous.arm).not.toHaveBeenCalled();
+    expect(h.autoService.arm).not.toHaveBeenCalled();
+  });
+
+  it("routes only explicit verified-room persistent consent to Koolkool's own service", async () => {
+    const h = await start({ withContinuous: true, withVerifiedContinuous: true });
+    const path = "/koolkool888/auto/arm";
+    const input = { expectedCampaignId: PREPARE.expectedCampaignId, expectedBudgetMinor: PREPARE.expectedBudgetMinor,
+      expectedPolicyRevision: 2, expectedLiveSessionId: null, nativeAutoOff: true, noConcurrentChanges: true,
+      evidenceMode: "verified-room-spend-trend", autoDetectLive: true, allowExhaustedRecovery: true, keepAutoAcrossRooms: true };
+    expect((await h.post(path, JSON.stringify({ ...input, evidenceMode: "spend-trend" }))).status).toBe(400);
+    expect((await h.post(path, JSON.stringify({ ...input, nativeAutoOff: false }))).status).toBe(400);
+    expect((await h.post(path, JSON.stringify(input))).status).toBe(200);
+    expect(h.koolRoom.arm).toHaveBeenCalledTimes(1);
+    expect(h.koolRoom.arm).toHaveBeenCalledWith(27, input, expect.any(Function));
+    expect(h.bubpaRoom.arm).not.toHaveBeenCalled();
     expect(h.continuous.arm).not.toHaveBeenCalled();
     expect(h.autoService.arm).not.toHaveBeenCalled();
   });

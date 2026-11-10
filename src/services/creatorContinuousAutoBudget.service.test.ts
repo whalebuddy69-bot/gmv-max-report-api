@@ -260,7 +260,7 @@ describe("Ppan continuous budget automation", () => {
     f.refresh(60_000); await f.service.tick();
     expect(f.ledger.create).not.toHaveBeenCalled();
   });
-  it.each(["punpan_020", "srihiw", "nnshop5719", "ashopbytheta", "myushop4", "bubpa_shop189"] as const)(
+  it.each(["punpan_020", "srihiw", "nnshop5719", "ashopbytheta", "myushop4", "bubpa_shop189", "koolkool888"] as const)(
     "can explicitly link %s's existing LIVE even before the spend row arrives", async client => {
       const f = fixture("live", client === "punpan_020" || client === "srihiw" ? "spend-trend" : LIVE_ROOM_SPEND_TREND, client, true, true);
       f.refresh(0, { liveSessionStartedAt: "2026-11-07T13:00:00.000Z" });
@@ -304,7 +304,16 @@ describe("Ppan continuous budget automation", () => {
     expect(configuredCreatorScheduledAutoLive(ready, "srihiw")).toBe(false);
     expect(configuredCreatorAutoBudgetMode(ready, "nnshop5719")).toBe("shadow");
   });
-  it.each(["ashopbytheta", "bubpa_shop189", "punpan_020", "srihiw", "myushop4", "nnshop5719"] as const)("pre-arms %s without LIVE or spend and writes only after two verified readings from a new room", async client => {
+  it("needs explicit Koolkool writer and verified-room Auto configuration without enabling any other creator", () => {
+    const env = { CREATOR_READ_ENABLED: "true", CREATOR_WEB_BUDGET_LIVE_ENABLED: "true", CREATOR_WEB_KOOLKOOL888_BUDGET_MODE: "live",
+      CREATOR_AUTO_BUDGET_KOOLKOOL888_MODE: "live", CREATOR_AUTO_BUDGET_KOOLKOOL888_LIVE_ENABLED: "true" };
+    expect(configuredCreatorScheduledAutoLive(env, "koolkool888")).toBe(false);
+    const ready = { ...env, CREATOR_WEB_KOOLKOOL888_BUDGET_LIVE_ENABLED: "true" };
+    expect(configuredCreatorScheduledAutoLive(ready, "koolkool888")).toBe(true);
+    expect(configuredCreatorScheduledAutoLive(ready, "bubpa_shop189")).toBe(false);
+    expect(configuredCreatorScheduledAutoLive({ ...ready, CREATOR_BUDGET_TEST_ENABLED: "true" }, "koolkool888")).toBe(false);
+  });
+  it.each(["ashopbytheta", "bubpa_shop189", "punpan_020", "srihiw", "myushop4", "nnshop5719", "koolkool888"] as const)("pre-arms %s without LIVE or spend and writes only after two verified readings from a new room", async client => {
     const f = fixture("live", client === "punpan_020" || client === "srihiw" ? "spend-trend" : LIVE_ROOM_SPEND_TREND, client, true);
     vi.mocked(f.adapters.readContext).mockRejectedValueOnce(new Error("no daily spend report"));
     expect(await f.service.status(true, OWNER)).toMatchObject({ canArm: true, preview: { waitingForLive: true, liveSessionId: null, spendMinor: null } });

@@ -63,7 +63,8 @@ describe("Ppan continuous Auto session", () => {
       const row = (await sessions.arm(arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, baselineBudgetMinor: 250000 })))!;
       expect(row).toMatchObject({ clientId: id, liveSessionId: ROOM, evidenceMode: LIVE_ROOM_SPEND_TREND });
       const table = { ashopbytheta: "creator_ashop_cauto_auto_budget_sessions", myushop4: "creator_myu_cauto_auto_budget_sessions",
-        bubpa_shop189: "creator_bubpa_cauto_auto_budget_sessions", nnshop5719: "creator_nn_cauto_auto_budget_sessions" }[id];
+        bubpa_shop189: "creator_bubpa_cauto_auto_budget_sessions", koolkool888: "creator_kool_cauto_auto_budget_sessions",
+        nnshop5719: "creator_nn_cauto_auto_budget_sessions" }[id];
       await expect(h.db.query(`UPDATE ${table} SET evidence_mode='spend-trend', live_session_id=NULL,
         native_auto_off_attested=false,no_concurrent_changes_attested=false WHERE session_id=$1`, [row.sessionId])).rejects.toMatchObject({ code: "23514" });
       for (const other of records) {
