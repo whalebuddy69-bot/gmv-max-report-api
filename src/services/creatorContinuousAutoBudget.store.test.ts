@@ -15,6 +15,9 @@ const ROOM = "12000000000002";
 const BEFORE = "a".repeat(64);
 const AFTER = "b".repeat(64);
 const NEXT = "c".repeat(64);
+const SETTINGS = "d".repeat(64);
+const FIRST_ROOM_AT = "2026-11-09T00:00:00.000Z";
+const NEXT_ROOM_AT = "2026-11-10T00:00:00.000Z";
 const dbs: PGlite[] = [];
 afterEach(async () => { for (const db of dbs.splice(0)) await db.close(); });
 
@@ -153,6 +156,14 @@ describe("Ppan continuous Auto session", () => {
     await sessions.ensureSchema();
     const draft = arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, liveSessionId: null });
     const old = (await sessions.arm(draft))!;
+    await h.db.exec(`ALTER TABLE ${table} DROP CONSTRAINT creator_ashop_cauto_session_keep_rooms_v7,
+      DROP CONSTRAINT creator_ashop_cauto_session_awaiting_live_v4,
+      DROP COLUMN keep_auto_across_rooms,DROP COLUMN last_bound_room_started_at,DROP COLUMN baseline_settings_fingerprint,
+      ADD CONSTRAINT creator_ashop_cauto_session_awaiting_live_v4 CHECK (
+        evidence_mode<>'${LIVE_ROOM_SPEND_TREND}' OR live_session_id IS NOT NULL OR
+        (status<>'BLOCKED' AND operation_id IS NULL AND last_outcome IS NULL AND last_verified_at IS NULL));
+      ALTER TABLE creator_ashop_cauto_auto_budget_attempts DROP CONSTRAINT creator_ashop_cauto_auto_attempt_retry_scope_v3,
+      ADD CONSTRAINT creator_ashop_cauto_auto_attempt_retry_scope_v3 CHECK (NOT retry_released OR evidence_mode='spend-trend');`);
     await h.db.exec(`ALTER TABLE ${table} DROP CONSTRAINT creator_ashop_cauto_session_exhausted_recovery_v6, DROP COLUMN allow_exhausted_recovery,
       DROP CONSTRAINT creator_ashop_cauto_session_auto_detect_v5, DROP COLUMN auto_detect_live`);
     await sessions.ensureSchema(); await sessions.ensureSchema();
@@ -217,6 +228,105 @@ describe("Ppan continuous Auto session", () => {
       .toMatchObject({ liveSessionId: ROOM, autoDetectLive: true, allowExhaustedRecovery: true, status: "ACTIVE" });
   });
 
+  it("advances one opted-in campaign across a verified new room and budget baseline without changing settings or owner", async () => {
+    const h = setup(), id = "bubpa_shop189";
+    const ledger = createCreatorWebBudgetStore(h.database, id), sessions = createCreatorContinuousAutoBudgetStore(h.database, id);
+    await ledger.ensureSchema(); await sessions.ensureSchema(); await sessions.ensureSchema();
+    const original = arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, liveSessionId: null, autoDetectLive: true, keepAutoAcrossRooms: true,
+      baselineSettingsFingerprint: SETTINGS, baselineBudgetMinor: 250_000 });
+    expect(await sessions.arm({ ...original, autoDetectLive: undefined })).toBeNull();
+    expect(await sessions.arm({ ...original, baselineSettingsFingerprint: undefined })).toBeNull();
+    expect(await sessions.arm({ ...original, liveSessionId: ROOM })).toBeNull();
+    expect(await sessions.arm({ ...original, lastBoundRoomStartedAt: FIRST_ROOM_AT })).toBeNull();
+    const waiting = (await sessions.arm(original))!;
+    const bind = { liveSessionId: ROOM, lastBoundRoomStartedAt: FIRST_ROOM_AT, budgetMinor: 250_000,
+      fingerprint: BEFORE, settingsFingerprint: SETTINGS, policyRevision: 2 };
+    expect(await sessions.bindLiveSession(waiting, ROOM)).toBeNull();
+    expect(await sessions.advanceContinuousSession(waiting, { ...bind, policyRevision: 0 })).toBeNull();
+    expect(await sessions.advanceContinuousSession(waiting, { ...bind, policyRevision: 1 })).toBeNull();
+    expect(await sessions.advanceContinuousSession(waiting, { ...bind, settingsFingerprint: NEXT })).toBeNull();
+    expect(await sessions.advanceContinuousSession({ ...waiting, ownerId: waiting.ownerId + 1 }, bind)).toBeNull();
+    expect(await sessions.advanceContinuousSession({ ...waiting, allowExhaustedRecovery: true }, bind)).toBeNull();
+    const bound = (await sessions.advanceContinuousSession(waiting, bind))!;
+    expect(bound).toEqual({ ...waiting, liveSessionId: ROOM, lastBoundRoomStartedAt: FIRST_ROOM_AT });
+    expect(await sessions.advanceContinuousSession(waiting, bind)).toBeNull();
+    const revised = (await sessions.advanceContinuousSession(bound, { ...bind, policyRevision: 3 }))!;
+    expect(revised).toEqual({ ...bound, policyRevision: 3 });
+    const rebase = { ...bind, budgetMinor: 260_000, fingerprint: AFTER, policyRevision: 3 };
+    expect(await sessions.advanceContinuousSession(bound, rebase)).toBeNull(); // stale revision cannot CAS
+    expect(await sessions.advanceContinuousSession(revised, { ...rebase, policyRevision: 2 })).toBeNull();
+    expect(await sessions.advanceContinuousSession(revised, { ...rebase, fingerprint: BEFORE })).toBeNull();
+    const based = (await sessions.advanceContinuousSession(revised, rebase))!;
+    expect(based).toMatchObject({ baselineBudgetMinor: 260_000, baselineFingerprint: AFTER, baselineSettingsFingerprint: SETTINGS });
+    const op = operation(based); await ledger.create(op); await sessions.reserve(based, op.operationId, op.targetBudgetMinor);
+    const detach = { ...rebase, liveSessionId: null, lastBoundRoomStartedAt: undefined };
+    expect(await sessions.advanceContinuousSession(based, detach)).toBeNull();
+    await ledger.reserve(based.ownerId, op.operationId, "live");
+    await ledger.finish(based.ownerId, op.operationId, { status: "APPLIED_VERIFIED", observedBudgetMinor: op.targetBudgetMinor,
+      observedFingerprint: NEXT, reason: "VERIFIED" });
+    const settled = (await sessions.settleVerified(based, op.operationId, { budgetMinor: op.targetBudgetMinor, fingerprint: NEXT }))!;
+    const next = { ...detach, budgetMinor: op.targetBudgetMinor, fingerprint: NEXT };
+    const detached = (await sessions.advanceContinuousSession(settled, next))!;
+    expect(detached).toEqual({ ...settled, liveSessionId: null });
+    expect(await sessions.advanceContinuousSession(detached, { ...next, liveSessionId: ROOM, lastBoundRoomStartedAt: FIRST_ROOM_AT })).toBeNull();
+    expect(await sessions.advanceContinuousSession(detached, { ...next, liveSessionId: "12000000000003", lastBoundRoomStartedAt: FIRST_ROOM_AT })).toBeNull();
+    const rebound = await sessions.advanceContinuousSession(detached, { ...next, liveSessionId: "12000000000003", lastBoundRoomStartedAt: NEXT_ROOM_AT });
+    expect(rebound).toMatchObject({ lastBoundRoomStartedAt: NEXT_ROOM_AT, liveSessionId: "12000000000003",
+      lastOutcome: "APPLIED_VERIFIED", lastVerifiedAt: settled.lastVerifiedAt });
+  });
+
+  it("releases an opted-in same-fingerprint retry only after exact durable NOT_SENT and never releases an uncertain send", async () => {
+    const h = setup(), id = "myushop4";
+    const ledger = createCreatorWebBudgetStore(h.database, id), sessions = createCreatorContinuousAutoBudgetStore(h.database, id);
+    await ledger.ensureSchema(); await sessions.ensureSchema();
+    const s = (await sessions.arm(arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true, keepAutoAcrossRooms: true,
+      baselineSettingsFingerprint: SETTINGS, lastBoundRoomStartedAt: FIRST_ROOM_AT, baselineBudgetMinor: 250_000 })))!;
+    const first = operation(s); await ledger.create(first); await sessions.reserve(s, first.operationId, first.targetBudgetMinor);
+    expect(await sessions.settleNotSent(s, first.operationId)).toBeNull();
+    await ledger.reserve(s.ownerId, first.operationId, "live");
+    await ledger.finish(s.ownerId, first.operationId, { status: "NOT_SENT", observedBudgetMinor: null, reason: "PRECHECK" });
+    const resumed = (await sessions.settleNotSent(s, first.operationId))!;
+    expect(resumed).toMatchObject({ status: "ACTIVE", lastOutcome: "NOT_SENT", operationId: null, keepAutoAcrossRooms: true });
+    const second = operation(resumed); await ledger.create(second); await sessions.reserve(resumed, second.operationId, second.targetBudgetMinor);
+    await ledger.reserve(resumed.ownerId, second.operationId, "live");
+    await ledger.finish(resumed.ownerId, second.operationId, { status: "OUTCOME_UNKNOWN", observedBudgetMinor: null, reason: "UNKNOWN" });
+    expect(await sessions.settleNotSent(resumed, second.operationId)).toBeNull();
+    expect(await sessions.markUnknown(resumed, second.operationId)).toMatchObject({ status: "BLOCKED" });
+    expect((await h.db.query("SELECT retry_released FROM creator_myu_cauto_auto_budget_attempts ORDER BY reserved_at")).rows)
+      .toEqual([{ retry_released: true }, { retry_released: false }]);
+  });
+
+  it("atomically voids only an exact unreserved expired proposal for a persistent session before retrying", async () => {
+    const h = setup(), id = "bubpa_shop189";
+    const ledger = createCreatorWebBudgetStore(h.database, id), sessions = createCreatorContinuousAutoBudgetStore(h.database, id);
+    await ledger.ensureSchema(); await sessions.ensureSchema();
+    const s = (await sessions.arm(arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true, keepAutoAcrossRooms: true,
+      baselineSettingsFingerprint: SETTINGS, lastBoundRoomStartedAt: FIRST_ROOM_AT, baselineBudgetMinor: 250_000 })))!;
+    const first = operation(s); await ledger.create(first); await sessions.reserve(s, first.operationId, first.targetBudgetMinor);
+    expect(await sessions.settleNotSent(s, first.operationId)).toBeNull();
+    const expire = (operationId: string) => h.db.query("UPDATE creator_web_budget_bubpa_shop189_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE operation_id=$1", [operationId]);
+    await expire(first.operationId);
+    await h.db.query("UPDATE creator_web_budget_bubpa_shop189_operations SET reserved_at=clock_timestamp() WHERE operation_id=$1", [first.operationId]);
+    expect(await sessions.settleNotSent(s, first.operationId)).toBeNull();
+    expect(await sessions.getActive()).toMatchObject({ status: "ACTIVE", operationId: first.operationId });
+    await h.db.query("UPDATE creator_web_budget_bubpa_shop189_operations SET reserved_at=NULL WHERE operation_id=$1", [first.operationId]);
+    const resumed = (await sessions.settleNotSent(s, first.operationId))!;
+    expect(resumed).toMatchObject({ status: "ACTIVE", lastOutcome: "NOT_SENT", operationId: null, keepAutoAcrossRooms: true });
+    expect(await ledger.get(s.ownerId, first.operationId)).toMatchObject({ status: "NOT_SENT" });
+    expect((await h.db.query("SELECT reason,reserved_at FROM creator_web_budget_bubpa_shop189_operations WHERE operation_id=$1", [first.operationId])).rows)
+      .toEqual([{ reason: "PROPOSAL_EXPIRED_BEFORE_RESERVATION", reserved_at: null }]);
+    expect(await ledger.reserve(s.ownerId, first.operationId, "live")).toBeNull();
+
+    const second = operation(resumed); await ledger.create(second);
+    expect(await sessions.reserve(resumed, second.operationId, second.targetBudgetMinor)).toMatchObject({ operationId: second.operationId });
+    expect(await ledger.reserve(resumed.ownerId, second.operationId, "live")).toMatchObject({ status: "PROCESSING" });
+    await expire(second.operationId);
+    expect(await sessions.settleNotSent(resumed, second.operationId)).toBeNull();
+    expect(await ledger.get(resumed.ownerId, second.operationId)).toMatchObject({ status: "PROCESSING" });
+    expect((await h.db.query("SELECT retry_released FROM creator_bubpa_cauto_auto_budget_attempts ORDER BY reserved_at")).rows)
+      .toEqual([{ retry_released: true }, { retry_released: false }]);
+  });
+
   it("migrates Ppan and Srihiw in place, keeping each legacy pending send and requiring a room for new hybrid attempts", async () => {
     const h = setup();
     for (const id of ["punpan_020", "srihiw"] as const) {
@@ -243,7 +353,8 @@ describe("Ppan continuous Auto session", () => {
       await sessions.ensureSchema(); await sessions.ensureSchema();
       const pending = (await sessions.getActive())!;
       expect(pending).toMatchObject({ ...old, status: "ACTIVE", operationId: pendingId });
-      expect((await h.db.query(`SELECT * FROM ${table}`)).rows).toEqual([{ ...before, auto_detect_live: false, allow_exhausted_recovery: false }]);
+      expect((await h.db.query(`SELECT * FROM ${table}`)).rows).toEqual([{ ...before, auto_detect_live: false, allow_exhausted_recovery: false,
+        keep_auto_across_rooms: false, last_bound_room_started_at: null, baseline_settings_fingerprint: null }]);
       expect(pending.autoDetectLive).toBeUndefined();
       expect(pending.allowExhaustedRecovery).toBeUndefined();
       await expect(h.db.query(`UPDATE ${table} SET auto_detect_live=true WHERE session_id=$1`, [old.sessionId]))

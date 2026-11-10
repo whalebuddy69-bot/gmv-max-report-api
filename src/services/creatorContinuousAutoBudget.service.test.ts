@@ -10,6 +10,8 @@ const OWNER = 123;
 const CAMPAIGN = "1234567890123456";
 const ROOM = "2234567890123456";
 const OTHER_ROOM = "3234567890123456";
+const THIRD_ROOM = "4234567890123456";
+const SETTINGS = "d".repeat(64);
 const ORIGINAL_BUDGET = 650_000;
 const ORIGINAL_THRESHOLD = 520_000;
 const CAP_REVISION = 7;
@@ -22,7 +24,7 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
   let session: CreatorContinuousAutoBudgetSession | null = null;
   let context: WebBudgetContext = {
     campaignId: CAMPAIGN, reportingDate: "2026-11-07", observedAt: ts(clock), budgetMinor: ORIGINAL_BUDGET,
-    spendMinor: ORIGINAL_THRESHOLD, aggregateSpendMinor: ORIGINAL_THRESHOLD + 2_000, fingerprint: "a".repeat(64),
+    spendMinor: ORIGINAL_THRESHOLD, aggregateSpendMinor: ORIGINAL_THRESHOLD + 2_000, fingerprint: "a".repeat(64), settingsFingerprint: SETTINGS,
     nativeAutoState: "DISABLED", liveDeliveryState: "LIVE", deliveryVerified: true, liveSessionId: ROOM,
     providerSpendObservedAt: ts(clock - 1000),
   };
@@ -74,13 +76,16 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
       ? save({ baselineBudgetMinor: next.budgetMinor, baselineFingerprint: next.fingerprint }) : null),
     bindLiveSession: vi.fn(async (prior, liveSessionId) => session?.sessionId === prior.sessionId && session.status === "ACTIVE" && !session.operationId && session.liveSessionId === null
       ? save({ liveSessionId }) : null),
+    advanceContinuousSession: vi.fn(async (prior, next) => session?.sessionId === prior.sessionId && session.status === "ACTIVE" && !session.operationId && session.keepAutoAcrossRooms
+      ? save({ liveSessionId: next.liveSessionId, lastBoundRoomStartedAt: next.lastBoundRoomStartedAt, baselineBudgetMinor: next.budgetMinor,
+        baselineFingerprint: next.fingerprint, baselineSettingsFingerprint: next.settingsFingerprint, policyRevision: next.policyRevision }) : null),
     reserve: vi.fn(async (prior, id) => session && session.sessionId === prior.sessionId && session.status === "ACTIVE" && !session.operationId
       ? save({ operationId: id, lastOutcome: null }) : null),
     isReserved: vi.fn(async (prior, id) => isPending(prior, id) && session?.status === "ACTIVE"),
     markUnknown: vi.fn(async (prior, id) => isPending(prior, id) ? save({ status: "BLOCKED", lastOutcome: "OUTCOME_UNKNOWN" }) : null),
     settleVerified: vi.fn(async (prior, id, next) => isPending(prior, id) ? save({ operationId: null,
       baselineBudgetMinor: next.budgetMinor, baselineFingerprint: next.fingerprint, lastOutcome: "APPLIED_VERIFIED", lastVerifiedAt: ts(clock) }) : null),
-    settleNotSent: vi.fn(async (prior, id) => isPending(prior, id) ? save({ ...(prior.evidenceMode === "spend-trend" && session?.status === "ACTIVE" &&
+    settleNotSent: vi.fn(async (prior, id) => isPending(prior, id) ? save({ ...((prior.evidenceMode === "spend-trend" || prior.keepAutoAcrossRooms) && session?.status === "ACTIVE" &&
       records.get(id)?.status === "NOT_SENT" ? {} : { status: "STOPPED" as const, stopReason: "NOT_SENT" as const }),
       operationId: null, lastOutcome: "NOT_SENT" }) : null),
     stop: vi.fn(async (owner, id, reason = "OPERATOR_STOPPED") => session && session.ownerId === owner && session.sessionId === id
@@ -94,7 +99,7 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
     return { outcome: "APPLIED_VERIFIED", observedBudgetMinor: context.budgetMinor, observedFingerprint: fingerprint };
   });
   const preArmContext = () => ({ campaignId: CAMPAIGN, observedAt: context.observedAt, reportingDate: context.reportingDate,
-    budgetMinor: context.budgetMinor, fingerprint: context.fingerprint, nativeAutoState: context.nativeAutoState,
+    budgetMinor: context.budgetMinor, fingerprint: context.fingerprint, settingsFingerprint: context.settingsFingerprint, nativeAutoState: context.nativeAutoState,
     scheduleStartAt: "2026-11-07T14:16:00.000Z", scheduleEndAt: null });
   const adapters: WebBudgetAdapters = {
     readPolicy: vi.fn(async () => policy),
@@ -119,6 +124,8 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
     armWaiting: () => service.arm(OWNER, { ...CONFIRM, expectedLiveSessionId: null, evidenceMode: LIVE_ROOM_SPEND_TREND }, async () => true),
     armDetecting: (room: string | null, allowExhaustedRecovery?: true) => service.arm(OWNER, { ...CONFIRM, expectedLiveSessionId: room,
       evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true, ...(allowExhaustedRecovery ? { allowExhaustedRecovery } : {}) }, async () => true),
+    armPersistent: (room: string | null) => service.arm(OWNER, { ...CONFIRM, expectedLiveSessionId: room,
+      evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true, allowExhaustedRecovery: true, keepAutoAcrossRooms: true }, async () => true),
     setPolicy: (changes: Partial<WebBudgetPolicy>) => { policy = { ...policy, ...changes }; },
     nextReservedSpend: (spend: number) => { nextReservedSpend = spend; },
     arm: () => service.arm(OWNER, evidence === "spend-trend" ? { expectedCampaignId: CAMPAIGN, expectedBudgetMinor: ORIGINAL_BUDGET,
@@ -132,8 +139,66 @@ function fixture(mode: "shadow" | "live" = "live", evidence: ContinuousEvidence 
 }
 
 describe("Ppan continuous budget automation", () => {
+  it("keeps one authorization across three verified rooms, ignores an old room, and adopts a manual budget before any write", async () => {
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, "myushop4", true, true);
+    f.refresh(0, { liveSessionStartedAt: "2026-11-07T13:00:00.000Z" });
+    const armed = await f.armPersistent(ROOM);
+    f.refresh(60_000, { liveDeliveryState: "NOT_LIVE", liveSessionId: null }); await f.service.tick();
+    expect(await f.sessions.getLatest()).toMatchObject({ sessionId: armed.sessionId, status: "ACTIVE", liveSessionId: null,
+      lastBoundRoomStartedAt: "2026-11-07T13:00:00.000Z" });
+    f.refresh(60_000, { liveDeliveryState: "LIVE", liveSessionId: ROOM }); await f.service.tick();
+    expect(await f.sessions.getLatest()).toMatchObject({ liveSessionId: null });
+    f.refresh(60_000, { liveSessionId: OTHER_ROOM, liveSessionStartedAt: "2026-11-07T14:15:00.000Z", budgetMinor: 700_000, fingerprint: "f".repeat(64) });
+    await f.service.tick();
+    expect(await f.sessions.getLatest()).toMatchObject({ sessionId: armed.sessionId, status: "ACTIVE", liveSessionId: OTHER_ROOM, baselineBudgetMinor: 700_000 });
+    f.refresh(60_000, { liveSessionId: THIRD_ROOM, liveSessionStartedAt: "2026-11-07T14:17:00.000Z", spendMinor: 700_000,
+      aggregateSpendMinor: 700_000, roomSpendMinor: 695_000 });
+    await f.service.tick();
+    expect(await f.sessions.getLatest()).toMatchObject({ sessionId: armed.sessionId, status: "ACTIVE", liveSessionId: THIRD_ROOM, baselineBudgetMinor: 700_000 });
+    expect(f.dispatch).not.toHaveBeenCalled();
+    f.refresh(60_000); await f.service.tick();
+    expect(f.dispatch).not.toHaveBeenCalled();
+    f.refresh(60_000); await f.service.tick();
+    expect(f.writes).toEqual([840_000]); // integrated 100%, exact room, missing secondary status
+    f.refresh(60_000, { liveSessionId: null, liveDeliveryState: "NOT_LIVE" }); await f.service.tick();
+    expect(await f.sessions.getLatest()).toMatchObject({ sessionId: armed.sessionId, status: "ACTIVE", liveSessionId: null, lastOutcome: "APPLIED_VERIFIED" });
+    await expect(f.service.stop(OWNER, armed.sessionId)).resolves.toEqual({ stopped: true });
+  });
+
+  it("pauses for an unavailable campaign or changed settings, and accepts a newly verified cap without going OFF", async () => {
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, "ashopbytheta", true, true);
+    f.refresh(0, { liveSessionStartedAt: "2026-11-07T13:00:00.000Z" });
+    const armed = await f.armPersistent(ROOM);
+    f.discover.mockResolvedValue(OTHER_ROOM);
+    f.refresh(60_000); await f.service.tick();
+    expect(await f.service.status(true, OWNER, "detect-live")).toMatchObject({ blockers: ["CAMPAIGN_NOT_VISIBLE"], continuousSession: { reason: "CAMPAIGN_NOT_VISIBLE" } });
+    f.discover.mockResolvedValue(CAMPAIGN);
+    f.refresh(60_000, { settingsFingerprint: "e".repeat(64), fingerprint: "f".repeat(64) }); await f.service.tick();
+    expect((await f.service.status(true, OWNER, "detect-live")).continuousSession).toMatchObject({ reason: "CAMPAIGN_SETTINGS_CHANGED", status: "ARMED" });
+    f.refresh(60_000, { settingsFingerprint: SETTINGS, fingerprint: "a".repeat(64) });
+    f.setPolicy({ revision: CAP_REVISION + 1, campaignCapMinor: ORIGINAL_BUDGET, clientDailyCapMinor: ORIGINAL_BUDGET });
+    await f.service.tick();
+    expect(await f.sessions.getLatest()).toMatchObject({ sessionId: armed.sessionId, status: "ACTIVE", policyRevision: CAP_REVISION + 1 });
+    expect(f.dispatch).not.toHaveBeenCalled();
+  });
+
+  it("keeps persistent Auto after a proven NOT_SENT preflight and starts a fresh pair", async () => {
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, "ashopbytheta", true, true);
+    f.refresh(0, { liveSessionStartedAt: "2026-11-07T13:00:00.000Z", roomSpendMinor: 500_000 });
+    const armed = await f.armPersistent(ROOM);
+    f.refresh(60_000); await f.service.tick();
+    f.nextReservedSpend(ORIGINAL_THRESHOLD - 1);
+    f.refresh(60_000, { spendMinor: ORIGINAL_THRESHOLD + 500, roomSpendMinor: 501_000 }); await f.service.tick();
+    expect(await f.sessions.getLatest()).toMatchObject({ sessionId: armed.sessionId, status: "ACTIVE", lastOutcome: "NOT_SENT", operationId: null });
+    expect(f.dispatch).not.toHaveBeenCalled();
+    f.refresh(60_000, { spendMinor: ORIGINAL_THRESHOLD + 600, roomSpendMinor: 502_000 }); await f.service.tick();
+    expect(f.dispatch).not.toHaveBeenCalled();
+    f.refresh(60_000, { spendMinor: ORIGINAL_THRESHOLD + 900, roomSpendMinor: 503_000 }); await f.service.tick();
+    expect(f.writes).toEqual([780_000]);
+  });
+
   it.each([
-    ["ENABLED", ORIGINAL_BUDGET], ["CAMPAIGN_BUDGET_EXHAUSTED", ORIGINAL_BUDGET - 1_000],
+    ["ENABLED", ORIGINAL_BUDGET], ["CAMPAIGN_BUDGET_EXHAUSTED", ORIGINAL_BUDGET - 1_000], [undefined, ORIGINAL_BUDGET],
   ] as const)("recovers from two flat reads when %s verifies the budget is exhausted", async (campaignDeliveryStatus, spendMinor) => {
     const f = fixture("live", LIVE_ROOM_SPEND_TREND, "bubpa_shop189", true, true);
     f.refresh(0, { liveSessionStartedAt: "2026-11-07T13:00:00.000Z", campaignDeliveryStatus,
@@ -167,6 +232,20 @@ describe("Ppan continuous budget automation", () => {
     f.refresh(60_000); await f.service.tick();
     expect(f.ledger.create).not.toHaveBeenCalled();
     expect(f.dispatch).not.toHaveBeenCalled();
+  });
+
+  it("keeps Auto armed but requires rising cost for a room older than 24 hours when delivery status is missing", async () => {
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, "bubpa_shop189", true, true);
+    f.refresh(0, { liveSessionStartedAt: "2026-11-06T13:00:00.000Z", campaignDeliveryStatus: undefined,
+      spendMinor: ORIGINAL_BUDGET, aggregateSpendMinor: ORIGINAL_BUDGET, roomSpendMinor: ORIGINAL_BUDGET - 100 });
+    await f.armPersistent(ROOM);
+    f.refresh(60_000); await f.service.tick();
+    f.refresh(60_000); await f.service.tick();
+    expect(f.dispatch).not.toHaveBeenCalled();
+    expect((await f.service.status(true, OWNER, "summary")).continuousSession?.status).toBe("ARMED");
+    f.refresh(60_000, { spendMinor: ORIGINAL_BUDGET + 100, aggregateSpendMinor: ORIGINAL_BUDGET + 100, roomSpendMinor: ORIGINAL_BUDGET });
+    await f.service.tick();
+    expect(f.writes).toEqual([780_000]);
   });
 
   it("does not recover if exact LIVE proof or headroom under the daily ceiling is lost", async () => {

@@ -250,7 +250,10 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     if ((scheduleEndAt !== null && scheduleEndAt <= scheduleStartAt) || (preArmStamp === undefined &&
       (Date.parse(scheduleStartAt) > at || (scheduleEndAt !== null && Date.parse(scheduleEndAt) <= at)))) unverified();
     if (preArmStamp !== undefined && data.modify_time !== undefined && data.modify_time !== preArmStamp) unverified();
-    const { budget, modify_time: _, ...untouched } = data;
+    // Only campaign settings are stable across a manual budget edit. A
+    // secondary delivery status, if the detail endpoint echoes it, is runtime
+    // evidence and must not turn an unchanged campaign into a settings edit.
+    const { budget, modify_time: _, secondary_status: _delivery, ...untouched } = data;
     const budgetMinor = minor(budget);
     if (!positive(budgetMinor)) unverified();
     const listed: CampaignListObservation | null = preArmStamp === undefined ? await exactCampaignList(campaignId, accessToken) : { stamp: preArmStamp };
@@ -289,7 +292,8 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     if (!live || (live.scheduleEndAt !== null && Date.parse(live.scheduleEndAt) <= observed.getTime())) return null;
     if (live.budgetMinor > WEB_BUDGET_MAX_MINOR) unverified();
     return { campaignId: expectedCampaignId, reportingDate, observedAt: observed.toISOString(), budgetMinor: live.budgetMinor,
-      fingerprint: live.fingerprint, nativeAutoState: live.native, scheduleStartAt: live.scheduleStartAt, scheduleEndAt: live.scheduleEndAt };
+      fingerprint: live.fingerprint, settingsFingerprint: live.unchanged, nativeAutoState: live.native,
+      scheduleStartAt: live.scheduleStartAt, scheduleEndAt: live.scheduleEndAt };
   }
 
   async function readPreArmContext(expectedCampaignId: string): Promise<WebBudgetPreArmContext | null> {
@@ -334,7 +338,7 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
       { deliveryVerified: false, liveDeliveryState: "UNKNOWN" as const, liveSessionId: null };
     return { campaignId: expectedCampaignId, reportingDate: raw.reportingDate as string, observedAt: raw.observedAt,
       budgetMinor: live.budgetMinor, spendMinor: c.spendMinor, aggregateSpendMinor: quality.aggregateSpendMinor,
-      fingerprint: live.fingerprint, nativeAutoState: live.native, providerSpendObservedAt: null,
+      fingerprint: live.fingerprint, settingsFingerprint: live.unchanged, nativeAutoState: live.native, providerSpendObservedAt: null,
       ...(live.campaignDeliveryStatus === undefined ? {} : { campaignDeliveryStatus: live.campaignDeliveryStatus }), ...room, sample: live };
   }
 

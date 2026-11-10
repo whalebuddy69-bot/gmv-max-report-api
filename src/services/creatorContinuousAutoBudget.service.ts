@@ -12,8 +12,8 @@ type Sessions = ReturnType<typeof createCreatorContinuousAutoBudgetStore>;
 type Session = NonNullable<Awaited<ReturnType<Sessions["getLatest"]>>>;
 type EvidenceMode = ContinuousEvidence;
 type ArmInput = { expectedCampaignId: string; expectedBudgetMinor: number; expectedPolicyRevision: number } & (
-  { expectedLiveSessionId: string | null; nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: typeof LIVE_ROOM_SPEND_TREND; autoDetectLive?: true; allowExhaustedRecovery?: true } |
-  { evidenceMode: "spend-trend"; expectedLiveSessionId?: never; nativeAutoOff?: never; noConcurrentChanges?: never; autoDetectLive?: never; allowExhaustedRecovery?: never });
+  { expectedLiveSessionId: string | null; nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: typeof LIVE_ROOM_SPEND_TREND; autoDetectLive?: true; allowExhaustedRecovery?: true; keepAutoAcrossRooms?: true } |
+  { evidenceMode: "spend-trend"; expectedLiveSessionId?: never; nativeAutoOff?: never; noConcurrentChanges?: never; autoDetectLive?: never; allowExhaustedRecovery?: never; keepAutoAcrossRooms?: never });
 type Mode = "disabled" | "shadow" | "live";
 const unavailable = () => new WebBudgetError("AUTO_BUDGET_NOT_READY", 409, "ข้อมูลสำหรับเปิด Auto ยังไม่ครบ จึงยังไม่ส่งคำสั่งจริง");
 const CLIENT = "punpan_020" as const;
@@ -42,7 +42,12 @@ function confirmedExhaustion(ctx: WebBudgetContext, priorIncrease: boolean) {
     // to the old amount. The new amount must actually be used up.
     return ctx.spendMinor >= ctx.budgetMinor || (!priorIncrease && ctx.spendMinor * 5 >= ctx.budgetMinor * 4);
   }
-  return ctx.campaignDeliveryStatus === "ENABLED" && ctx.spendMinor >= ctx.budgetMinor;
+  // Some exact LIVE GMV Max list responses omit secondary_status entirely.
+  // Without that signal, a room more than a day old must still prove rising
+  // spend. A stale unfinished-room marker alone cannot recover a flat budget.
+  const roomAge = instant(ctx.observedAt) - instant(ctx.liveSessionStartedAt);
+  return (ctx.campaignDeliveryStatus === "ENABLED" || (ctx.campaignDeliveryStatus === undefined &&
+    roomAge >= 0 && roomAge <= 86_400_000)) && ctx.spendMinor >= ctx.budgetMinor;
 }
 function verifiedDetectedRoom<T extends WebBudgetRoomEvidence>(ctx: T, at: Date): ctx is T & { liveSessionId: string; liveSessionStartedAt: string } {
   const launch = instant(ctx.liveSessionStartedAt);
@@ -80,6 +85,12 @@ function canStart(ctx: WebBudgetContext, policy: WebBudgetPolicy, fenced: boolea
 }
 
 const validAmount = (value: number) => Number.isSafeInteger(value) && value > 0 && value <= WEB_BUDGET_MAX_MINOR;
+const validSettingsFingerprint = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+function freshPolicy(policy: WebBudgetPolicy, at: Date) {
+  const age = at.getTime() - instant(policy.readAt);
+  return validAmount(policy.campaignCapMinor) && validAmount(policy.clientDailyCapMinor) && Number.isSafeInteger(policy.revision) &&
+    policy.revision > 0 && age >= 0 && age <= 20_000;
+}
 function validScheduledContext(ctx: WebBudgetPreArmContext, campaignId: string, at: Date) {
   const start = instant(ctx.scheduleStartAt), end = ctx.scheduleEndAt === null ? Infinity : instant(ctx.scheduleEndAt);
   return ctx.campaignId === campaignId && freshContext(ctx, at) && validAmount(ctx.budgetMinor) && /^[0-9a-f]{64}$/.test(ctx.fingerprint) &&
@@ -87,9 +98,7 @@ function validScheduledContext(ctx: WebBudgetPreArmContext, campaignId: string, 
 }
 function scheduledBlockers(ctx: WebBudgetPreArmContext, policy: WebBudgetPolicy, fenced: boolean, at: Date): string[] {
   const reasons: string[] = [];
-  const age = at.getTime() - instant(policy.readAt);
-  if (!validAmount(policy.campaignCapMinor) || !validAmount(policy.clientDailyCapMinor) || !Number.isSafeInteger(policy.revision) ||
-    policy.revision < 1 || !(age >= 0 && age <= 20_000)) reasons.push("CONTEXT_UNAVAILABLE");
+  if (!freshPolicy(policy, at)) reasons.push("CONTEXT_UNAVAILABLE");
   else if (BigInt(ctx.budgetMinor) * 6n > BigInt(Math.min(policy.campaignCapMinor, policy.clientDailyCapMinor)) * 5n) reasons.push("SCHEDULED_CAP_TOO_LOW");
   if (ctx.budgetMinor % 5 !== 0) reasons.push("SCHEDULED_TARGET_NOT_EXACT");
   if (ctx.nativeAutoState !== "DISABLED" && ctx.nativeAutoState !== "UNKNOWN") reasons.push("NATIVE_AUTO_CONFLICT");
@@ -119,6 +128,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
   // Deliberately process-local. A restart or incomplete read requires a fresh
   // pair of minute polls; an old qualifying sample never survives a restart.
   let pulse: { key: string; at: number; spend: number; roomSpend?: number; exhausted: boolean } | undefined;
+  let lastTick: { sessionId: string; at: number; reason: string } | undefined;
   function observeTrend(row: Session, ctx: WebBudgetContext) {
     const timestamp = instant(ctx.observedAt), anchor = Math.max(instant(row.authorizedAt), row.lastVerifiedAt ? instant(row.lastVerifiedAt) : 0);
     const roomSpend = row.autoDetectLive ? ctx.roomSpendMinor : undefined;
@@ -164,6 +174,48 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     return { context, policy, fenced };
   }
 
+  async function trackPersistent(row: Session, campaign: string) {
+    // Discover the sole corroborated current room without filtering it out
+    // merely because the prior room changed. A missing report does not end it.
+    const full = await read(campaign, LIVE_ROOM_SPEND_TREND, undefined, true).catch(() => null);
+    const checked = full ?? await readDetected(campaign);
+    const { context, policy, fenced } = checked, at = now();
+    const hold = (reason: PpanAutoTickReason, detail?: string) => ({ full: null, reason, detail });
+    if (!context) return hold("CAMPAIGN_ENDED", "CAMPAIGN_NOT_VISIBLE");
+    if (context.campaignId !== campaign || !freshContext(context, at) || !validAmount(context.budgetMinor) ||
+      !validSettingsFingerprint(context.fingerprint) || !freshPolicy(policy, at)) return hold("CONTEXT_UNAVAILABLE");
+    if (context.nativeAutoState !== "DISABLED" && context.nativeAutoState !== "UNKNOWN") return hold("NATIVE_AUTO_CONFLICT");
+    if (!validSettingsFingerprint(context.settingsFingerprint) || context.settingsFingerprint !== row.baselineSettingsFingerprint) {
+      return hold("BASELINE_CHANGED", "CAMPAIGN_SETTINGS_CHANGED");
+    }
+    if (fenced || policy.locked) return hold("WRITE_LOCKED");
+    let room = row.liveSessionId, start = row.lastBoundRoomStartedAt;
+    const current = verifiedDetectedRoom(context, at) ? context : null;
+    if (current && current.liveSessionId === room && current.liveSessionStartedAt !== start) return hold("LIVE_DELIVERY_UNVERIFIED");
+    if (current && current.liveSessionId !== room) {
+      // Do not re-attach to a previously ended room or go back to an earlier
+      // room just because TikTok is momentarily serving an old report.
+      if (start && instant(current.liveSessionStartedAt) <= instant(start)) return hold("LIVE_DELIVERY_UNVERIFIED");
+      room = current.liveSessionId;
+      start = current.liveSessionStartedAt;
+    } else if (!current && room) {
+      // An unscoped END-only report can be about some other room. Only an
+      // END scoped to the durable room ID is allowed to detach it.
+      const prior = await readDetected(campaign, room).catch(() => null);
+      if (prior?.context && validScheduledContext(prior.context, campaign, now()) &&
+        prior.context.fingerprint === context.fingerprint && prior.context.settingsFingerprint === context.settingsFingerprint &&
+        verifiedEnded(prior.context)) room = null;
+    }
+    if (room !== row.liveSessionId || start !== row.lastBoundRoomStartedAt || context.budgetMinor !== row.baselineBudgetMinor ||
+      context.fingerprint !== row.baselineFingerprint || policy.revision !== row.policyRevision) {
+      const advanced = await sessions.advanceContinuousSession(row, { liveSessionId: room, lastBoundRoomStartedAt: start,
+        budgetMinor: context.budgetMinor, fingerprint: context.fingerprint, settingsFingerprint: context.settingsFingerprint, policyRevision: policy.revision });
+      return advanced ? hold(room ? "SPEND_UPDATE_PENDING" : "LIVE_DELIVERY_UNVERIFIED") : hold("WRITE_LOCKED");
+    }
+    if (!current || !room || !full) return hold(current ? "SPEND_UPDATE_PENDING" : "LIVE_DELIVERY_UNVERIFIED");
+    return { full, reason: "SPEND_UPDATE_PENDING" as const, detail: undefined };
+  }
+
   async function status(operator: boolean, ownerId?: number, view?: "summary" | "detect-live") {
     const currentMode = canWaitForLive() ? "live" : mode();
     const readOwnerState = operator && (view !== "summary" || (typeof ownerId === "number" && Number.isSafeInteger(ownerId) && ownerId > 0));
@@ -172,10 +224,13 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     const visible = view === "summary" ? own : row;
     const evidence = visible && visible.status !== "STOPPED" ? visible.evidenceMode ?? "verified-room" : evidenceMode();
     const ownStatus = own?.status === "ACTIVE" ? (own.operationId ? "SENDING" : "ARMED") : own?.status;
+    const recentTick = own && ownStatus === "ARMED" && own.keepAutoAcrossRooms && lastTick?.sessionId === own.sessionId &&
+      now().getTime() - lastTick.at <= 180_000 ? lastTick.reason : null;
     const continuousSession = own && ownStatus ? { sessionId: own.sessionId, status: ownStatus,
-      startedAt: own.authorizedAt, reason: own.stopReason ?? (own.lastOutcome === "OUTCOME_UNKNOWN" ? own.lastOutcome : null),
+      startedAt: own.authorizedAt, reason: own.stopReason ?? (own.lastOutcome === "OUTCOME_UNKNOWN" ? own.lastOutcome : recentTick),
       ...(waiting(own) ? { waitingForLive: true as const } : {}), ...(own.autoDetectLive ? { autoDetectLive: true as const } : {}),
-      ...(own.allowExhaustedRecovery ? { allowExhaustedRecovery: true as const } : {}) } : null;
+      ...(own.allowExhaustedRecovery ? { allowExhaustedRecovery: true as const } : {}),
+      ...(own.keepAutoAcrossRooms ? { keepAutoAcrossRooms: true as const } : {}) } : null;
     const base = { clientId, strategy: "continuous" as const, mode: currentMode, grant: null, continuousSession,
       ...(evidence !== "verified-room" ? { evidenceMode: evidence } : {}),
       canStop: !!own && own.status !== "STOPPED" };
@@ -192,7 +247,9 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     if (currentMode === "disabled") return { ...base, canArm: false, preview: null, blockers: [] };
     try {
       const campaign = await discover();
-      if (!campaign) return { ...base, canArm: false, preview: null, blockers: ["CAMPAIGN_NOT_VISIBLE"] };
+      if (!campaign || (own?.status === "ACTIVE" && own.keepAutoAcrossRooms && campaign !== own.campaignId)) {
+        return { ...base, canArm: false, preview: null, blockers: ["CAMPAIGN_NOT_VISIBLE"] };
+      }
       const canRequest = currentMode === "live" && operator && state.ok && (!row || (row.status === "STOPPED" && !row.operationId));
       if (view === "detect-live" && canAutoDetect() && (canRequest || (own?.status === "ACTIVE" && (own.autoDetectLive || waiting(own))))) {
         const boundRoom = own?.status === "ACTIVE" ? own.liveSessionId ?? undefined : undefined;
@@ -202,11 +259,13 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
         if (exact && freshContext(exact.context, at) && verifiedDetectedRoom(exact.context, at) && expected(exact.context)) {
           const { context, policy, fenced } = exact;
           const verdict = preview(context, policy, at, LIVE_ROOM_SPEND_TREND);
-          const reasons = blockers(context, policy, fenced, at, LIVE_ROOM_SPEND_TREND);
+          const reasons: string[] = blockers(context, policy, fenced, at, LIVE_ROOM_SPEND_TREND);
+          if (!validSettingsFingerprint(context.settingsFingerprint) || (own?.status === "ACTIVE" && own.keepAutoAcrossRooms &&
+            context.settingsFingerprint !== own.baselineSettingsFingerprint)) reasons.push("CAMPAIGN_SETTINGS_CHANGED");
           if (boundRoom && verdict.status === "WOULD_INCREASE" && !reasons.length) reasons.push("SPEND_TREND_PENDING");
           return { ...base, evidenceMode: LIVE_ROOM_SPEND_TREND,
-            canArm: canRequest && canStart(context, policy, fenced, at, LIVE_ROOM_SPEND_TREND) && !await legacyBusy(), blockers: reasons,
-            preview: { status: verdict.status, autoDetectLive: true as const, allowExhaustedRecovery: true as const, campaignId: campaign, currentBudgetMinor: context.budgetMinor,
+            canArm: canRequest && !reasons.length && canStart(context, policy, fenced, at, LIVE_ROOM_SPEND_TREND) && !await legacyBusy(), blockers: reasons,
+            preview: { status: verdict.status, autoDetectLive: true as const, allowExhaustedRecovery: true as const, keepAutoAcrossRooms: true as const, campaignId: campaign, currentBudgetMinor: context.budgetMinor,
               liveSessionId: context.liveSessionId, liveSessionStartedAt: context.liveSessionStartedAt, spendMinor: context.spendMinor, policyRevision: policy.revision,
               thresholdMinor: Number((BigInt(context.budgetMinor) * 8n + 9n) / 10n), targetBudgetMinor: verdict.status === "WOULD_INCREASE" ? verdict.targetBudgetMinor : null,
               projectedClientSpendMinor: verdict.status === "WOULD_INCREASE" ? verdict.projectedClientSpendMinor : null, observedAt: context.observedAt } };
@@ -214,13 +273,15 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
         const { context, policy, fenced } = await readDetected(campaign, boundRoom), checkedAt = now();
         if (!context || !validScheduledContext(context, campaign, checkedAt)) return { ...base, canArm: false, preview: null, blockers: ["CONTEXT_UNAVAILABLE"] };
         const reasons = scheduledBlockers(context, policy, fenced, checkedAt);
+        if (!validSettingsFingerprint(context.settingsFingerprint) || (own?.status === "ACTIVE" && own.keepAutoAcrossRooms &&
+          context.settingsFingerprint !== own.baselineSettingsFingerprint)) reasons.push("CAMPAIGN_SETTINGS_CHANGED");
         const matched = verifiedDetectedRoom(context, checkedAt) && expected(context) ? context : null;
         if (!matched && boundRoom) reasons.push("LIVE_DELIVERY_UNVERIFIED");
         if (!matched && context.roomEvidenceIssue === "STALE_ONGOING" && !canRequest) reasons.push("LIVE_ROOM_REPORT_STALE");
         return { ...base, evidenceMode: LIVE_ROOM_SPEND_TREND, canArm: canRequest && !reasons.length && !await legacyBusy(), blockers: reasons,
           preview: { ...(matched ? { status: "LIVE_WAITING_FOR_SPEND", liveSessionId: matched.liveSessionId, liveSessionStartedAt: matched.liveSessionStartedAt }
             : { status: "WAITING_FOR_LIVE", waitingForLive: true as const, liveSessionId: null }),
-            autoDetectLive: true as const, allowExhaustedRecovery: true as const, campaignId: campaign, currentBudgetMinor: context.budgetMinor, spendMinor: null,
+            autoDetectLive: true as const, allowExhaustedRecovery: true as const, keepAutoAcrossRooms: true as const, campaignId: campaign, currentBudgetMinor: context.budgetMinor, spendMinor: null,
             policyRevision: policy.revision, thresholdMinor: Number((BigInt(context.budgetMinor) * 8n + 9n) / 10n), targetBudgetMinor: null,
             projectedClientSpendMinor: null, observedAt: context.observedAt } };
       }
@@ -265,10 +326,13 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     const trend = input.evidenceMode === "spend-trend";
     const autoDetectLive = input.autoDetectLive === true;
     const allowExhaustedRecovery = input.allowExhaustedRecovery === true;
+    const keepAutoAcrossRooms = input.keepAutoAcrossRooms === true;
+    let lastBoundRoomStartedAt: string | undefined;
     const wait = input.expectedLiveSessionId === null && evidence === LIVE_ROOM_SPEND_TREND && canWaitForLive();
     if (!allowedEvidence(evidence) || !supportsContinuousEvidence(clientId, evidence) || !WEB_BUDGET_CAMPAIGN_ID.test(input.expectedCampaignId) ||
       (input.autoDetectLive !== undefined && (!autoDetectLive || evidence !== LIVE_ROOM_SPEND_TREND || !canAutoDetect())) ||
       (input.allowExhaustedRecovery !== undefined && (!allowExhaustedRecovery || !autoDetectLive)) ||
+      (input.keepAutoAcrossRooms !== undefined && (!keepAutoAcrossRooms || !autoDetectLive)) ||
       input.evidenceMode !== (evidence === "verified-room" ? undefined : evidence) ||
       (trend ? input.expectedLiveSessionId !== undefined || input.nativeAutoOff !== undefined || input.noConcurrentChanges !== undefined
         : (!wait && (typeof input.expectedLiveSessionId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(input.expectedLiveSessionId))) ||
@@ -277,8 +341,13 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     if (!campaignId || campaignId !== input.expectedCampaignId) throw unavailable();
     const ready = autoDetectLive ? await readDetected(campaignId, input.expectedLiveSessionId ?? undefined).then(({ context, policy, fenced }) => {
       const at = now();
-      return context && validScheduledContext(context, campaignId, at) && !scheduledBlockers(context, policy, fenced, at).length &&
-        (wait || verifiedDetectedRoom(context, at) && context.liveSessionId === input.expectedLiveSessionId) ? { context, policy } : null;
+      if (!context || !validScheduledContext(context, campaignId, at) || scheduledBlockers(context, policy, fenced, at).length ||
+        (keepAutoAcrossRooms && !validSettingsFingerprint(context.settingsFingerprint))) return null;
+      if (!wait) {
+        if (!verifiedDetectedRoom(context, at) || context.liveSessionId !== input.expectedLiveSessionId) return null;
+        lastBoundRoomStartedAt = context.liveSessionStartedAt;
+      }
+      return { context, policy };
     }) : wait ? await readScheduled(campaignId).then(({ context, policy, fenced }) => {
       const at = now();
       return context && validScheduledContext(context, campaignId, at) && !scheduledBlockers(context, policy, fenced, at).length ? { context, policy } : null;
@@ -293,7 +362,9 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       ...(trend ? { evidenceMode: "spend-trend" as const, liveSessionId: null, nativeAutoOffAttested: false as const, noConcurrentChangesAttested: false as const }
         : { ...(evidence === LIVE_ROOM_SPEND_TREND ? { evidenceMode: evidence } : {}), liveSessionId: input.expectedLiveSessionId,
           nativeAutoOffAttested: true as const, noConcurrentChangesAttested: true as const,
-          ...(autoDetectLive ? { autoDetectLive: true as const } : {}), ...(allowExhaustedRecovery ? { allowExhaustedRecovery: true as const } : {}) }) });
+          ...(autoDetectLive ? { autoDetectLive: true as const } : {}), ...(allowExhaustedRecovery ? { allowExhaustedRecovery: true as const } : {}),
+          ...(keepAutoAcrossRooms ? { keepAutoAcrossRooms: true as const, baselineSettingsFingerprint: context.settingsFingerprint,
+            ...(lastBoundRoomStartedAt ? { lastBoundRoomStartedAt } : {}) } : {}) }) });
     if (!row) throw new WebBudgetError("AUTO_BUDGET_SESSION_EXISTS", 409, "มีรอบ Auto หรือรายการที่ยังต้องตรวจสอบอยู่แล้ว");
     return { sessionId: row.sessionId, startedAt: row.authorizedAt, ...(wait ? { waitingForLive: true as const } : {}) };
   }
@@ -328,6 +399,7 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     if (busy) return;
     busy = true;
     let reason: PpanAutoTickReason = "ERROR", sessionId: string | null = null, lastValidReadAt: string | null = null;
+    let publicDetail: string | undefined;
     try {
       const row = await sessions.getLatest();
       if (!row) { pulse = undefined; reason = "NOT_ARMED"; return; }
@@ -335,9 +407,10 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       const evidence = row.evidenceMode ?? "verified-room", trend = evidence === "spend-trend";
       const roomTrend = evidence === LIVE_ROOM_SPEND_TREND, needsPair = trend || roomTrend;
       const rounding = roundingFor(evidence);
+      const persistent = row.keepAutoAcrossRooms === true;
       if (row.status === "ACTIVE" && !allowedEvidence(evidence)) {
         reason = "AUTO_DISABLED";
-        await sessions.stop(row.ownerId, row.sessionId, "AUTO_DISABLED");
+        if (!persistent) await sessions.stop(row.ownerId, row.sessionId, "AUTO_DISABLED");
       }
       if (row.operationId) { pulse = undefined; await reconcile(row); reason = row.lastOutcome === "OUTCOME_UNKNOWN" ? "OUTCOME_UNKNOWN" : "PENDING"; return; }
       if (row.status !== "ACTIVE" || !allowedEvidence(evidence)) { pulse = undefined; if (reason !== "AUTO_DISABLED") reason = "SESSION_STOPPED"; return; }
@@ -345,13 +418,22 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       if (await legacyBusy()) { if (roomTrend) pulse = undefined; reason = "LEGACY_BUSY"; return; }
       reason = "CONTEXT_UNAVAILABLE";
       const campaign = await discover();
-      if (campaign !== row.campaignId) { pulse = undefined; await sessions.stop(row.ownerId, row.sessionId, "CAMPAIGN_ENDED"); reason = "CAMPAIGN_ENDED"; return; }
-      // The newer opt-in covers the current exact room if there is one. It
-      // does not grant authority over a replacement after a room is bound.
+      if (campaign !== row.campaignId) {
+        pulse = undefined; reason = "CAMPAIGN_ENDED";
+        if (persistent) publicDetail = "CAMPAIGN_NOT_VISIBLE";
+        else await sessions.stop(row.ownerId, row.sessionId, "CAMPAIGN_ENDED");
+        return;
+      }
+      // Legacy auto-detect binds only one room. Only the separate persistent
+      // opt-in can move to a replacement room for the same campaign.
       const autoDetect = row.autoDetectLive === true;
       if (autoDetect && !canAutoDetect()) { pulse = undefined; return; }
-      const detectedFull = autoDetect && !waiting(row)
-        ? await read(campaign, evidence, row.liveSessionId ?? undefined, true).catch(() => null) : null;
+      const tracking = persistent ? await trackPersistent(row, campaign) : null;
+      if (tracking && !tracking.full) {
+        pulse = undefined; reason = tracking.reason; publicDetail = tracking.detail; return;
+      }
+      const detectedFull = tracking?.full ?? (autoDetect && !waiting(row)
+        ? await read(campaign, evidence, row.liveSessionId ?? undefined, true).catch(() => null) : null);
       if (autoDetect && (waiting(row) || !detectedFull)) {
         pulse = undefined;
         const { context, policy, fenced } = await readDetected(campaign, row.liveSessionId ?? undefined), at = now();
@@ -480,6 +562,10 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
       reason = result.status === "APPLIED_VERIFIED" || result.status === "NOT_SENT" || result.status === "OUTCOME_UNKNOWN" ? result.status : "PENDING";
     } catch (error) { pulse = undefined; throw error; } finally {
       busy = false;
+      const display = publicDetail ?? (["AUTO_DISABLED", "CONTEXT_UNAVAILABLE", "NATIVE_AUTO_CONFLICT", "LINE_NOT_READY", "WRITE_LOCKED",
+        "LIVE_DELIVERY_UNVERIFIED", "SPEND_UPDATE_PENDING", "SPEND_TREND_PENDING", "BELOW_THRESHOLD", "CAP_REACHED", "TARGET_UNAVAILABLE",
+        "LEGACY_BUSY"].includes(reason) ? reason : undefined);
+      lastTick = sessionId && display ? { sessionId, at: now().getTime(), reason: display } : undefined;
       if (observeTick) await observeTick({ checkedAt: now().toISOString(), reason, sessionId, lastValidReadAt }).catch(() => undefined);
     }
   }

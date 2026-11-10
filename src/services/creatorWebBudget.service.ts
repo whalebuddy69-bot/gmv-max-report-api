@@ -23,6 +23,7 @@ export interface WebBudgetPolicy {
 }
 interface WebBudgetCampaignEvidence {
   campaignId: string; reportingDate: string; observedAt: string; budgetMinor: number; fingerprint: string;
+  settingsFingerprint?: string;
   nativeAutoState: "DISABLED" | "UNKNOWN" | "ENABLED" | "CONFLICT";
 }
 export interface WebBudgetPreArmContext extends WebBudgetCampaignEvidence {

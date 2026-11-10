@@ -39,6 +39,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
     [`CREATOR_AUTO_BUDGET_${extra.clientId.toUpperCase()}_MODE`]: "live", [`CREATOR_AUTO_BUDGET_${extra.clientId.toUpperCase()}_LIVE_ENABLED`]: "true" } :
     { CREATOR_AUTO_BUDGET_LIVE_ENABLED: "true", CREATOR_AUTO_BUDGET_MODE: "live", CREATOR_AUTO_BUDGET_PPAN_CONTINUOUS_LIVE_ENABLED: "true" };
   let budget = 2800, roi = 15, stamp = "2025-03-15 08:55:00", spend = "2100.09", otherSpend = "20.00", secondaryStatus = options.secondaryStatus;
+  let detailSecondaryStatus: unknown;
   let daily = options.daily ?? (() => ({ page_info: pageInfo(2), list: [dailyRow(CAMPAIGN), dailyRow(MISSING_CAMPAIGN, 0)] }));
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input));
@@ -101,7 +102,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
       store_id: "0", store_authorized_bc_id: "0", operation_status: "ENABLE", budget, roas_bid: roi,
       optimization_goal: "VALUE", deep_bid_type: "VO_MIN_ROAS", schedule_type: "SCHEDULE_FROM_NOW",
       schedule_start_time: "2025-03-15 08:30:00", ...(options.nativeUnknown ? {} : { auto_budget_enabled: options.competing === true }),
-      promotion_days: { is_enabled: false }, identity_list: [{ identity_id: binding.identityId,
+      ...(detailSecondaryStatus === undefined ? {} : { secondary_status: detailSecondaryStatus }), promotion_days: { is_enabled: false }, identity_list: [{ identity_id: binding.identityId,
         identity_type: binding.identityType, identity_authorized_bc_id: binding.identityAuthorizedBcId }], ...options.campaignInfo } });
     if (url.pathname.endsWith("/gmv_max/report/get/")) {
       expect(method).toBe("GET");
@@ -136,6 +137,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
         [`CREATOR_WEB_${options.extraClient.toUpperCase()}_BUDGET_LIVE_ENABLED`]: options.extraLive ? "true" : "false" } : {}),
       CREATOR_BUDGET_TEST_ENABLED: options.legacy ? "true" : "false", CREATOR_WEB_POLICY_BRIDGE_KEY: options.policyKey ?? KEY, ...scheduledEnv } });
   return { adapters, calls, queries, edit(value: number) { budget = value; stamp = "2025-03-15 08:59:30"; }, setSpend(value: string) { spend = value; },
+    setRoi(value: number) { roi = value; }, setDetailSecondaryStatus(value: unknown) { detailSecondaryStatus = value; },
     setOtherSpend(value: string) { otherSpend = value; }, setDaily(value: typeof daily) { daily = value; }, setSecondaryStatus(value: unknown) { secondaryStatus = value; },
     async input(targetBudgetMinor = 310_000, source?: WebBudgetSource) {
       const ctx = await adapters.readContext(CAMPAIGN, source);
@@ -174,6 +176,25 @@ describe("exact GMV campaign delivery telemetry", () => {
     expect(new Set([absent.fingerprint, enabled.fingerprint, exhausted.fingerprint]).size).toBe(1);
     expect(await h.adapters.readPreArmContext!(CAMPAIGN)).not.toHaveProperty("campaignDeliveryStatus");
   });
+
+  it("separates budget revision from settings across pre-arm, room-only and strict provider reads", async () => {
+    const h = harness({ extraClient: "ashopbytheta", room: "ONGOING", detectRoom: true, roomCost: "20.00" });
+    const before = await h.adapters.readScheduledLiveContext!(CAMPAIGN, ROOM, true);
+    expect(before.settingsFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect((await h.adapters.readPreArmContext!(CAMPAIGN))?.settingsFingerprint).toBe(before.settingsFingerprint);
+    expect((await h.adapters.readAutoDetectContext!(CAMPAIGN))?.settingsFingerprint).toBe(before.settingsFingerprint);
+    h.edit(3000);
+    h.setSecondaryStatus("CAMPAIGN_STATUS_BUDGET_EXCEED");
+    h.setDetailSecondaryStatus("CAMPAIGN_STATUS_BUDGET_EXCEED");
+    const budgetEdit = await h.adapters.readScheduledLiveContext!(CAMPAIGN, ROOM, true);
+    expect(budgetEdit.settingsFingerprint).toBe(before.settingsFingerprint);
+    expect(budgetEdit.fingerprint).not.toBe(before.fingerprint);
+    h.setRoi(16);
+    const settingsEdit = await h.adapters.readScheduledLiveContext!(CAMPAIGN, ROOM, true);
+    expect(settingsEdit.settingsFingerprint).not.toBe(before.settingsFingerprint);
+    expect((await h.adapters.readPreArmContext!(CAMPAIGN))?.settingsFingerprint).toBe(settingsEdit.settingsFingerprint);
+    expect(h.providerPosts()).toHaveLength(0);
+  });
 });
 
 describe("exact read-only scheduled Auto context", () => {
@@ -181,7 +202,8 @@ describe("exact read-only scheduled Auto context", () => {
     const h = harness({ ...options, targetAbsent: true, nativeUnknown: true, campaignInfo: {
       schedule_type: "SCHEDULE_START_END", schedule_start_time: "2025-03-15 10:00:00", schedule_end_time: "2025-03-15 12:00:00" } });
     await expect(h.adapters.readPreArmContext!(CAMPAIGN)).resolves.toEqual({ campaignId: CAMPAIGN,
-      reportingDate: TODAY, observedAt: NOW, budgetMinor: 280_000, fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/), nativeAutoState: "UNKNOWN",
+      reportingDate: TODAY, observedAt: NOW, budgetMinor: 280_000, fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+      settingsFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/), nativeAutoState: "UNKNOWN",
       scheduleStartAt: "2025-03-15T10:00:00.000Z", scheduleEndAt: "2025-03-15T12:00:00.000Z" });
     expect(h.calls.map(x => [x.method, x.path])).toEqual([["GET", "/open_api/v1.3/advertiser/info/"],
       ["GET", "/open_api/v1.3/gmv_max/campaign/get/"], ["GET", "/open_api/v1.3/campaign/gmv_max/info/"]]);

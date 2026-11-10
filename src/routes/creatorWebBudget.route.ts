@@ -162,9 +162,15 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
       throw new WebBudgetError("AUTO_BUDGET_NOT_CONFIGURED", 404, "ยังไม่ได้ตั้งค่า Auto สำหรับ Creator นี้");
     }
     const roomFields = [...base, "expectedLiveSessionId", "nativeAutoOff", "noConcurrentChanges", "evidenceMode"];
-    const exhaustedRecovery = fields(value, [...roomFields, "autoDetectLive", "allowExhaustedRecovery"]) &&
+    const detectFields = [...roomFields, "autoDetectLive"];
+    const recoveryFields = [...detectFields, "allowExhaustedRecovery"];
+    const persistentWithRecovery = fields(value, [...recoveryFields, "keepAutoAcrossRooms"]) &&
+      value.keepAutoAcrossRooms === true && value.autoDetectLive === true && value.allowExhaustedRecovery === true;
+    const keepAutoAcrossRooms = persistentWithRecovery || fields(value, [...detectFields, "keepAutoAcrossRooms"]) &&
+      value.keepAutoAcrossRooms === true && value.autoDetectLive === true;
+    const exhaustedRecovery = persistentWithRecovery || fields(value, recoveryFields) &&
       value.autoDetectLive === true && value.allowExhaustedRecovery === true;
-    const newDetection = exhaustedRecovery || fields(value, [...roomFields, "autoDetectLive"]) && value.autoDetectLive === true;
+    const newDetection = keepAutoAcrossRooms || exhaustedRecovery || fields(value, detectFields) && value.autoDetectLive === true;
     const roomInput = fields(value, roomFields) || newDetection;
     if (continuous && (isVerifiedRoomCreator(firstSegment(req)) || firstSegment(req) === "nnshop5719" ||
       roomInput && value.evidenceMode === LIVE_ROOM_SPEND_TREND)) {
@@ -178,7 +184,8 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
         expectedBudgetMinor: value.expectedBudgetMinor, expectedPolicyRevision: value.expectedPolicyRevision,
         evidenceMode: LIVE_ROOM_SPEND_TREND, nativeAutoOff: true, noConcurrentChanges: true,
         ...(newDetection ? { autoDetectLive: true as const } : {}),
-        ...(exhaustedRecovery ? { allowExhaustedRecovery: true as const } : {}) }, () => recheck(req, id));
+        ...(exhaustedRecovery ? { allowExhaustedRecovery: true as const } : {}),
+        ...(keepAutoAcrossRooms ? { keepAutoAcrossRooms: true as const } : {}) }, () => recheck(req, id));
     }
     if (continuous && !isVerifiedRoomCreator(firstSegment(req)) && fields(value, [...base, "evidenceMode"]) && value.evidenceMode === "spend-trend") {
       if (typeof value.expectedCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.expectedCampaignId)
