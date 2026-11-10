@@ -98,6 +98,13 @@ function validGrant(value: unknown): value is CreatorAutoBudgetGrant {
     bangkokDay(new Date(start)) === g.reportingDate && end <= dateEnd(g.reportingDate);
 }
 
+/** The exact same target is used before arming, while waiting, and before a write. */
+export function calculateCreatorAutoBudgetTarget(budgetMinor: number, rounding?: "floor-satang"): bigint | null {
+  if (!positive(budgetMinor, WEB_BUDGET_MAX_MINOR)) return null;
+  const baseline = BigInt(budgetMinor), scaled = baseline * 12n, target = scaled / 10n;
+  return (rounding === "floor-satang" || scaled % 10n === 0n) && target > baseline && target <= MAX_MONEY ? target : null;
+}
+
 /** Pure advisory calculation. This result carries no authorization or provider freshness proof. */
 export function previewCreatorAutoBudget({ now, context, policy, rounding }: {
   now: Date; context: WebBudgetContext | null; policy: WebBudgetPolicy | null; rounding?: "floor-satang";
@@ -118,9 +125,8 @@ export function previewCreatorAutoBudget({ now, context, policy, rounding }: {
   const baseline = BigInt(context.budgetMinor);
   const threshold = (baseline * 8n + 9n) / 10n;
   if (BigInt(context.spendMinor) < threshold) return { status: "BELOW_THRESHOLD" };
-  const scaled = baseline * 12n;
-  const target = scaled / 10n;
-  if ((rounding !== "floor-satang" && scaled % 10n !== 0n) || target <= baseline || target > MAX_MONEY) return { status: "TARGET_NOT_EXACT" };
+  const target = calculateCreatorAutoBudgetTarget(context.budgetMinor, rounding);
+  if (target === null) return { status: "TARGET_NOT_EXACT" };
   if (target <= BigInt(context.spendMinor)) return { status: "TARGET_BELOW_SPEND" };
   if (target > BigInt(policy.campaignCapMinor)) return { status: "CAMPAIGN_CAP_EXCEEDED" };
   const projected = target + BigInt(context.aggregateSpendMinor - context.spendMinor);

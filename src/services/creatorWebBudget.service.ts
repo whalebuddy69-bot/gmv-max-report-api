@@ -211,7 +211,7 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
         (clientId === WEB_BUDGET_CLIENT_ID ? autoRounding !== "floor-satang" : autoRounding !== undefined) ||
         input.nativeAutoOff !== undefined || input.noConcurrentChanges !== undefined)
         : (input.nativeAutoOff !== true || input.noConcurrentChanges !== true || (useRoomTrend ?
-          (!allowsScheduledCreatorAuto(clientId) || initial.source !== "auto" || !autoGuard || autoRounding !== undefined) :
+          (!allowsScheduledCreatorAuto(clientId) || initial.source !== "auto" || !autoGuard) :
           (input.evidenceMode !== undefined || (initial.source === "auto" && isVerifiedRoomCreator(clientId)))))) {
         reject("BUDGET_ATTESTATION_REQUIRED", 400, "ต้องยืนยันสิทธิ์และเงื่อนไขการปรับงบ");
       }
