@@ -170,9 +170,9 @@ describe("Ppan continuous budget automation", () => {
     expect(f.observeCheckHealth).toHaveBeenCalledTimes(before);
   });
 
-  it("uses the same rounded-down Ppan target in verified LIVE preview, arm, and final leased write", async () => {
+  it("uses the same whole-baht round-up in verified Ppan LIVE preview, arm, and final leased write", async () => {
     const f = fixture("live", "spend-trend", "punpan_020", true, true);
-    const budgetMinor = 1_289_944, targetBudgetMinor = 1_547_932;
+    const budgetMinor = 1_289_944, targetBudgetMinor = 1_548_000;
     f.refresh(0, { budgetMinor, spendMinor: 1_049_429, aggregateSpendMinor: 1_049_429, roomSpendMinor: 900_000,
       liveSessionStartedAt: "2026-11-07T13:00:00.000Z" });
     f.setPolicy({ campaignCapMinor: targetBudgetMinor, clientDailyCapMinor: targetBudgetMinor });
@@ -185,32 +185,44 @@ describe("Ppan continuous budget automation", () => {
     expect(f.dispatch).not.toHaveBeenCalled();
     f.refresh(60_000, { spendMinor: 1_059_429, aggregateSpendMinor: 1_059_429, roomSpendMinor: 910_000 }); await f.service.tick();
     expect(f.writes).toEqual([targetBudgetMinor]);
+    expect(f.sessions.reserve).toHaveBeenCalledWith(expect.any(Object), expect.any(String), targetBudgetMinor, "ceil-baht");
     expect(f.adapters.acquireLease).toHaveBeenCalledWith(expect.any(String), CAP_REVISION,
-      { previousBudgetMinor: budgetMinor, targetBudgetMinor, rounding: "floor-satang" });
+      { previousBudgetMinor: budgetMinor, targetBudgetMinor, rounding: "ceil-baht" });
     expect(f.lineOutbox.size).toBe(1);
   });
 
   it("applies the same rounding when Ppan pre-arms without a room but still blocks below the rounded ceiling", async () => {
     const f = fixture("live", "spend-trend", "punpan_020", true, true);
     f.refresh(0, { budgetMinor: 1_289_944, liveDeliveryState: "UNKNOWN", deliveryVerified: false, liveSessionId: null });
-    f.setPolicy({ campaignCapMinor: 1_547_931, clientDailyCapMinor: 1_547_931 });
+    f.setPolicy({ campaignCapMinor: 1_547_999, clientDailyCapMinor: 1_547_999 });
     expect(await f.service.status(true, OWNER, "detect-live")).toMatchObject({ canArm: false, blockers: ["SCHEDULED_CAP_TOO_LOW"] });
-    f.setPolicy({ campaignCapMinor: 1_547_932, clientDailyCapMinor: 1_547_932 });
+    f.setPolicy({ campaignCapMinor: 1_548_000, clientDailyCapMinor: 1_548_000 });
     expect(await f.service.status(true, OWNER, "detect-live")).toMatchObject({ canArm: true, blockers: [], preview: { status: "WAITING_FOR_LIVE" } });
     await f.service.arm(OWNER, { ...CONFIRM, expectedBudgetMinor: 1_289_944, expectedLiveSessionId: null,
       evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true, keepAutoAcrossRooms: true }, async () => true);
     expect(f.ledger.create).not.toHaveBeenCalled();
   });
 
-  it("does not broaden rounding authorization for other creator scopes", async () => {
-    const f = fixture("live", LIVE_ROOM_SPEND_TREND, "bubpa_shop189", true, true);
-    f.refresh(0, { budgetMinor: 1_289_944, spendMinor: 1_049_429, aggregateSpendMinor: 1_049_429, roomSpendMinor: 900_000,
+  it("rounds a fractional Kool budget up and uses the verified whole-baht result as the next baseline", async () => {
+    const f = fixture("live", LIVE_ROOM_SPEND_TREND, "koolkool888", true, true);
+    const budgetMinor = 497_664, targetBudgetMinor = 597_200;
+    f.refresh(0, { budgetMinor, spendMinor: 459_404, aggregateSpendMinor: 501_011, roomSpendMinor: 423_638,
       liveSessionStartedAt: "2026-11-07T13:00:00.000Z" });
-    f.setPolicy({ campaignCapMinor: 3_100_000, clientDailyCapMinor: 3_100_000 });
-    expect(await f.service.status(true, OWNER, "detect-live")).toMatchObject({ canArm: false, preview: { status: "TARGET_NOT_EXACT" } });
-    await expect(f.service.arm(OWNER, { ...CONFIRM, expectedBudgetMinor: 1_289_944, evidenceMode: LIVE_ROOM_SPEND_TREND,
-      autoDetectLive: true, keepAutoAcrossRooms: true }, async () => true)).rejects.toMatchObject({ code: "AUTO_BUDGET_NOT_READY" });
+    f.setPolicy({ campaignCapMinor: 1_000_000, clientDailyCapMinor: 638_806 });
+    expect(await f.service.status(true, OWNER, "detect-live")).toMatchObject({ preview: { status: "CLIENT_DAILY_CAP_EXCEEDED", targetBudgetMinor: null } });
+    f.setPolicy({ clientDailyCapMinor: 1_000_000 });
+    expect(await f.service.status(true, OWNER, "detect-live")).toMatchObject({ canArm: true, preview: { status: "WOULD_INCREASE", targetBudgetMinor, projectedClientSpendMinor: 638_807 } });
+    await f.service.arm(OWNER, { ...CONFIRM, expectedBudgetMinor: budgetMinor, evidenceMode: LIVE_ROOM_SPEND_TREND,
+      autoDetectLive: true, keepAutoAcrossRooms: true }, async () => true);
+    f.refresh(60_000); await f.service.tick();
     expect(f.dispatch).not.toHaveBeenCalled();
+    f.refresh(60_000, { spendMinor: 460_404, aggregateSpendMinor: 502_011, roomSpendMinor: 424_638 }); await f.service.tick();
+    expect(f.writes).toEqual([targetBudgetMinor]);
+    expect(await f.sessions.getLatest()).toMatchObject({ status: "ACTIVE", baselineBudgetMinor: targetBudgetMinor });
+    f.refresh(60_000, { spendMinor: 478_000, aggregateSpendMinor: 519_607, roomSpendMinor: 440_000 }); await f.service.tick();
+    f.refresh(60_000, { spendMinor: 479_000, aggregateSpendMinor: 520_607, roomSpendMinor: 441_000 }); await f.service.tick();
+    expect(f.writes).toEqual([targetBudgetMinor, 716_700]);
+    expect(f.lineOutbox.size).toBe(2);
   });
 
   it("keeps one authorization across three verified rooms, ignores an old room, and adopts a manual budget before any write", async () => {

@@ -1,14 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  createCreatorWebBudgetService, WebBudgetAdapters, WebBudgetMode, WebBudgetRecord, WebBudgetStore,
+  createCreatorWebBudgetService, WebBudgetAdapters, WebBudgetMode, WebBudgetPolicy, WebBudgetRecord, WebBudgetStore,
 } from "./creatorWebBudget.service";
+import { LIVE_ROOM_SPEND_TREND, type CreatorBudgetScope } from "./creatorBudgetScope";
 
 const CAMPAIGN = "90000000000001", OTHER_CAMPAIGN = "90000000000002", OWNER = 27;
 const CURRENT = 120_000, TARGET = 150_000;
 const PREPARE = { expectedCampaignId: CAMPAIGN, expectedBudgetMinor: CURRENT, targetBudgetMinor: TARGET };
-function harness(initialMode: WebBudgetMode = "dry-run") {
+function harness(initialMode: WebBudgetMode = "dry-run", clientId: CreatorBudgetScope = "punpan_020") {
   let mode = initialMode, at = Date.parse("2026-06-09T04:00:00.000Z");
-  let cap = { revision: 3, campaignCapMinor: 600_000, clientDailyCapMinor: 800_000, locked: false };
+  let cap: Omit<WebBudgetPolicy, "readAt"> = { revision: 3, campaignCapMinor: 600_000, clientDailyCapMinor: 800_000, locked: false };
   let context: Omit<Awaited<ReturnType<WebBudgetAdapters["readContext"]>>, "observedAt"> = {
     campaignId: CAMPAIGN, reportingDate: "2026-06-09", budgetMinor: CURRENT, spendMinor: 40_000, aggregateSpendMinor: 160_000,
     fingerprint: "a".repeat(64), nativeAutoState: "UNKNOWN",
@@ -36,16 +37,17 @@ function harness(initialMode: WebBudgetMode = "dry-run") {
   const adapters = {
     readPolicy: vi.fn<WebBudgetAdapters["readPolicy"]>(async () => ({ ...cap, readAt: iso() })),
     readContext: vi.fn<WebBudgetAdapters["readContext"]>(async () => ({ ...context, observedAt: iso() })),
+    readScheduledLiveContext: vi.fn<NonNullable<WebBudgetAdapters["readScheduledLiveContext"]>>(async () => ({ ...context, observedAt: iso() })),
     acquireLease: vi.fn<WebBudgetAdapters["acquireLease"]>(async operationId => {
       trace.push("lease"); return { ...cap, locked: true, readAt: iso(), operationId, expiresAt: new Date(at + 60_000).toISOString() };
     }),
     dispatch: vi.fn<WebBudgetAdapters["dispatch"]>(async input => {
       trace.push("dispatch");
-      return await input.canSend() ? { outcome: "APPLIED_VERIFIED", observedBudgetMinor: input.targetBudgetMinor } : { outcome: "NOT_SENT" };
+      return await input.canSend({ ...context, observedAt: iso() }) ? { outcome: "APPLIED_VERIFIED", observedBudgetMinor: input.targetBudgetMinor } : { outcome: "NOT_SENT" };
     }),
     finishLease: vi.fn<WebBudgetAdapters["finishLease"]>(async () => { trace.push("release"); }),
   };
-  const service = createCreatorWebBudgetService({ store, adapters, mode: () => mode, now: () => new Date(at) });
+  const service = createCreatorWebBudgetService({ store, adapters, clientId, mode: () => mode, now: () => new Date(at) });
   const confirm = (operationId: string, owner = OWNER, recheck = async () => true) =>
     service.confirm(owner, { operationId, nativeAutoOff: true, noConcurrentChanges: true }, recheck);
   return { rows, trace, store, service, adapters, confirm, setMode: (value: WebBudgetMode) => { mode = value; },
@@ -169,5 +171,56 @@ describe("Creator web budget workflow", () => {
       operationId, expiresAt: "2026-06-09T04:00:01.000Z" }));
     expect(await h.confirm(next.operationId)).toMatchObject({ status: "NOT_SENT" });
     expect(h.adapters.dispatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Creator verified LIVE whole-baht Auto writer", () => {
+  const BASE = 497_664, CEILING_TARGET = 597_200;
+  const live = { nativeAutoOff: true as const, noConcurrentChanges: true as const, evidenceMode: LIVE_ROOM_SPEND_TREND };
+  const op = { expectedCampaignId: CAMPAIGN, expectedBudgetMinor: BASE, targetBudgetMinor: CEILING_TARGET };
+  function ready(scope: CreatorBudgetScope = "koolkool888") {
+    const h = harness("live", scope);
+    h.setCap({ autoLineReady: true });
+    h.setContext({ budgetMinor: BASE, deliveryVerified: true, liveDeliveryState: "LIVE", liveSessionId: OTHER_CAMPAIGN,
+      liveSessionStartedAt: "2026-06-09T03:00:00.000Z" });
+    return h;
+  }
+
+  it("sends only the exact approved ceiling proof to the lease and strict room writer", async () => {
+    const h = ready(), row = await h.service.prepare(OWNER, op, "auto");
+    h.adapters.dispatch.mockResolvedValueOnce({ outcome: "APPLIED_VERIFIED", observedBudgetMinor: CEILING_TARGET, observedFingerprint: "b".repeat(64) });
+    expect(await h.service.confirm(OWNER, { operationId: row.operationId, ...live }, async () => true, async () => true, "ceil-baht"))
+      .toMatchObject({ status: "APPLIED_VERIFIED", observedBudgetMinor: CEILING_TARGET });
+    expect(h.adapters.acquireLease).toHaveBeenCalledWith(row.operationId, 3,
+      { previousBudgetMinor: BASE, targetBudgetMinor: CEILING_TARGET, rounding: "ceil-baht" });
+    expect(h.adapters.dispatch).toHaveBeenCalledWith(expect.objectContaining({ source: "auto", evidenceMode: LIVE_ROOM_SPEND_TREND,
+      autoRounding: "ceil-baht", expectedBudgetMinor: BASE, targetBudgetMinor: CEILING_TARGET }));
+  });
+
+  it.each([597_196, 597_197, 597_201])("does not reserve or lease a malformed rounded target %s", async targetBudgetMinor => {
+    const h = ready(), row = await h.service.prepare(OWNER, { ...op, targetBudgetMinor }, "auto");
+    await expect(h.service.confirm(OWNER, { operationId: row.operationId, ...live }, async () => true, async () => true, "ceil-baht"))
+      .rejects.toMatchObject({ code: "BUDGET_INPUT_INVALID" });
+    expect(h.trace).toHaveLength(0);
+  });
+
+  it("does not use rounded authority for manual or legacy non-room paths", async () => {
+    const h = ready("punpan_020"), manual = await h.service.prepare(OWNER, op), auto = await h.service.prepare(OWNER, op, "auto");
+    await expect(h.service.confirm(OWNER, { operationId: manual.operationId, ...live }, async () => true, undefined, "ceil-baht"))
+      .rejects.toMatchObject({ code: "BUDGET_INPUT_INVALID" });
+    await expect(h.service.confirm(OWNER, { operationId: auto.operationId, evidenceMode: "spend-trend" }, async () => true, async () => true, "ceil-baht"))
+      .rejects.toMatchObject({ code: "BUDGET_INPUT_INVALID" });
+    expect(h.trace).toHaveLength(0);
+  });
+
+  it("still refuses to acquire a lease when LIVE evidence disappears or the rounded projection exceeds the cap", async () => {
+    const h = ready(), row = await h.service.prepare(OWNER, op, "auto");
+    h.setContext({ liveDeliveryState: "UNKNOWN", deliveryVerified: false });
+    expect(await h.service.confirm(OWNER, { operationId: row.operationId, ...live }, async () => true, async () => true, "ceil-baht"))
+      .toMatchObject({ status: "NOT_SENT" });
+    expect(h.adapters.acquireLease).not.toHaveBeenCalled();
+    expect(h.adapters.dispatch).not.toHaveBeenCalled();
+    h.setCap({ campaignCapMinor: CEILING_TARGET - 1 });
+    await expect(h.service.prepare(OWNER, op, "auto")).rejects.toMatchObject({ code: "BUDGET_CAP_EXCEEDED" });
   });
 });

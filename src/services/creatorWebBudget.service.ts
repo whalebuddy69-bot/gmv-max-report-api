@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { bangkokDay } from "./creatorRead.service";
 import { allowsScheduledCreatorAuto, isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND, type CreatorBudgetScope } from "./creatorBudgetScope";
+import { roundedCreatorAutoTarget, type CreatorAutoBudgetRounding } from "./creatorAutoBudgetMoney";
 
 export const WEB_BUDGET_CLIENT_ID = "punpan_020";
 export const WEB_BUDGET_OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -45,7 +46,7 @@ export interface WebBudgetContext extends WebBudgetCampaignEvidence, WebBudgetRo
   providerSpendObservedAt?: string | null;
   campaignDeliveryStatus?: "ENABLED" | "CAMPAIGN_BUDGET_EXHAUSTED" | "OTHER";
 }
-export type WebAutoBudgetProof = { previousBudgetMinor: number; targetBudgetMinor: number; rounding?: "floor-satang" };
+export type WebAutoBudgetProof = { previousBudgetMinor: number; targetBudgetMinor: number; rounding?: CreatorAutoBudgetRounding };
 export type WebBudgetAuthorization = { nativeAutoOff: true; noConcurrentChanges: true; evidenceMode?: typeof LIVE_ROOM_SPEND_TREND; autoDetectLive?: true }
   | { evidenceMode: "spend-trend"; nativeAutoOff?: never; noConcurrentChanges?: never; autoDetectLive?: never };
 export type WebBudgetDispatch = WebBudgetAuthorization & {
@@ -53,6 +54,7 @@ export type WebBudgetDispatch = WebBudgetAuthorization & {
   campaignCapMinor: number; clientDailyCapMinor: number;
   fingerprint: string; notAfter: string;
   source?: WebBudgetSource;
+  autoRounding?: CreatorAutoBudgetRounding;
   canSend: (latest: WebBudgetContext) => Promise<boolean>;
 }
 export interface WebBudgetAdapters {
@@ -199,14 +201,18 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
       return proposal(row);
     },
     async confirm(ownerId: number, input: { operationId: string } & WebBudgetAuthorization, recheckOperator: () => Promise<boolean>,
-      autoGuard?: (context: WebBudgetContext, policy: WebBudgetPolicy) => Promise<boolean>, autoRounding?: "floor-satang") {
+      autoGuard?: (context: WebBudgetContext, policy: WebBudgetPolicy) => Promise<boolean>, autoRounding?: CreatorAutoBudgetRounding) {
       const initial = await store.get(ownerId, input.operationId);
       if (!initial || (initial.source === "auto") !== (typeof autoGuard === "function")) reject("BUDGET_OPERATION_NOT_FOUND", 404, "ไม่พบรายการนี้");
-      if (autoRounding !== undefined && (autoRounding !== "floor-satang" || !autoGuard || clientId !== WEB_BUDGET_CLIENT_ID)) {
-        reject("BUDGET_INPUT_INVALID", 400, "ไม่รองรับกติกาปัดเศษงบนี้");
-      }
       const useTrend = input.evidenceMode === "spend-trend";
       const useRoomTrend = input.evidenceMode === LIVE_ROOM_SPEND_TREND;
+      if (autoRounding !== undefined && (!autoGuard || initial.source !== "auto" || (autoRounding === "ceil-baht"
+        ? !useRoomTrend || !allowsScheduledCreatorAuto(clientId) || !adapters.readScheduledLiveContext ||
+          !amount(initial.currentBudgetMinor) || !amount(initial.targetBudgetMinor) ||
+          roundedCreatorAutoTarget(BigInt(initial.currentBudgetMinor), autoRounding) !== BigInt(initial.targetBudgetMinor)
+        : autoRounding !== "floor-satang" || clientId !== WEB_BUDGET_CLIENT_ID))) {
+        reject("BUDGET_INPUT_INVALID", 400, "ไม่รองรับกติกาปัดเศษงบนี้");
+      }
       if (input.autoDetectLive !== undefined && (!useRoomTrend || input.autoDetectLive !== true || !adapters.readAutoDetectContext || !adapters.readScheduledLiveContext)) {
         reject("BUDGET_ATTESTATION_REQUIRED", 400, "ต้องยืนยันห้อง LIVE ที่ตรงกับแคมเปญ");
       }
@@ -239,6 +245,11 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
         if (!sameCap(reserved.cap, cap) || context.reportingDate !== reserved.reportingDate || context.fingerprint !== reserved.fingerprint) {
           reject("BUDGET_PRECONDITION_CHANGED", 409, "งบหรือเพดานเปลี่ยน กรุณาเปิดรายการใหม่");
         }
+        if (autoRounding === "ceil-baht" && (context.deliveryVerified !== true || context.liveDeliveryState !== "LIVE" ||
+          typeof context.liveSessionId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(context.liveSessionId) ||
+          !Number.isFinite(timeMs(context.liveSessionStartedAt)))) {
+          reject("BUDGET_AUTO_PREFLIGHT", 409, "ยังยืนยันห้อง LIVE ไม่ได้");
+        }
         if (autoGuard) {
           if (!nativeReady(context) || cap.autoLineReady !== true) reject(useTrend ? "PPAN_TREND_PREFLIGHT_NATIVE_OR_LINE" : "BUDGET_AUTO_PREFLIGHT", 409, "ข้อมูลสำหรับ Auto ยังไม่พร้อม");
           if (!await autoGuard(context, cap)) reject("BUDGET_AUTO_PREFLIGHT", 409, "ข้อมูลสำหรับ Auto ยังไม่พร้อม");
@@ -264,6 +275,7 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
           const sent = await adapters.dispatch({ campaignId: reserved.campaignId, reportingDate: reserved.reportingDate,
             expectedBudgetMinor: reserved.currentBudgetMinor, targetBudgetMinor: reserved.targetBudgetMinor, fingerprint: reserved.fingerprint,
             campaignCapMinor: lease.campaignCapMinor, clientDailyCapMinor: lease.clientDailyCapMinor, source,
+            ...(autoRounding === "ceil-baht" ? { autoRounding } : {}),
             notAfter: new Date(deadline).toISOString(), ...(useTrend ? { evidenceMode: "spend-trend" as const }
               : { ...(useRoomTrend ? { evidenceMode: LIVE_ROOM_SPEND_TREND } : {}), ...(input.autoDetectLive === true ? { autoDetectLive: true as const } : {}), nativeAutoOff: true as const, noConcurrentChanges: true as const }),
             canSend: async latest => mode() === "live" && await recheckOperator() &&

@@ -5,6 +5,7 @@ import {
 } from "./creatorWebBudget.service";
 import type { CreatorWebBudgetDatabase } from "./creatorWebBudget.store";
 import type { LegacyAutoBudgetScope } from "./creatorBudgetScope";
+import { roundedCreatorAutoTarget, type CreatorAutoBudgetRounding } from "./creatorAutoBudgetMoney";
 
 export type CreatorAutoBudgetClientId = LegacyAutoBudgetScope;
 export const CREATOR_AUTO_BUDGET_MAX_GRANT_MS = 2 * 60 * 60 * 1000;
@@ -99,15 +100,15 @@ function validGrant(value: unknown): value is CreatorAutoBudgetGrant {
 }
 
 /** The exact same target is used before arming, while waiting, and before a write. */
-export function calculateCreatorAutoBudgetTarget(budgetMinor: number, rounding?: "floor-satang"): bigint | null {
+export function calculateCreatorAutoBudgetTarget(budgetMinor: number, rounding?: CreatorAutoBudgetRounding): bigint | null {
   if (!positive(budgetMinor, WEB_BUDGET_MAX_MINOR)) return null;
-  const baseline = BigInt(budgetMinor), scaled = baseline * 12n, target = scaled / 10n;
-  return (rounding === "floor-satang" || scaled % 10n === 0n) && target > baseline && target <= MAX_MONEY ? target : null;
+  const baseline = BigInt(budgetMinor), target = roundedCreatorAutoTarget(baseline, rounding);
+  return target !== null && target > baseline && target <= MAX_MONEY ? target : null;
 }
 
 /** Pure advisory calculation. This result carries no authorization or provider freshness proof. */
 export function previewCreatorAutoBudget({ now, context, policy, rounding }: {
-  now: Date; context: WebBudgetContext | null; policy: WebBudgetPolicy | null; rounding?: "floor-satang";
+  now: Date; context: WebBudgetContext | null; policy: WebBudgetPolicy | null; rounding?: CreatorAutoBudgetRounding;
 }): CreatorAutoBudgetPreview {
   const at = now.getTime();
   if (!context || !fresh(context.observedAt, at, READ_FRESH_MS) ||
@@ -121,7 +122,7 @@ export function previewCreatorAutoBudget({ now, context, policy, rounding }: {
     typeof policy.locked !== "boolean") return { status: "POLICY_UNAVAILABLE" };
   if (policy.locked) return { status: "POLICY_LOCKED" };
 
-  // One-shot scopes still require exact satang. Continuous Ppan may round down by less than one satang.
+  // Keep legacy proof math compatible; persistent LIVE Auto rounds up to a full baht.
   const baseline = BigInt(context.budgetMinor);
   const threshold = (baseline * 8n + 9n) / 10n;
   if (BigInt(context.spendMinor) < threshold) return { status: "BELOW_THRESHOLD" };

@@ -4,6 +4,7 @@ import {
 import type { CreatorWebBudgetDatabase } from "./creatorWebBudget.store";
 import { allowsScheduledCreatorAuto, isContinuousCreatorBudgetScope, isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND, supportsContinuousEvidence,
   type ContinuousCreatorBudgetScope, type ContinuousEvidence } from "./creatorBudgetScope";
+import { roundedCreatorAutoTarget } from "./creatorAutoBudgetMoney";
 
 const CLIENT = "punpan_020";
 export type CreatorContinuousAutoBudgetClient = ContinuousCreatorBudgetScope;
@@ -449,6 +450,47 @@ BEGIN
 END
 $creator_continuous_non_roi_settings$;`;
 
+// Keep the historical formula as the implicit proof for every existing attempt
+// and for older overlapping binaries. New whole-baht attempts carry an explicit
+// proof; switching the amount rule never rewrites a prior reservation or fence.
+const CREATOR_CONTINUOUS_TARGET_ROUNDING_SCHEMA_SQL = `
+DO $creator_continuous_target_rounding$
+DECLARE
+  attempts constant regclass := 'creator_continuous_auto_budget_attempts'::regclass;
+  legacy_guard constant text := '(((target_budget_minor >= 1) AND (target_budget_minor <= ''100000000000''::bigint)) AND (target_budget_minor > baseline_budget_minor) AND (target_budget_minor = ((baseline_budget_minor * 6) / 5)))';
+  expected_guard constant text := '(((target_budget_minor >= 1) AND (target_budget_minor <= ''100000000000''::bigint)) AND (target_budget_minor > baseline_budget_minor) AND (((rounding = ''legacy-satang''::text) AND (target_budget_minor = ((baseline_budget_minor * 6) / 5))) OR ((rounding = ''ceil-baht''::text) AND (evidence_mode = ''${LIVE_ROOM_SPEND_TREND}''::text) AND (target_budget_minor = ((((baseline_budget_minor * 6) + 499) / 500) * 100)))))';
+  legacy_checks name[];
+  current_guard text;
+  column_present boolean;
+  valid_column boolean;
+BEGIN
+  FOR pass IN 1..2 LOOP
+    SELECT array_agg(conname) INTO legacy_checks FROM pg_constraint
+      WHERE conrelid=attempts AND contype='c' AND convalidated AND pg_get_expr(conbin,conrelid)=legacy_guard;
+    SELECT true,a.atttypid='text'::regtype AND a.attnotnull AND pg_get_expr(d.adbin,d.adrelid)='''legacy-satang''::text'
+      INTO column_present,valid_column
+      FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+      WHERE a.attrelid=attempts AND a.attname='rounding' AND NOT a.attisdropped;
+    SELECT pg_get_expr(conbin,conrelid) INTO current_guard FROM pg_constraint WHERE conrelid=attempts
+      AND conname='creator_continuous_attempt_rounding_v9' AND convalidated AND contype='c';
+    IF valid_column AND current_guard=expected_guard AND legacy_checks IS NULL THEN RETURN; END IF;
+    IF pass=1 THEN LOCK TABLE creator_continuous_auto_budget_attempts IN ACCESS EXCLUSIVE MODE; END IF;
+  END LOOP;
+  IF column_present OR current_guard IS NOT NULL OR cardinality(legacy_checks) IS DISTINCT FROM 1 THEN
+    RAISE EXCEPTION 'Unrecognized Creator continuous attempt target constraint';
+  END IF;
+  ALTER TABLE creator_continuous_auto_budget_attempts
+    ADD COLUMN rounding text NOT NULL DEFAULT 'legacy-satang',
+    ADD CONSTRAINT creator_continuous_attempt_rounding_v9 CHECK (
+      target_budget_minor BETWEEN 1 AND 100000000000 AND target_budget_minor > baseline_budget_minor AND (
+        (rounding='legacy-satang' AND target_budget_minor=(baseline_budget_minor * 6) / 5) OR
+        (rounding='ceil-baht' AND evidence_mode='${LIVE_ROOM_SPEND_TREND}' AND target_budget_minor=((baseline_budget_minor * 6 + 499) / 500) * 100)
+      )
+    );
+  EXECUTE format('ALTER TABLE creator_continuous_auto_budget_attempts DROP CONSTRAINT %I', legacy_checks[1]);
+END
+$creator_continuous_target_rounding$;`;
+
 type Runner = ReturnType<CreatorWebBudgetDatabase["createQueryRunner"]>;
 function rows(value: unknown): Record<string, unknown>[] {
   if (!Array.isArray(value)) throw new Error("CREATOR_CONTINUOUS_AUTO_STORE_SHAPE");
@@ -494,8 +536,8 @@ function validScopedSession(value: CreatorContinuousAutoBudgetSession, clientId:
     validAuthorizedAt(value.authorizedAt) && (!awaitingLive(value) || (value.status !== "BLOCKED" && value.operationId === null &&
       (value.keepAutoAcrossRooms === true || (value.lastOutcome === null && value.lastVerifiedAt === null))));
 }
-function validTarget(baseline: number, target: number): boolean {
-  return positive(target, WEB_BUDGET_MAX_MINOR) && target > baseline && BigInt(target) === BigInt(baseline) * 6n / 5n;
+function validTarget(baseline: number, target: number, rounding: "floor-satang" | "ceil-baht"): boolean {
+  return positive(target, WEB_BUDGET_MAX_MINOR) && target > baseline && roundedCreatorAutoTarget(BigInt(baseline), rounding) === BigInt(target);
 }
 function stopReasonValid(value: unknown): value is CreatorContinuousAutoBudgetStopReason {
   return typeof value === "string" && (STOP_REASONS as readonly string[]).includes(value);
@@ -604,6 +646,7 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
       await runner.query(CREATOR_CONTINUOUS_EXHAUSTED_RECOVERY_SCHEMA_SQL);
       await runner.query(CREATOR_CONTINUOUS_KEEP_ROOMS_SCHEMA_SQL);
       await runner.query(CREATOR_CONTINUOUS_NON_ROI_SETTINGS_SCHEMA_SQL);
+      await runner.query(CREATOR_CONTINUOUS_TARGET_ROUNDING_SCHEMA_SQL);
     }); },
     async getActive() {
       // Includes stopped sessions whose already reserved operation still needs reconciliation.
@@ -706,20 +749,23 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
             AND (w.status='OUTCOME_UNKNOWN' OR (w.status='PROCESSING' AND (w.mode='live' OR w.expires_at > clock_timestamp()))))
         RETURNING s.*`, [...args(session), next.budgetMinor, next.fingerprint])));
     },
-    async reserve(session: CreatorContinuousAutoBudgetSession, operationId: string, targetBudgetMinor: number) {
-      if (!validSession(session) || awaitingLive(session) || !identifier(operationId, WEB_BUDGET_OPERATION_ID) || !validTarget(session.baselineBudgetMinor, targetBudgetMinor)) return null;
+    async reserve(session: CreatorContinuousAutoBudgetSession, operationId: string, targetBudgetMinor: number, rounding?: "ceil-baht") {
+      if (!validSession(session) || awaitingLive(session) || !identifier(operationId, WEB_BUDGET_OPERATION_ID) ||
+        (rounding !== undefined && (rounding !== "ceil-baht" || session.keepAutoAcrossRooms !== true || session.evidenceMode !== LIVE_ROOM_SPEND_TREND)) ||
+        !validTarget(session.baselineBudgetMinor, targetBudgetMinor, rounding ?? "floor-satang")) return null;
       return run(async runner => {
-        const input = [...args(session), operationId, targetBudgetMinor];
+        const input = [...args(session), operationId, targetBudgetMinor, rounding ?? "legacy-satang"];
         // The lock makes selection, fingerprint consumption and setting the pending
         // operation atomic across workers. No caller may confirm until this commits.
         const current = rows(await runner.query(`SELECT 1 FROM ${SESSION} s
           WHERE ${EXACT} AND s.status='ACTIVE' AND s.operation_id IS NULL FOR UPDATE`, input.slice(0, 8)));
         if (current.length !== 1) return null;
         const attempt = rows(await runner.query(`INSERT INTO creator_continuous_auto_budget_attempts
-          (operation_id,session_id,client_id,campaign_id,live_session_id,baseline_fingerprint,baseline_budget_minor,target_budget_minor,evidence_mode)
-          SELECT $9::uuid,s.session_id,s.client_id,s.campaign_id,s.live_session_id,s.baseline_fingerprint,s.baseline_budget_minor,$10,s.evidence_mode
+          (operation_id,session_id,client_id,campaign_id,live_session_id,baseline_fingerprint,baseline_budget_minor,target_budget_minor,evidence_mode,rounding)
+          SELECT $9::uuid,s.session_id,s.client_id,s.campaign_id,s.live_session_id,s.baseline_fingerprint,s.baseline_budget_minor,$10,s.evidence_mode,$11::text
           FROM ${SESSION} s
-          WHERE ${EXACT} AND EXISTS (SELECT 1 FROM creator_web_budget_operations w WHERE ${EXACT_WEB_OP}
+          WHERE ${EXACT} AND ($11::text='legacy-satang' OR ($11::text='ceil-baht' AND s.keep_auto_across_rooms AND s.auto_detect_live AND s.evidence_mode='${LIVE_ROOM_SPEND_TREND}'))
+          AND EXISTS (SELECT 1 FROM creator_web_budget_operations w WHERE ${EXACT_WEB_OP}
             AND w.target_budget_minor=$10 AND w.status='PREPARED' AND w.expires_at > clock_timestamp())
           AND (s.evidence_mode='spend-trend' OR s.keep_auto_across_rooms OR NOT EXISTS (
             SELECT 1 FROM creator_continuous_auto_budget_attempts a WHERE a.client_id=s.client_id AND a.campaign_id=s.campaign_id
@@ -747,7 +793,8 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
     },
     async settleVerified(session: CreatorContinuousAutoBudgetSession, operationId: string, next: { budgetMinor: number; fingerprint: string }) {
       if (!validSession(session) || !identifier(operationId, WEB_BUDGET_OPERATION_ID) ||
-        !validTarget(session.baselineBudgetMinor, next.budgetMinor) || !identifier(next.fingerprint, FINGERPRINT) ||
+        (!validTarget(session.baselineBudgetMinor, next.budgetMinor, "floor-satang") &&
+          !(session.keepAutoAcrossRooms === true && validTarget(session.baselineBudgetMinor, next.budgetMinor, "ceil-baht"))) || !identifier(next.fingerprint, FINGERPRINT) ||
         next.fingerprint === session.baselineFingerprint) return null;
       return run(async runner => one(await runner.query(`UPDATE ${SESSION} s
         SET status=CASE WHEN s.status='STOPPED' THEN 'STOPPED' ELSE 'ACTIVE' END, operation_id=NULL,
@@ -756,7 +803,9 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
         WHERE ${EXACT} AND s.operation_id=$9::uuid
           AND NOT EXISTS (SELECT 1 FROM creator_continuous_auto_budget_attempts a WHERE a.client_id=s.client_id
             AND a.campaign_id=s.campaign_id AND a.baseline_fingerprint=$11 AND (NOT a.retry_released OR (s.evidence_mode<>'spend-trend' AND NOT s.keep_auto_across_rooms)))
-          AND EXISTS (SELECT 1 FROM creator_web_budget_operations w WHERE ${EXACT_WEB_OP}
+          AND EXISTS (SELECT 1 FROM creator_web_budget_operations w JOIN creator_continuous_auto_budget_attempts a ON a.operation_id=w.operation_id
+            WHERE ${EXACT_WEB_OP} AND ${EXACT_RETRY_ATTEMPT}
+            AND (a.rounding='legacy-satang' OR (a.rounding='ceil-baht' AND s.keep_auto_across_rooms AND s.auto_detect_live AND s.evidence_mode='${LIVE_ROOM_SPEND_TREND}'))
             AND w.target_budget_minor=$10 AND w.observed_budget_minor=$10
             AND w.observed_fingerprint=$11 AND w.status='APPLIED_VERIFIED')
         RETURNING s.*`, [...args(session), operationId, next.budgetMinor, next.fingerprint])));

@@ -4,6 +4,7 @@ import type { AutomationVerifiedCreatorBinding } from "./creatorAutomationRegist
 import { configuredCreatorScheduledAutoLive, configuredCreatorWebBudgetMode, configuredCreatorSpendTrendLive, creatorBudgetPolicyPath,
   allowsScheduledCreatorAuto, isExtraCreatorBudgetScope, isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND, type CreatorBudgetScope } from "./creatorBudgetScope";
 import { createCreatorVerifiedLiveRoomReader } from "./creatorVerifiedLiveRoom.service";
+import { roundedCreatorAutoTarget, type CreatorAutoBudgetRounding } from "./creatorAutoBudgetMoney";
 import { WEB_BUDGET_MAX_MINOR, WebBudgetError, type WebBudgetAdapters, type WebBudgetContext, type WebBudgetPreArmContext, type WebBudgetRoomEvidence,
   type WebBudgetSource } from "./creatorWebBudget.service";
 
@@ -27,6 +28,10 @@ function object(x: unknown): Data { if (!x || typeof x !== "object" || Array.isA
 function opt(x: unknown): Data { return x == null ? {} : object(x); }
 function nonnegative(x: unknown): x is number { return Number.isSafeInteger(x) && Number(x) >= 0; }
 function positive(x: unknown): x is number { return nonnegative(x) && x > 0; }
+function matchesAutoTarget(baseline: unknown, target: unknown, rounding?: CreatorAutoBudgetRounding) {
+  return positive(baseline) && positive(target) && baseline < target && target <= WEB_BUDGET_MAX_MINOR &&
+    roundedCreatorAutoTarget(BigInt(baseline), rounding) === BigInt(target);
+}
 function noShop(x: unknown) { return x == null || x === "" || x === "0"; }
 function campaignDeliveryStatus(value: unknown): WebBudgetContext["campaignDeliveryStatus"] {
   if (value === undefined) return undefined;
@@ -373,11 +378,10 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     async acquireLease(operationId, revision, autoBudget) {
       if (!UUID.test(operationId) || !positive(revision)) unverified();
       if (autoBudget) {
-        if (!positive(autoBudget.previousBudgetMinor) || !positive(autoBudget.targetBudgetMinor) ||
-          autoBudget.targetBudgetMinor <= autoBudget.previousBudgetMinor) unverified();
-        const scaled = BigInt(autoBudget.previousBudgetMinor) * 6n, target = BigInt(autoBudget.targetBudgetMinor);
-        if (autoBudget.rounding === undefined ? scaled !== target * 5n
-          : autoBudget.rounding !== "floor-satang" || clientId !== "punpan_020" || scaled / 5n !== target) unverified();
+        const rounding = autoBudget.rounding;
+        if ((rounding !== undefined && (rounding === "ceil-baht" ? !configuredCreatorScheduledAutoLive(env, clientId)
+          : rounding !== "floor-satang" || clientId !== "punpan_020")) ||
+          !matchesAutoTarget(autoBudget.previousBudgetMinor, autoBudget.targetBudgetMinor, rounding)) unverified();
       }
       const raw = await policyRequest("/lease", { operationId, revision, ...(autoBudget ? { autoBudget } : {}) });
       const at = now();
@@ -402,15 +406,16 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
       try {
         const roomTrend = input.evidenceMode === LIVE_ROOM_SPEND_TREND;
         if (input.autoDetectLive !== undefined && (input.autoDetectLive !== true || !roomTrend)) unverified();
+        const rounding = input.autoRounding;
+        if (rounding !== undefined && (input.source !== "auto" || (rounding === "ceil-baht"
+          ? !roomTrend || !configuredCreatorScheduledAutoLive(env, clientId)
+          : rounding !== "floor-satang" || clientId !== "punpan_020" || roomTrend))) unverified();
         const allowedAuthority = input.evidenceMode === "spend-trend" ? configuredCreatorSpendTrendLive(env, clientId) &&
           input.nativeAutoOff === undefined && input.noConcurrentChanges === undefined &&
-          positive(input.expectedBudgetMinor) && positive(input.targetBudgetMinor) &&
-          BigInt(input.targetBudgetMinor) === BigInt(input.expectedBudgetMinor) * 6n / 5n &&
-          (clientId === "punpan_020" || BigInt(input.expectedBudgetMinor) * 6n % 5n === 0n)
+          matchesAutoTarget(input.expectedBudgetMinor, input.targetBudgetMinor, clientId === "punpan_020" ? "floor-satang" : undefined)
           : input.nativeAutoOff === true && input.noConcurrentChanges === true && (roomTrend ?
             input.source === "auto" && configuredCreatorScheduledAutoLive(env, clientId) &&
-            positive(input.expectedBudgetMinor) && positive(input.targetBudgetMinor) &&
-            BigInt(input.targetBudgetMinor) * 5n === BigInt(input.expectedBudgetMinor) * 6n :
+            matchesAutoTarget(input.expectedBudgetMinor, input.targetBudgetMinor, rounding) :
             input.evidenceMode === undefined && !(input.source === "auto" && isVerifiedRoomCreator(clientId)));
         if (configuredCreatorWebBudgetMode(env, clientId) !== "live" ||
           !allowedAuthority || !ID.test(input.campaignId) ||

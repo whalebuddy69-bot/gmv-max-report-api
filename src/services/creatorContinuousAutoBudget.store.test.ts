@@ -708,10 +708,66 @@ describe("Ppan continuous Auto session", () => {
         old.baselineFingerprint, old.baselineBudgetMinor, oldOp.targetBudgetMinor]);
     }
     await h.sessions.ensureSchema(); await h.sessions.ensureSchema();
-    expect((await h.db.query("SELECT retry_released FROM creator_continuous_auto_budget_attempts ORDER BY baseline_fingerprint")).rows)
-      .toEqual([{ retry_released: true }, { retry_released: false }, { retry_released: false }]);
+    expect((await h.db.query("SELECT retry_released,rounding FROM creator_continuous_auto_budget_attempts ORDER BY baseline_fingerprint")).rows)
+      .toEqual([{ retry_released: true, rounding: "legacy-satang" }, { retry_released: false, rounding: "legacy-satang" },
+        { retry_released: false, rounding: "legacy-satang" }]);
     expect(await h.sessions.arm(arm())).toBeNull();
     expect(await h.sessions.arm(trendArm({ baselineFingerprint: AFTER }))).toBeNull();
     expect(await h.sessions.arm(trendArm())).toMatchObject({ status: "ACTIVE", baselineFingerprint: BEFORE });
+  });
+
+  it("reconciles an overlapping old satang proof before reserving a new exact whole-baht target", async () => {
+    const h = setup(); await h.web.ensureSchema(); await h.sessions.ensureSchema(); await h.sessions.ensureSchema();
+    const row = (await h.sessions.arm(arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true, keepAutoAcrossRooms: true,
+      lastBoundRoomStartedAt: FIRST_ROOM_AT, baselineSettingsFingerprint: SETTINGS, baselineNonRoiSettingsFingerprint: NON_ROI_SETTINGS })))!;
+    const legacy = operation(row); expect(legacy.targetBudgetMinor).toBe(780_001);
+    await h.web.create(legacy);
+    // Old binaries omit the new column, and retain the same immutable attempt proof.
+    await h.db.query(`INSERT INTO creator_continuous_auto_budget_attempts
+      (operation_id,session_id,client_id,campaign_id,live_session_id,baseline_fingerprint,baseline_budget_minor,target_budget_minor,evidence_mode)
+      VALUES ($1,$2,'punpan_020',$3,$4,$5,$6,$7,$8)`, [legacy.operationId, row.sessionId, row.campaignId, row.liveSessionId,
+      row.baselineFingerprint, row.baselineBudgetMinor, legacy.targetBudgetMinor, row.evidenceMode]);
+    await h.db.query("UPDATE creator_continuous_auto_budget_sessions SET operation_id=$1 WHERE session_id=$2", [legacy.operationId, row.sessionId]);
+    await h.web.reserve(row.ownerId, legacy.operationId, "live");
+    await h.web.finish(row.ownerId, legacy.operationId, { status: "APPLIED_VERIFIED", observedBudgetMinor: 780_001,
+      observedFingerprint: AFTER, reason: "EXACT_PROVIDER_READBACK" });
+    const adopted = (await h.sessions.settleVerified(row, legacy.operationId, { budgetMinor: 780_001, fingerprint: AFTER }))!;
+    expect(adopted).toMatchObject({ status: "ACTIVE", baselineBudgetMinor: 780_001, operationId: null });
+
+    const target = 936_100;
+    const proposal = operation(adopted, target, { projectedClientSpendMinor: target, cap: { ...legacy.cap, campaignCapMinor: target, clientDailyCapMinor: target } });
+    await h.web.create(proposal);
+    expect(await h.sessions.reserve(adopted, proposal.operationId, target)).toBeNull();
+    expect(await h.sessions.reserve(adopted, proposal.operationId, target - 1, "ceil-baht")).toBeNull();
+    expect(await h.sessions.reserve(adopted, proposal.operationId, target + 100, "ceil-baht")).toBeNull();
+    expect(await h.sessions.reserve(adopted, proposal.operationId, target, "ceil-baht")).toMatchObject({ operationId: proposal.operationId });
+    expect(await h.sessions.reserve(adopted, legacy.operationId, target, "ceil-baht")).toBeNull();
+    await expect(h.db.query("UPDATE creator_continuous_auto_budget_attempts SET rounding='legacy-satang' WHERE operation_id=$1", [proposal.operationId]))
+      .rejects.toMatchObject({ code: "23514" });
+    await expect(h.db.query("UPDATE creator_continuous_auto_budget_attempts SET target_budget_minor=$1 WHERE operation_id=$2", [target + 100, proposal.operationId]))
+      .rejects.toMatchObject({ code: "23514" });
+    expect(await h.sessions.settleVerified(adopted, proposal.operationId, { budgetMinor: target, fingerprint: NEXT })).toBeNull();
+    await h.web.reserve(row.ownerId, proposal.operationId, "live");
+    await h.web.finish(row.ownerId, proposal.operationId, { status: "APPLIED_VERIFIED", observedBudgetMinor: target,
+      observedFingerprint: NEXT, reason: "EXACT_PROVIDER_READBACK" });
+    expect(await h.sessions.settleVerified(adopted, proposal.operationId, { budgetMinor: target, fingerprint: NEXT })).toMatchObject({
+      status: "ACTIVE", operationId: null, baselineBudgetMinor: target, lastOutcome: "APPLIED_VERIFIED" });
+    expect((await h.db.query("SELECT rounding,target_budget_minor FROM creator_continuous_auto_budget_attempts ORDER BY reserved_at")).rows)
+      .toEqual([{ rounding: "legacy-satang", target_budget_minor: 780_001 }, { rounding: "ceil-baht", target_budget_minor: target }]);
+  });
+
+  it("does not grant whole-baht reservations to nonpersistent or unbound LIVE sessions", async () => {
+    const h = setup(); await h.web.ensureSchema(); await h.sessions.ensureSchema();
+    const old = (await h.sessions.arm(arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true })))!;
+    const proposal = operation(old, 780_100); await h.web.create(proposal);
+    expect(await h.sessions.reserve(old, proposal.operationId, 780_100, "ceil-baht")).toBeNull();
+    // A forged in-memory opt-in cannot pass the exact persisted-session predicate.
+    expect(await h.sessions.reserve({ ...old, keepAutoAcrossRooms: true, lastBoundRoomStartedAt: FIRST_ROOM_AT,
+      baselineSettingsFingerprint: SETTINGS }, proposal.operationId, 780_100, "ceil-baht")).toBeNull();
+    await h.sessions.stop(old.ownerId, old.sessionId);
+    const waiting = (await h.sessions.arm(arm({ evidenceMode: LIVE_ROOM_SPEND_TREND, liveSessionId: null, autoDetectLive: true,
+      keepAutoAcrossRooms: true, baselineSettingsFingerprint: SETTINGS })))!;
+    expect(await h.sessions.reserve(waiting, proposal.operationId, 780_100, "ceil-baht")).toBeNull();
+    expect((await h.db.query("SELECT operation_id FROM creator_continuous_auto_budget_attempts")).rows).toEqual([]);
   });
 });

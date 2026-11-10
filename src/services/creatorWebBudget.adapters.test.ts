@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { CREATOR_BINDING } from "./creatorRead.service";
 import { createCreatorWebBudgetAdapters, createCreatorWebCapAdapters, queueCreatorAutoCheckFailureAlert } from "./creatorWebBudget.adapters";
-import type { WebBudgetSource } from "./creatorWebBudget.service";
+import type { WebAutoBudgetProof, WebBudgetSource } from "./creatorWebBudget.service";
 import { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode, configuredPpanSpendTrendLive, creatorBudgetPolicyPath,
   LIVE_ROOM_SPEND_TREND, type CreatorBudgetScope } from "./creatorBudgetScope";
 
@@ -49,6 +49,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
   extra?: boolean; extraLive?: boolean; extraClient?: "nnshop5719" | "ashopbytheta" | "myushop4" | "bubpa_shop189" | "koolkool888"; wrongProviderScope?: boolean;
   targetAbsent?: boolean; integrated?: Record<string, unknown>; daily?: (page: number) => unknown; currency?: string;
   campaignInfo?: Record<string, unknown>; campaignList?: Record<string, unknown>; listedStatus?: string; secondaryStatus?: unknown; timezone?: string;
+  expectedLeaseBudget?: WebAutoBudgetProof;
   scheduledLive?: boolean; room?: "ONGOING" | "END"; detectRoom?: boolean; roomCost?: string | null;
   identityLive?: "ongoing" | "ended" | "missing"; now?: () => Date } = {}) {
   const calls: { host: string; path: string; method: string }[] = [];
@@ -76,7 +77,8 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
       expect(url.pathname).toContain(extra ? `/${extra.clientId}/policy` : "/ppan/policy");
       const reply = { ...policy, ...(extra ? { clientId: extra.clientId, configured: true } : {}), readAt: options.readAt ?? NOW };
       if (url.pathname.endsWith("/lease")) {
-        expect(JSON.parse(String(init?.body))).toEqual({ operationId: OP, revision: 4 });
+        expect(JSON.parse(String(init?.body))).toEqual({ operationId: OP, revision: 4,
+          ...(options.expectedLeaseBudget ? { autoBudget: options.expectedLeaseBudget } : {}) });
         return Response.json({ ...reply, locked: true, operationId: OP, expiresAt: LEASE_END });
       }
       if (url.pathname.endsWith("/finish")) {
@@ -356,6 +358,44 @@ describe("verified room dispatch boundary", () => {
     expect(h.providerPosts()).toHaveLength(0);
   });
 
+  it.each(SCHEDULED_SCOPES)("%s leases and sends the exact whole-baht target for verified LIVE Auto", async (_scope, options) => {
+    const proof = { previousBudgetMinor: 497_664, targetBudgetMinor: 597_200, rounding: "ceil-baht" as const };
+    const h = harness({ ...options, scheduledLive: true, extraLive: true, room: "ONGOING", detectRoom: true, roomCost: "4236.38", expectedLeaseBudget: proof });
+    h.edit(4976.64);
+    h.setSpend("4594.04");
+    await expect(h.adapters.acquireLease(OP, 4, proof)).resolves.toMatchObject({ locked: true, operationId: OP });
+    const input = await h.input(proof.targetBudgetMinor, "auto");
+    await expect(h.adapters.dispatch({ ...input, evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true, autoRounding: "ceil-baht" }))
+      .resolves.toMatchObject({ outcome: "APPLIED_VERIFIED", observedBudgetMinor: proof.targetBudgetMinor });
+    expect(h.providerPosts()).toHaveLength(1);
+  });
+
+  it.each([
+    ["rounded down", { targetBudgetMinor: 597_196 }], ["not a whole baht", { targetBudgetMinor: 597_197 }],
+    ["unapproved next baht", { targetBudgetMinor: 597_300 }], ["manual", { source: "manual" }],
+    ["no room authorization", { evidenceMode: undefined, autoDetectLive: undefined }],
+    ["below campaign cap", { campaignCapMinor: 597_199 }], ["below projected daily cap", { clientDailyCapMinor: 599_199 }],
+    ["unverified final guard", { canSend: async () => false }],
+  ] as const)("does not send a rounded target with %s", async (_case, changes) => {
+    const h = harness({ extraClient: "koolkool888", scheduledLive: true, extraLive: true, room: "ONGOING", detectRoom: true, roomCost: "4236.38" });
+    h.edit(4976.64);
+    h.setSpend("4594.04");
+    const input = await h.input(597_200, "auto");
+    await expect(h.adapters.dispatch({ ...input, evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true, autoRounding: "ceil-baht", ...changes }))
+      .resolves.toEqual({ outcome: "NOT_SENT" });
+    expect(h.providerPosts()).toHaveLength(0);
+  });
+
+  it("rejects malformed or non-authorized rounded lease proofs and does not extend the Ppan floor exception", async () => {
+    const proof = { previousBudgetMinor: 497_664, targetBudgetMinor: 597_200, rounding: "ceil-baht" as const };
+    const allowed = harness({ extraClient: "koolkool888", scheduledLive: true, extraLive: true });
+    const off = harness({ extraClient: "koolkool888", extraLive: true });
+    await expect(allowed.adapters.acquireLease(OP, 4, { ...proof, targetBudgetMinor: 597_197 })).rejects.toThrow("UNVERIFIED");
+    await expect(allowed.adapters.acquireLease(OP, 4, { ...proof, targetBudgetMinor: 597_196, rounding: "floor-satang" })).rejects.toThrow("UNVERIFIED");
+    await expect(off.adapters.acquireLease(OP, 4, proof)).rejects.toThrow("UNVERIFIED");
+    expect([...allowed.calls, ...off.calls]).toHaveLength(0);
+  });
+
   it("does not impose the new room check on an already-authorized legacy spend-trend send", async () => {
     for (const options of [{ spendTrend: true }, { extra: true, extraLive: true, sriTrend: true }]) {
       const h = harness({ ...options, room: "END", nativeUnknown: true });
@@ -364,6 +404,17 @@ describe("verified room dispatch boundary", () => {
       expect(h.calls.filter(x => x.path.endsWith("/gmv_max/report/get/"))).toHaveLength(0);
       expect(h.providerPosts()).toHaveLength(1);
     }
+  });
+
+  it("preserves Ppan legacy satang-floor and rejects whole-baht rounding on that legacy evidence", async () => {
+    const h = harness({ spendTrend: true });
+    h.edit(2800.01);
+    const { nativeAutoOff: _, noConcurrentChanges: __, ...input } = await h.input(336_001, "auto");
+    await expect(h.adapters.dispatch({ ...input, targetBudgetMinor: 336_100, evidenceMode: "spend-trend", autoRounding: "ceil-baht" }))
+      .resolves.toEqual({ outcome: "NOT_SENT" });
+    await expect(h.adapters.dispatch({ ...input, evidenceMode: "spend-trend", autoRounding: "floor-satang" }))
+      .resolves.toMatchObject({ outcome: "APPLIED_VERIFIED", observedBudgetMinor: 336_001 });
+    expect(h.providerPosts()).toHaveLength(1);
   });
 });
 
