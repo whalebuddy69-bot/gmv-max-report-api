@@ -20,7 +20,7 @@ const dailyRow = (campaignId: string, cost: unknown = "0.00", dimensions = {}) =
 const pageInfo = (count: number, page = 1, pages = 1) => ({ page, total_page: pages, total_number: count });
 const SCHEDULED_SCOPES = [["punpan_020", {}], ["srihiw", { extra: true }], ["nnshop5719", { extraClient: "nnshop5719" }],
   ["ashopbytheta", { extraClient: "ashopbytheta" }], ["myushop4", { extraClient: "myushop4" }],
-  ["bubpa_shop189", { extraClient: "bubpa_shop189" }], ["koolkool888", { extraClient: "koolkool888" }]] as const;
+  ["bubpa_shop189", { extraClient: "bubpa_shop189" }], ["koolkool888", { extraClient: "koolkool888" }], ["boomkan", { extraClient: "boomkan" }]] as const;
 
 describe("Auto failed-check LINE handoff", () => {
   const event = { incidentId: OP, advertiserName: "บัญชีโฆษณา Kool", tiktokUsername: "koolkool888" };
@@ -46,7 +46,7 @@ describe("Auto failed-check LINE handoff", () => {
 
 function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: boolean; spendTrend?: boolean; sriTrend?: boolean; legacy?: boolean; policyKey?: string;
   providerResult?: "unknown" | "reject" | "roi-drift" | "reject-with-drift"; readAt?: string;
-  extra?: boolean; extraLive?: boolean; extraClient?: "nnshop5719" | "ashopbytheta" | "myushop4" | "bubpa_shop189" | "koolkool888"; wrongProviderScope?: boolean;
+  extra?: boolean; extraLive?: boolean; extraClient?: "nnshop5719" | "ashopbytheta" | "myushop4" | "bubpa_shop189" | "koolkool888" | "boomkan"; wrongProviderScope?: boolean;
   targetAbsent?: boolean; integrated?: Record<string, unknown>; daily?: (page: number) => unknown; currency?: string;
   campaignInfo?: Record<string, unknown>; campaignList?: Record<string, unknown>; listedStatus?: string; secondaryStatus?: unknown; timezone?: string;
   expectedLeaseBudget?: WebAutoBudgetProof;

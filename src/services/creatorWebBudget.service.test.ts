@@ -186,8 +186,8 @@ describe("Creator verified LIVE whole-baht Auto writer", () => {
     return h;
   }
 
-  it("sends only the exact approved ceiling proof to the lease and strict room writer", async () => {
-    const h = ready(), row = await h.service.prepare(OWNER, op, "auto");
+  it.each(["koolkool888", "boomkan"] as const)("sends only the exact approved ceiling proof for %s to the lease and strict room writer", async clientId => {
+    const h = ready(clientId), row = await h.service.prepare(OWNER, op, "auto");
     h.adapters.dispatch.mockResolvedValueOnce({ outcome: "APPLIED_VERIFIED", observedBudgetMinor: CEILING_TARGET, observedFingerprint: "b".repeat(64) });
     expect(await h.service.confirm(OWNER, { operationId: row.operationId, ...live }, async () => true, async () => true, "ceil-baht"))
       .toMatchObject({ status: "APPLIED_VERIFIED", observedBudgetMinor: CEILING_TARGET });

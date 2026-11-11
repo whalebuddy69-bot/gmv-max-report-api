@@ -1,9 +1,9 @@
 import type { WebBudgetMode } from "./creatorWebBudget.service";
 
-export const EXTRA_CREATOR_BUDGET_SCOPE_IDS = ["srihiw", "nnshop5719", "ashopbytheta", "myushop4", "bubpa_shop189", "koolkool888"] as const;
+export const EXTRA_CREATOR_BUDGET_SCOPE_IDS = ["srihiw", "nnshop5719", "ashopbytheta", "myushop4", "bubpa_shop189", "koolkool888", "boomkan"] as const;
 export type ExtraCreatorBudgetScope = (typeof EXTRA_CREATOR_BUDGET_SCOPE_IDS)[number];
 export type CreatorBudgetScope = "punpan_020" | ExtraCreatorBudgetScope;
-export const VERIFIED_ROOM_CREATOR_IDS = ["ashopbytheta", "myushop4", "bubpa_shop189", "koolkool888"] as const;
+export const VERIFIED_ROOM_CREATOR_IDS = ["ashopbytheta", "myushop4", "bubpa_shop189", "koolkool888", "boomkan"] as const;
 export type VerifiedRoomCreator = (typeof VERIFIED_ROOM_CREATOR_IDS)[number];
 export type LegacyAutoBudgetScope = "punpan_020" | "srihiw" | "nnshop5719" | "ashopbytheta";
 export type ContinuousCreatorBudgetScope = CreatorBudgetScope;
@@ -48,6 +48,8 @@ const SCOPES = Object.freeze({
     autoMode: "CREATOR_AUTO_BUDGET_BUBPA_SHOP189_MODE", autoLive: "CREATOR_AUTO_BUDGET_BUBPA_SHOP189_LIVE_ENABLED" },
   koolkool888: { path: "koolkool888", manualMode: "CREATOR_WEB_KOOLKOOL888_BUDGET_MODE", manualLive: "CREATOR_WEB_KOOLKOOL888_BUDGET_LIVE_ENABLED",
     autoMode: "CREATOR_AUTO_BUDGET_KOOLKOOL888_MODE", autoLive: "CREATOR_AUTO_BUDGET_KOOLKOOL888_LIVE_ENABLED" },
+  boomkan: { path: "boomkan", manualMode: "CREATOR_WEB_BOOMKAN_BUDGET_MODE", manualLive: "CREATOR_WEB_BOOMKAN_BUDGET_LIVE_ENABLED",
+    autoMode: "CREATOR_AUTO_BUDGET_BOOMKAN_MODE", autoLive: "CREATOR_AUTO_BUDGET_BOOMKAN_LIVE_ENABLED" },
 } as const);
 
 export function isExtraCreatorBudgetScope(id: unknown): id is ExtraCreatorBudgetScope {

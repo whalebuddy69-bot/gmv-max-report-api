@@ -67,7 +67,7 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
     stop: vi.fn(async (_owner: number, _grantId: string) => ({ stopped: true })),
     tick: vi.fn(async () => {}),
   };
-  const mockScoped = (clientId: "nnshop5719" | "ashopbytheta" | "myushop4" | "bubpa_shop189" | "koolkool888") => ({
+  const mockScoped = (clientId: "nnshop5719" | "ashopbytheta" | "myushop4" | "bubpa_shop189" | "koolkool888" | "boomkan") => ({
     service: { ...srihiwService,
       status: vi.fn(async () => ({ clientId, mode: "disabled" as const, cap: null, canPrepare: false, capEditAllowed: false })),
       confirm: vi.fn(vi.mocked(service.confirm).getMockImplementation()),
@@ -91,10 +91,11 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
   const sriAuto = { ...continuous, arm: vi.fn(continuous.arm.getMockImplementation()), stop: vi.fn(continuous.stop.getMockImplementation()),
     status: vi.fn(async (...args: Parameters<typeof continuous.status>) => ({ ...await continuous.status(...args), clientId: "srihiw" as const, evidenceMode: "spend-trend" as const })) };
   const diagnostics = vi.fn(async (_owner: number) => ({ history: [] }));
-  const roomScope = (clientId: "ashopbytheta" | "myushop4" | "bubpa_shop189" | "koolkool888") => ({ ...continuous,
+  const roomScope = (clientId: "ashopbytheta" | "myushop4" | "bubpa_shop189" | "koolkool888" | "boomkan") => ({ ...continuous,
     arm: vi.fn(continuous.arm.getMockImplementation()), stop: vi.fn(continuous.stop.getMockImplementation()),
     status: vi.fn(async (...args: Parameters<typeof continuous.status>) => ({ ...await continuous.status(...args), clientId })) });
   const shopRoom = roomScope("ashopbytheta"), myuRoom = roomScope("myushop4"), bubpaRoom = roomScope("bubpa_shop189"), koolRoom = roomScope("koolkool888");
+  const boomService = mockScoped("boomkan").service, boomRoom = roomScope("boomkan");
   app.use("/automation/budget", createCreatorWebBudgetRouter({ viewerIds: () => viewerIds, operatorIds: () => operatorIds, service,
     autoService, capEditor, extraConfigured: () => extraCapConfigured,
     continuousAutoService: withContinuous ? continuous : undefined,
@@ -103,14 +104,15 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
       ashopbytheta: { ...ashop, continuousAutoService: withVerifiedContinuous ? shopRoom : undefined },
       ...(withVerifiedContinuous ? { myushop4: { service: mockScoped("myushop4").service, continuousAutoService: myuRoom },
         bubpa_shop189: { service: mockScoped("bubpa_shop189").service, continuousAutoService: bubpaRoom },
-        koolkool888: { service: mockScoped("koolkool888").service, continuousAutoService: koolRoom } } : {}) } }));
+        koolkool888: { service: mockScoped("koolkool888").service, continuousAutoService: koolRoom },
+        boomkan: { service: boomService, continuousAutoService: boomRoom } } : {}) } }));
   // Prove this route does not run the general application parser first.
   app.use(express.json());
   server = await new Promise<Server>(resolve => { const instance = app.listen(0, "127.0.0.1", () => resolve(instance)); });
   const { port } = server.address() as { port: number };
   const base = `http://127.0.0.1:${port}/automation/budget`;
   const post = (route: string, body = JSON.stringify(PREPARE), headers = HEADERS) => fetch(base + route, { method: "POST", headers, body });
-  return { service, srihiwService, autoService, base, post, capEditor, nn, ashop, continuous, sriAuto, diagnostics, shopRoom, myuRoom, bubpaRoom, koolRoom };
+  return { service, srihiwService, autoService, base, post, capEditor, nn, ashop, continuous, sriAuto, diagnostics, shopRoom, myuRoom, bubpaRoom, koolRoom, boomService, boomRoom };
 }
 
 describe("Automation web budget HTTP boundary", () => {
@@ -144,6 +146,35 @@ describe("Automation web budget HTTP boundary", () => {
     expect(h.bubpaRoom.arm).not.toHaveBeenCalled();
     expect(h.continuous.arm).not.toHaveBeenCalled();
     expect(h.autoService.arm).not.toHaveBeenCalled();
+  });
+
+  it("keeps Boomkan readiness and persistent arm isolated from all existing Creator routes", async () => {
+    const h = await start({ withContinuous: true, withVerifiedContinuous: true });
+    const read = await fetch(h.base + "/boomkan/auto/status?view=detect-live", { headers: HEADERS });
+    expect(read.status).toBe(200);
+    expect(await read.json()).toMatchObject({ clientId: "boomkan", strategy: "continuous" });
+    expect(h.boomRoom.status).toHaveBeenCalledWith(true, 27, "detect-live");
+    const input = { expectedCampaignId: PREPARE.expectedCampaignId, expectedBudgetMinor: PREPARE.expectedBudgetMinor,
+      expectedPolicyRevision: 2, expectedLiveSessionId: null, nativeAutoOff: true, noConcurrentChanges: true,
+      evidenceMode: "verified-room-spend-trend", autoDetectLive: true, allowExhaustedRecovery: true, keepAutoAcrossRooms: true };
+    for (const changed of [{ evidenceMode: "spend-trend" }, { nativeAutoOff: false }, { durationMinutes: 60 }]) {
+      expect((await h.post("/boomkan/auto/arm", JSON.stringify({ ...input, ...changed }))).status).toBe(400);
+    }
+    expect((await h.post("/boomkan/auto/arm", JSON.stringify(input))).status).toBe(200);
+    expect(h.boomRoom.arm).toHaveBeenCalledWith(27, input, expect.any(Function));
+    for (const other of [h.continuous, h.sriAuto, h.shopRoom, h.myuRoom, h.bubpaRoom, h.koolRoom, h.autoService]) {
+      expect(other.arm).not.toHaveBeenCalled();
+    }
+  });
+
+  it("lets the operator set Boomkan's own first ceiling without submitting a TikTok budget", async () => {
+    const h = await start({ withVerifiedContinuous: true });
+    const payload = JSON.stringify({ expectedRevision: 0, capMinor: 1_000_000 });
+    expect((await h.post("/cap/boomkan", payload, { ...HEADERS, Authorization: "Bearer report-admin" })).status).toBe(403);
+    expect(await (await h.post("/cap/boomkan", payload)).json()).toEqual({ revision: 1, capMinor: 1_000_000 });
+    expect(h.capEditor.update).toHaveBeenCalledWith("boomkan", 27, 0, 1_000_000, expect.any(Function));
+    expect(h.boomService.confirm).not.toHaveBeenCalled();
+    expect(h.boomRoom.arm).not.toHaveBeenCalled();
   });
 
   it("permits waiting-for-LIVE for continuous registered scopes without falling through to a legacy grant", async () => {

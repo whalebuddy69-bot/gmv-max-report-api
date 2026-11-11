@@ -26,6 +26,32 @@ function proposal(mode: WebBudgetProposal["mode"] = "live", ownerId = 27): WebBu
 }
 
 describe("Postgres budget operation ledger", () => {
+  it("adds Boomkan without changing or inheriting another Creator's unresolved write", async () => {
+    const h = setup(), kool = createCreatorWebBudgetStore(h.database, "koolkool888");
+    await h.store.ensureSchema(); await kool.ensureSchema();
+    const old = proposal();
+    await kool.create(old);
+    await kool.reserve(old.ownerId, old.operationId, "live");
+    await kool.finish(old.ownerId, old.operationId, { status: "OUTCOME_UNKNOWN", reason: "READBACK_UNVERIFIED", observedBudgetMinor: null });
+    const before = await kool.get(old.ownerId, old.operationId);
+    const boom = createCreatorWebBudgetStore(h.database, "boomkan");
+    await boom.ensureSchema(); await boom.ensureSchema();
+    expect(await boom.hasFence()).toBe(false);
+    expect(await boom.get(old.ownerId, old.operationId)).toBeNull();
+    const row = proposal();
+    await boom.create(row);
+    expect(await kool.get(row.ownerId, row.operationId)).toBeNull();
+    expect(await boom.reserve(row.ownerId + 1, row.operationId, "live")).toBeNull();
+    expect(await boom.reserve(row.ownerId, row.operationId, "live")).toMatchObject({ status: "PROCESSING" });
+    await boom.finish(row.ownerId, row.operationId, { status: "OUTCOME_UNKNOWN", reason: "READBACK_UNVERIFIED", observedBudgetMinor: null });
+    const restored = createCreatorWebBudgetStore(h.database, "boomkan");
+    expect(await restored.hasFence()).toBe(true);
+    expect(await kool.hasFence()).toBe(true);
+    expect(await kool.get(old.ownerId, old.operationId)).toEqual(before);
+    await expect(h.db.query("UPDATE creator_web_budget_boomkan_operations SET client_id='koolkool888' WHERE operation_id=$1", [row.operationId]))
+      .rejects.toMatchObject({ code: "23514" });
+  });
+
   it("requires explicit additive bootstrap and reserves only the owner/unexpired/mode-matched operation", async () => {
     const h = setup(), row = proposal();
     await expect(h.store.get(row.ownerId, row.operationId)).rejects.toMatchObject({ code: "BUDGET_LEDGER_UNAVAILABLE" });

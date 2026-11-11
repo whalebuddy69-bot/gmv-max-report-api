@@ -27,6 +27,7 @@ const SESSION_TABLE = Object.freeze({
   myushop4: "creator_myu_cauto_auto_budget_sessions",
   bubpa_shop189: "creator_bubpa_cauto_auto_budget_sessions",
   koolkool888: "creator_kool_cauto_auto_budget_sessions",
+  boomkan: "creator_boom_cauto_auto_budget_sessions",
 } satisfies Record<ContinuousCreatorBudgetScope, string>);
 const OUTCOMES = new Set<CreatorAutoCheckOutcome>(["CHECK_FAILED", "CHECK_VERIFIED", "NORMAL_HOLD"]);
 const THRESHOLD = 10;
@@ -38,9 +39,12 @@ const INCIDENT = "creator_auto_check_incidents";
 // records remain audit history and cannot become new alerts.
 const NOT_EXPIRED = "i.detected_at > clock_timestamp() - interval '23 hours'";
 const SCOPE_CHECK = Object.keys(SESSION_TABLE).map(scope => `'${scope}'`).join(",");
+const scopeExpression = (scopes: string[]) => `(client_id = ANY (ARRAY[${scopes.map(scope => `'${scope}'::text`).join(", ")}]))`;
+const LEGACY_SCOPE_EXPRESSION = scopeExpression(["punpan_020", "srihiw", "nnshop5719", "ashopbytheta", "myushop4", "bubpa_shop189", "koolkool888"]);
+const CURRENT_SCOPE_EXPRESSION = scopeExpression(Object.keys(SESSION_TABLE));
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS ${STATE} (
-  client_id text PRIMARY KEY CHECK (client_id IN (${SCOPE_CHECK})),
+  client_id text PRIMARY KEY CONSTRAINT creator_auto_check_health_scope_v2 CHECK (client_id IN (${SCOPE_CHECK})),
   session_id uuid NOT NULL,
   checked_at timestamptz NOT NULL,
   consecutive integer NOT NULL CHECK (consecutive BETWEEN 0 AND ${THRESHOLD}),
@@ -50,7 +54,7 @@ CREATE TABLE IF NOT EXISTS ${STATE} (
 );
 CREATE TABLE IF NOT EXISTS ${INCIDENT} (
   incident_id uuid PRIMARY KEY,
-  client_id text NOT NULL CHECK (client_id IN (${SCOPE_CHECK})),
+  client_id text NOT NULL CONSTRAINT creator_auto_check_incidents_scope_v2 CHECK (client_id IN (${SCOPE_CHECK})),
   session_id uuid NOT NULL,
   failed_since timestamptz NOT NULL,
   detected_at timestamptz NOT NULL,
@@ -62,6 +66,47 @@ CREATE TABLE IF NOT EXISTS ${INCIDENT} (
 CREATE INDEX IF NOT EXISTS creator_auto_check_incidents_pending
   ON ${INCIDENT} (client_id, session_id, detected_at, incident_id) WHERE accepted_at IS NULL;
 `;
+// Widen only the known seven-Creator checks. Existing incidents, retry keys and
+// streaks remain in place; unexpected constraints are never silently replaced.
+const SCOPE_UPGRADE = `
+DO $creator_auto_check_scopes$
+DECLARE
+  table_name text;
+  relation regclass;
+  scope_checks name[];
+  next_name text;
+  observed_expression text;
+  observed_valid boolean;
+  versioned_present boolean;
+  already_current boolean;
+BEGIN
+  FOREACH table_name IN ARRAY ARRAY['${STATE}','${INCIDENT}'] LOOP
+    relation := table_name::regclass;
+    next_name := table_name || '_scope_v2';
+    FOR pass IN 1..2 LOOP
+      -- Include every client-ID CHECK, even an unvalidated or cross-column
+      -- restriction. A correct v2 CHECK must not hide another unknown guard.
+      SELECT array_agg(c.conname ORDER BY c.conname) INTO scope_checks
+        FROM pg_constraint c JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=ANY(c.conkey)
+        WHERE c.conrelid=relation AND c.contype='c' AND a.attname='client_id' AND NOT a.attisdropped;
+      SELECT pg_get_expr(conbin,conrelid),convalidated INTO observed_expression,observed_valid
+        FROM pg_constraint WHERE conrelid=relation AND contype='c' AND conname=scope_checks[1];
+      SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid=relation AND conname=next_name) INTO versioned_present;
+      already_current := cardinality(scope_checks)=1 AND scope_checks[1]::text=next_name AND observed_valid
+        AND observed_expression=$current$${CURRENT_SCOPE_EXPRESSION}$current$;
+      IF already_current THEN EXIT; END IF;
+      IF pass=1 THEN EXECUTE format('LOCK TABLE %I IN ACCESS EXCLUSIVE MODE', table_name); END IF;
+    END LOOP;
+    IF already_current THEN CONTINUE; END IF;
+    IF cardinality(scope_checks) IS DISTINCT FROM 1 OR observed_valid IS DISTINCT FROM true OR versioned_present
+      OR observed_expression IS DISTINCT FROM $legacy$${LEGACY_SCOPE_EXPRESSION}$legacy$ THEN
+      RAISE EXCEPTION 'Unrecognized Creator Auto health scope constraint';
+    END IF;
+    EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I CHECK (client_id IN (${SCOPE_CHECK.replaceAll("'", "''")}))', table_name, next_name);
+    EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', table_name, scope_checks[1]);
+  END LOOP;
+END
+$creator_auto_check_scopes$;`;
 type Runner = ReturnType<CreatorWebBudgetDatabase["createQueryRunner"]>;
 type Row = Record<string, unknown>;
 
@@ -119,6 +164,7 @@ export function createCreatorAutoCheckHealthStore(database: CreatorWebBudgetData
       await run(async runner => {
         await runner.query("SELECT pg_advisory_xact_lock(821903782, 1)");
         await runner.query(SCHEMA);
+        await runner.query(SCOPE_UPGRADE);
       });
     },
 
