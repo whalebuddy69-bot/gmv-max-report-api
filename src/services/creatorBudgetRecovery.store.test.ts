@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { PGlite } from "@electric-sql/pglite";
+import { types as pgTypes } from "pg";
 import { createCreatorWebBudgetStore } from "./creatorWebBudget.store";
 import { createCreatorContinuousAutoBudgetStore, type CreatorContinuousAutoBudgetArmInput } from "./creatorContinuousAutoBudget.store";
 import { CREATOR_BUDGET_RECOVERY_ADVERTISER, createCreatorBudgetRecoveryStore, type CreatorBudgetRecoveryEvidence,
@@ -14,12 +15,25 @@ const dbs: PGlite[] = [];
 afterEach(async () => { for (const db of dbs.splice(0)) await db.close(); });
 async function fixture() {
   const db = new PGlite(); dbs.push(db); const now = new Date(), at = now.toISOString();
+  const indexMetadataQueries: string[] = [];
   let failSessionAnnotation = false;
   const database = { createQueryRunner: () => ({ connect: async () => undefined, release: async () => undefined,
     query: async (sql: string, params?: unknown[]) => {
       if (failSessionAnnotation && sql.includes(`UPDATE ${SESSION} SET quarantined_by_recovery_id`)) throw new Error("injected local transaction failure");
       if (sql.includes("CREATE TABLE")) { await db.exec(sql); return []; }
-      const result = await db.query(sql, params); return sql.trimStart().startsWith("UPDATE") ? [result.rows, result.affectedRows ?? 0] : result.rows;
+      const result = await db.query(sql, params);
+      if (sql.includes("FROM pg_index i JOIN pg_class") && sql.includes(") AS columns,")) {
+        indexMetadataQueries.push(sql);
+        // PGlite decodes name[] unlike node-postgres. Exercise the actual pg
+        // decoder so a catalog name[] (OID 1003) cannot silently pass in tests.
+        const columnType = result.fields.find(field => field.name === "columns")?.dataTypeID;
+        if (columnType === undefined) throw new Error("missing index column type");
+        for (const row of result.rows as { columns: string[] | string }[]) {
+          if (!Array.isArray(row.columns)) throw new Error("unexpected PGlite catalog array");
+          row.columns = pgTypes.getTypeParser(columnType, "text")(`{${row.columns.join(",")}}`) as string[] | string;
+        }
+      }
+      return sql.trimStart().startsWith("UPDATE") ? [result.rows, result.affectedRows ?? 0] : result.rows;
     } }) };
   const writer = createCreatorWebBudgetStore(database, "bubpa_shop189"), sessions = createCreatorContinuousAutoBudgetStore(database, "bubpa_shop189");
   await writer.ensureSchema(); await sessions.ensureSchema();
@@ -49,10 +63,25 @@ async function fixture() {
     session: (await db.query(`SELECT * FROM ${SESSION} WHERE session_id=$1`, [active.sessionId])).rows[0] });
   const complete = async () => { await recovery.stage(ACTOR, request, evidence); return recovery.finalize(request.recoveryId, receipt, evidence); };
   return { db, database, writer, sessions, recovery, proposal, arm, old, active, request, evidence, receipt, snapshot, complete,
+    indexMetadataQueries,
     failSessionAnnotation: () => { failSessionAnnotation = true; } };
 }
 
 describe("Bubpa audited different-campaign UNKNOWN quarantine", () => {
+  it("reads catalog index keys as text[] supported by the real node-postgres decoder, not name[]", async () => {
+    const f = await fixture();
+    expect(pgTypes.getTypeParser(1003, "text")("{client_id}")).toBe("{client_id}");
+    expect(pgTypes.getTypeParser(1009, "text")("{client_id}")).toEqual(["client_id"]);
+    expect(f.indexMetadataQueries.length).toBeGreaterThanOrEqual(2);
+    for (const sql of f.indexMetadataQueries) {
+      const array = sql.match(/(ARRAY\([\s\S]*?\)) AS columns/)?.[1];
+      expect(array).toBeDefined();
+      const result = await f.db.query<{ array_type: string }>(`SELECT pg_typeof(${array})::text AS array_type FROM pg_index i
+        WHERE i.indexrelid='creator_web_budget_bubpa_shop189_one_active_fence'::regclass`);
+      expect(result.rows).toEqual([{ array_type: "text[]" }]);
+    }
+    expect(await f.writer.hasFence(NEW)).toBe(true);
+  });
   it("preserves the full historical UNKNOWN and stopped session, only annotating audited quarantine", async () => {
     const f = await fixture(), before = await f.snapshot();
     const staged = await f.recovery.stage(ACTOR, f.request, f.evidence);

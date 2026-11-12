@@ -127,7 +127,7 @@ END $$;`;
 const normalize = (value: unknown) => String(value).replace(/::text/g, "").replace(/\s|\(|\)/g, "");
 async function upgradeIndex(runner: Runner, table: string, name: string, oldPredicate: string) {
   const indexes = rows(await runner.query(`SELECT i.indisunique,i.indisvalid,i.indisready,i.indnkeyatts,i.indnatts,t.relname AS table_name,a.amname,
-    ARRAY(SELECT att.attname FROM unnest(i.indkey) WITH ORDINALITY k(num,ord)
+    ARRAY(SELECT att.attname::text FROM unnest(i.indkey) WITH ORDINALITY k(num,ord)
       LEFT JOIN pg_attribute att ON att.attrelid=i.indrelid AND att.attnum=k.num ORDER BY k.ord) AS columns,
     pg_get_expr(i.indpred,i.indrelid) AS predicate
     FROM pg_index i JOIN pg_class x ON x.oid=i.indexrelid JOIN pg_class t ON t.oid=i.indrelid
