@@ -224,3 +224,77 @@ describe("Creator verified LIVE whole-baht Auto writer", () => {
     await expect(h.service.prepare(OWNER, op, "auto")).rejects.toMatchObject({ code: "BUDGET_CAP_EXCEEDED" });
   });
 });
+
+describe("Creator audited successor campaign authority", () => {
+  const RECOVERY = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+  const OTHER_RECOVERY = "a47ac10b-58cc-4372-a567-0e02b2c3d479";
+
+  it("uses the exact successor for fence status and rejects the old or another campaign before preparing", async () => {
+    const h = harness("live", "bubpa_shop189"), fence = vi.spyOn(h.store, "hasFence");
+    h.setCap({ writeCampaignId: CAMPAIGN, recoveryId: RECOVERY });
+    expect(await h.service.status(true)).toMatchObject({ canPrepare: true, cap: { writeCampaignId: CAMPAIGN, recoveryId: RECOVERY } });
+    expect(fence).toHaveBeenLastCalledWith(CAMPAIGN);
+    h.setContext({ campaignId: OTHER_CAMPAIGN });
+    await expect(h.service.prepare(OWNER, { ...PREPARE, expectedCampaignId: OTHER_CAMPAIGN }))
+      .rejects.toMatchObject({ code: "BUDGET_RECOVERY_CAMPAIGN_RESTRICTED" });
+    expect(fence).toHaveBeenLastCalledWith(OTHER_CAMPAIGN);
+    expect(h.rows.size).toBe(0);
+    expect(h.adapters.acquireLease).not.toHaveBeenCalled();
+    expect(h.adapters.dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { writeCampaignId: CAMPAIGN }, { recoveryId: RECOVERY },
+    { writeCampaignId: CAMPAIGN, recoveryId: "not-a-recovery" },
+    { writeCampaignId: "not-a-campaign", recoveryId: RECOVERY },
+  ])("fails closed on incomplete or malformed successor policy %j", async invalid => {
+    const h = harness("live", "bubpa_shop189");
+    h.setCap(invalid);
+    expect(await h.service.status(true)).toMatchObject({ cap: null, canPrepare: false });
+    await expect(h.service.prepare(OWNER, PREPARE)).rejects.toMatchObject({ code: "BUDGET_CAP_UNAVAILABLE" });
+    expect(h.rows.size).toBe(0);
+    expect(h.adapters.acquireLease).not.toHaveBeenCalled();
+    expect(h.adapters.dispatch).not.toHaveBeenCalled();
+  });
+
+  it("passes the successor as the fourth lease argument for manual work and preserves legacy call shape otherwise", async () => {
+    const recovered = harness("live", "bubpa_shop189");
+    recovered.setCap({ writeCampaignId: CAMPAIGN, recoveryId: RECOVERY });
+    const p = await recovered.service.prepare(OWNER, PREPARE);
+    expect(await recovered.confirm(p.operationId)).toMatchObject({ status: "APPLIED_VERIFIED" });
+    expect(recovered.adapters.acquireLease.mock.calls).toEqual([[p.operationId, 3, undefined, CAMPAIGN]]);
+    expect(recovered.adapters.dispatch).toHaveBeenCalledWith(expect.objectContaining({ campaignId: CAMPAIGN, source: "manual" }));
+    const normal = harness("live", "bubpa_shop189"), other = await normal.service.prepare(OWNER, PREPARE);
+    expect(await normal.confirm(other.operationId)).toMatchObject({ status: "APPLIED_VERIFIED" });
+    expect(normal.adapters.acquireLease.mock.calls).toEqual([[other.operationId, 3]]);
+  });
+
+  it("passes the whole-baht Auto proof and exact fourth campaign argument without inheriting old operation authority", async () => {
+    const h = harness("live", "bubpa_shop189"), target = 144_000;
+    h.setCap({ writeCampaignId: CAMPAIGN, recoveryId: RECOVERY, autoLineReady: true });
+    h.setContext({ deliveryVerified: true, liveDeliveryState: "LIVE", liveSessionId: OTHER_CAMPAIGN,
+      liveSessionStartedAt: "2026-06-09T03:00:00.000Z" });
+    h.adapters.dispatch.mockResolvedValueOnce({ outcome: "APPLIED_VERIFIED", observedBudgetMinor: target, observedFingerprint: "b".repeat(64) });
+    const p = await h.service.prepare(OWNER, { ...PREPARE, targetBudgetMinor: target }, "auto");
+    expect(await h.service.confirm(OWNER, { operationId: p.operationId, nativeAutoOff: true, noConcurrentChanges: true,
+      evidenceMode: LIVE_ROOM_SPEND_TREND }, async () => true, async () => true, "ceil-baht")).toMatchObject({ status: "APPLIED_VERIFIED" });
+    expect(h.adapters.acquireLease.mock.calls).toEqual([[p.operationId, 3,
+      { previousBudgetMinor: CURRENT, targetBudgetMinor: target, rounding: "ceil-baht" }, CAMPAIGN]]);
+    expect(h.adapters.finishLease).toHaveBeenCalledWith(p.operationId, "APPLIED_VERIFIED");
+  });
+
+  it.each([
+    { writeCampaignId: OTHER_CAMPAIGN, recoveryId: RECOVERY },
+    { writeCampaignId: CAMPAIGN, recoveryId: OTHER_RECOVERY },
+    { writeCampaignId: undefined, recoveryId: undefined },
+  ])("does not dispatch if the returned lease changes the pinned recovery pair %j", async changed => {
+    const h = harness("live", "bubpa_shop189");
+    h.setCap({ writeCampaignId: CAMPAIGN, recoveryId: RECOVERY });
+    const p = await h.service.prepare(OWNER, PREPARE);
+    h.adapters.acquireLease.mockImplementationOnce(async operationId => ({ ...await h.adapters.readPolicy(), ...changed,
+      locked: true, operationId, expiresAt: "2026-06-09T04:01:00.000Z" }));
+    expect(await h.confirm(p.operationId)).toMatchObject({ status: "NOT_SENT" });
+    expect(h.adapters.dispatch).not.toHaveBeenCalled();
+    expect(h.adapters.finishLease).toHaveBeenCalledWith(p.operationId, "NOT_SENT");
+  });
+});

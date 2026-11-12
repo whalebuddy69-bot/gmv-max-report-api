@@ -17,10 +17,18 @@ export type WebBudgetMode = "disabled" | "dry-run" | "live";
 export type WebBudgetSource = "manual" | "auto";
 export type WebBudgetOutcome = "NOT_SENT" | "PROVIDER_REJECTED" | "APPLIED_VERIFIED" | "OUTCOME_UNKNOWN";
 export type WebBudgetStatus = WebBudgetOutcome | "PREPARED" | "PROCESSING" | "SIMULATED";
+export const WEB_BUDGET_PROVIDER_FAILURE_CODES = [
+  "PROVIDER_POST_TRANSPORT_UNKNOWN", "PROVIDER_RESPONSE_UNVERIFIED", "PROVIDER_RESPONSE_NOT_SUCCESS",
+  "PROVIDER_RESPONSE_SCOPE_MISMATCH", "READBACK_UNAVAILABLE", "READBACK_BUDGET_NOT_CONVERGED",
+  "READBACK_SETTINGS_CHANGED", "READBACK_NOT_STABLE",
+] as const;
 export interface WebBudgetPolicy {
   revision: number; campaignCapMinor: number; clientDailyCapMinor: number; readAt: string; locked: boolean;
   capWriteEnabled?: boolean;
   autoLineReady?: boolean;
+  /** An audited historical-UNKNOWN quarantine authorizes only this successor. */
+  writeCampaignId?: string;
+  recoveryId?: string;
 }
 interface WebBudgetCampaignEvidence {
   campaignId: string; reportingDate: string; observedAt: string; budgetMinor: number; fingerprint: string;
@@ -59,13 +67,14 @@ export type WebBudgetDispatch = WebBudgetAuthorization & {
 }
 export interface WebBudgetAdapters {
   readPolicy(): Promise<WebBudgetPolicy>;
-  acquireLease(operationId: string, revision: number, autoBudget?: WebAutoBudgetProof): Promise<WebBudgetPolicy & { operationId: string; expiresAt: string }>;
+  acquireLease(operationId: string, revision: number, autoBudget?: WebAutoBudgetProof, campaignId?: string): Promise<WebBudgetPolicy & { operationId: string; expiresAt: string }>;
   finishLease(operationId: string, outcome: WebBudgetOutcome): Promise<void>;
   readContext(expectedCampaignId: string, source?: WebBudgetSource): Promise<WebBudgetContext>;
   readPreArmContext?(expectedCampaignId: string): Promise<WebBudgetPreArmContext | null>;
   readScheduledLiveContext?(expectedCampaignId: string, expectedLiveSessionId?: string, autoDetectLive?: true): Promise<WebBudgetContext>;
   readAutoDetectContext?(expectedCampaignId: string, expectedLiveSessionId?: string): Promise<(WebBudgetPreArmContext & WebBudgetRoomEvidence) | null>;
-  dispatch(input: WebBudgetDispatch): Promise<{ outcome: WebBudgetOutcome; observedBudgetMinor?: number; observedFingerprint?: string }>;
+  dispatch(input: WebBudgetDispatch): Promise<{ outcome: WebBudgetOutcome; observedBudgetMinor?: number; observedFingerprint?: string;
+    failureCode?: typeof WEB_BUDGET_PROVIDER_FAILURE_CODES[number] }>;
 }
 export interface WebBudgetProposal {
   operationId: string; ownerId: number; mode: Exclude<WebBudgetMode, "disabled">;
@@ -79,7 +88,7 @@ export interface WebBudgetRecord extends WebBudgetProposal {
 export interface WebBudgetStore {
   create(value: WebBudgetProposal): Promise<void>;
   get(ownerId: number, operationId: string): Promise<WebBudgetRecord | null>;
-  hasFence(): Promise<boolean>;
+  hasFence(campaignId?: string): Promise<boolean>;
   reserve(ownerId: number, operationId: string, mode: Exclude<WebBudgetMode, "disabled">): Promise<WebBudgetRecord | null>;
   finish(ownerId: number, operationId: string, value: {
     status: Exclude<WebBudgetStatus, "PROCESSING" | "PREPARED">; observedBudgetMinor: number | null; reason: string; observedFingerprint?: string;
@@ -107,9 +116,15 @@ function checkPolicy(raw: WebBudgetPolicy, now: number): WebBudgetPolicy {
     || typeof raw.locked !== "boolean" || !isFresh(raw.readAt, now, POLICY_FRESH_MS)) {
     reject("BUDGET_CAP_UNAVAILABLE", 503, "ยังยืนยันเพดานงบจากระบบเดิมไม่ได้");
   }
+  if ((raw.writeCampaignId !== undefined || raw.recoveryId !== undefined) &&
+    (typeof raw.writeCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(raw.writeCampaignId) ||
+      typeof raw.recoveryId !== "string" || !WEB_BUDGET_OPERATION_ID.test(raw.recoveryId))) {
+    reject("BUDGET_CAP_UNAVAILABLE", 503, "ยังยืนยันขอบเขตแคมเปญหลังการกู้คืนไม่ได้");
+  }
   return { revision: raw.revision, campaignCapMinor: raw.campaignCapMinor, clientDailyCapMinor: raw.clientDailyCapMinor,
     readAt: raw.readAt, locked: raw.locked, ...(raw.capWriteEnabled === true ? { capWriteEnabled: true } : {}),
-    ...(raw.autoLineReady === true ? { autoLineReady: true } : {}) };
+    ...(raw.autoLineReady === true ? { autoLineReady: true } : {}),
+    ...(raw.writeCampaignId ? { writeCampaignId: raw.writeCampaignId, recoveryId: raw.recoveryId } : {}) };
 }
 function checkContext(raw: WebBudgetContext, expectedCampaignId: string, expectedBudgetMinor: number, now: number) {
   if (!raw || !isFresh(raw.observedAt, now, CONTEXT_FRESH_MS) || raw.reportingDate !== bangkokDay(new Date(now))
@@ -127,6 +142,9 @@ function checkContext(raw: WebBudgetContext, expectedCampaignId: string, expecte
   return raw;
 }
 function projectedSpend(policy: WebBudgetPolicy, context: WebBudgetContext, target: number): number {
+  if (policy.writeCampaignId !== undefined && context.campaignId !== policy.writeCampaignId) {
+    reject("BUDGET_RECOVERY_CAMPAIGN_RESTRICTED", 409, "รายการเก่าถูกแยกเก็บไว้ ระบบอนุญาตเฉพาะแคมเปญใหม่ที่ยืนยันแล้ว");
+  }
   if (target === context.budgetMinor) reject("BUDGET_NO_CHANGE", 400, "งบใหม่ต้องต่างจากงบปัจจุบัน");
   if (target <= context.spendMinor) reject("BUDGET_BELOW_SPEND", 409, "งบใหม่ต้องสูงกว่ายอดใช้ที่ TikTok รายงานแล้ว");
   const projected = BigInt(target) + BigInt(context.aggregateSpendMinor - context.spendMinor);
@@ -168,7 +186,7 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
     async status(operator: boolean) {
       const activeMode = operator ? mode() : "disabled";
       const cap = await getPolicy().catch(() => null);
-      const fenced = activeMode !== "disabled" && await store.hasFence().catch(() => true);
+      const fenced = activeMode !== "disabled" && await store.hasFence(cap?.writeCampaignId).catch(() => true);
       return { clientId, mode: activeMode, cap,
         capEditAllowed: operator && cap?.capWriteEnabled === true && !cap.locked && cap.campaignCapMinor === cap.clientDailyCapMinor,
         canPrepare: activeMode !== "disabled" && !!cap && !cap.locked && !fenced };
@@ -189,7 +207,7 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
       if (!WEB_BUDGET_CAMPAIGN_ID.test(input.expectedCampaignId) || !amount(input.expectedBudgetMinor) || !amount(input.targetBudgetMinor)) {
         reject("BUDGET_INPUT_INVALID", 400, "แคมเปญหรืองบไม่ถูกต้อง");
       }
-      if (await store.hasFence()) reject("BUDGET_WRITE_FENCED", 409, "ยังมีรายการปรับงบที่ต้องตรวจผลก่อน");
+      if (await store.hasFence(input.expectedCampaignId)) reject("BUDGET_WRITE_FENCED", 409, "ยังมีรายการปรับงบที่ต้องตรวจผลก่อน");
       const { cap, context, projected, timestamp } = await validatedInputs(input.expectedCampaignId, input.expectedBudgetMinor, input.targetBudgetMinor, source);
       const endOfDay = Date.parse(`${context.reportingDate}T00:00:00+07:00`) + 86_400_000;
       const expiresAt = Math.min(timestamp + PROPOSAL_TTL_MS, endOfDay);
@@ -261,13 +279,18 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
           status = "SIMULATED"; reason = "CHECKED_WITHOUT_PROVIDER_WRITE";
         } else {
           leaseAttempted = true;
-          const rawLease = autoGuard ? await adapters.acquireLease(reserved.operationId, reserved.cap.revision,
+          const rawLease = cap.writeCampaignId ? await adapters.acquireLease(reserved.operationId, reserved.cap.revision,
+            autoGuard ? { previousBudgetMinor: reserved.currentBudgetMinor, targetBudgetMinor: reserved.targetBudgetMinor,
+              ...(autoRounding ? { rounding: autoRounding } : {}) } : undefined, reserved.campaignId)
+            : autoGuard ? await adapters.acquireLease(reserved.operationId, reserved.cap.revision,
             { previousBudgetMinor: reserved.currentBudgetMinor, targetBudgetMinor: reserved.targetBudgetMinor,
               ...(autoRounding ? { rounding: autoRounding } : {}) })
             : await adapters.acquireLease(reserved.operationId, reserved.cap.revision);
           const lease = checkPolicy(rawLease, now().getTime());
           const deadline = Math.min(timeMs(rawLease.expiresAt), timeMs(reserved.expiresAt));
           if (rawLease.operationId !== reserved.operationId || !lease.locked || !sameCap(reserved.cap, lease)
+            || lease.writeCampaignId !== cap.writeCampaignId || lease.recoveryId !== cap.recoveryId
+            || (lease.writeCampaignId !== undefined && lease.writeCampaignId !== reserved.campaignId)
             || !Number.isFinite(deadline) || deadline - now().getTime() < MIN_SEND_WINDOW_MS || mode() !== "live" || !await recheckOperator()) {
             reject("BUDGET_LEASE_UNVERIFIED", 409, "ยังยืนยันสิทธิ์ส่งคำสั่งไม่ได้");
           }
@@ -288,7 +311,8 @@ export function createCreatorWebBudgetService({ store, adapters, mode, clientId 
           } else if (sent?.outcome === "NOT_SENT" || sent?.outcome === "PROVIDER_REJECTED") {
             status = sent.outcome; reason = status;
           } else {
-            status = "OUTCOME_UNKNOWN"; reason = "READBACK_UNVERIFIED";
+            status = "OUTCOME_UNKNOWN";
+            reason = sent?.failureCode && WEB_BUDGET_PROVIDER_FAILURE_CODES.includes(sent.failureCode) ? sent.failureCode : "READBACK_UNVERIFIED";
           }
         }
       } catch (error) {

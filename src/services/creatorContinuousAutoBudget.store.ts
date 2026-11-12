@@ -5,6 +5,9 @@ import type { CreatorWebBudgetDatabase } from "./creatorWebBudget.store";
 import { allowsScheduledCreatorAuto, isContinuousCreatorBudgetScope, isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND, supportsContinuousEvidence,
   type ContinuousCreatorBudgetScope, type ContinuousEvidence } from "./creatorBudgetScope";
 import { roundedCreatorAutoTarget } from "./creatorAutoBudgetMoney";
+import { CREATOR_BUDGET_RECOVERY_CLIENT, creatorBudgetRecoveryCandidateAllowedSql,
+  creatorBudgetRecoveryQuarantinedSessionSql, creatorBudgetRecoveryQuarantinedWriterSql,
+  ensureCreatorBudgetRecoverySessionSchema } from "./creatorBudgetRecovery.store";
 
 const CLIENT = "punpan_020";
 export type CreatorContinuousAutoBudgetClient = ContinuousCreatorBudgetScope;
@@ -611,10 +614,14 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
     clientId === "myushop4" ? "creator_myu_cauto_" : clientId === "bubpa_shop189" ? "creator_bubpa_cauto_" :
       clientId === "koolkool888" ? "creator_kool_cauto_" : clientId === "boomkan" ? "creator_boom_cauto_" : "creator_nn_cauto_";
   const roomOnly = isVerifiedRoomCreator(clientId) || clientId === "nnshop5719";
-  const scopedSql = (sql: string) => clientId === CLIENT ? sql : sql
-    .replaceAll("creator_continuous_", prefix)
-    .replaceAll("creator_web_budget_operations", `creator_web_budget_${clientId}_operations`)
-    .replaceAll("'punpan_020'", `'${clientId}'`);
+  const scopedSql = (sql: string) => {
+    const scoped = clientId === CLIENT ? sql : sql
+      .replaceAll("creator_continuous_", prefix)
+      .replaceAll("creator_web_budget_operations", `creator_web_budget_${clientId}_operations`)
+      .replaceAll("'punpan_020'", `'${clientId}'`);
+    return clientId === CREATOR_BUDGET_RECOVERY_CLIENT ? scoped.replaceAll("w.status='OUTCOME_UNKNOWN'",
+      `(w.status='OUTCOME_UNKNOWN' AND NOT ${creatorBudgetRecoveryQuarantinedWriterSql("w", "s.campaign_id")})`) : scoped;
+  };
   const one = (result: unknown) => oneScoped(result, clientId);
   const validSession = (value: CreatorContinuousAutoBudgetSession) => validScopedSession(value, clientId);
   async function run<T>(work: (runner: Pick<Runner, "query">) => Promise<T>): Promise<T> {
@@ -647,14 +654,17 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
       await runner.query(CREATOR_CONTINUOUS_KEEP_ROOMS_SCHEMA_SQL);
       await runner.query(CREATOR_CONTINUOUS_NON_ROI_SETTINGS_SCHEMA_SQL);
       await runner.query(CREATOR_CONTINUOUS_TARGET_ROUNDING_SCHEMA_SQL);
+      if (clientId === CREATOR_BUDGET_RECOVERY_CLIENT) await ensureCreatorBudgetRecoverySessionSchema(runner);
     }); },
     async getActive() {
       // Includes stopped sessions whose already reserved operation still needs reconciliation.
-      return run(async runner => one(await runner.query(`SELECT * FROM ${SESSION} WHERE client_id='punpan_020'
-        AND (status <> 'STOPPED' OR operation_id IS NOT NULL)`)));
+      return run(async runner => one(await runner.query(`SELECT s.* FROM ${SESSION} s WHERE client_id='punpan_020'
+        AND (status <> 'STOPPED' OR operation_id IS NOT NULL)
+        ${clientId === CREATOR_BUDGET_RECOVERY_CLIENT ? `AND NOT ${creatorBudgetRecoveryQuarantinedSessionSql("s")}` : ""}`)));
     },
     async getLatest() {
-      return run(async runner => one(await runner.query(`SELECT * FROM ${SESSION} WHERE client_id='punpan_020'
+      return run(async runner => one(await runner.query(`SELECT s.* FROM ${SESSION} s WHERE client_id='punpan_020'
+        ${clientId === CREATOR_BUDGET_RECOVERY_CLIENT ? `AND NOT ${creatorBudgetRecoveryQuarantinedSessionSql("s")}` : ""}
         ORDER BY created_order DESC LIMIT 1`)));
     },
     async arm(input: CreatorContinuousAutoBudgetArmInput) {
@@ -667,6 +677,7 @@ export function createCreatorContinuousAutoBudgetStore(database: CreatorWebBudge
         SELECT $1::uuid,'punpan_020',$2,$3,$4,$5,$6,$7,date_trunc('milliseconds',clock_timestamp()),$8,$9,$10,$11,$12,$13,$14::timestamptz,$15,$16
         WHERE NOT EXISTS (SELECT 1 FROM creator_continuous_auto_budget_attempts
           WHERE client_id='punpan_020' AND campaign_id=$3 AND baseline_fingerprint=$6 AND (NOT retry_released OR ($10<>'spend-trend' AND NOT $13::boolean)))
+        ${clientId === CREATOR_BUDGET_RECOVERY_CLIENT ? `AND ${creatorBudgetRecoveryCandidateAllowedSql("$3::text")}` : ""}
         ON CONFLICT DO NOTHING RETURNING *`,
       [input.sessionId, input.ownerId, input.campaignId, input.policyRevision, input.baselineBudgetMinor,
         input.baselineFingerprint, input.liveSessionId, input.nativeAutoOffAttested, input.noConcurrentChangesAttested,

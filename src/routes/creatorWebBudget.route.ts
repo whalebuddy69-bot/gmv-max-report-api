@@ -9,6 +9,7 @@ import { parseAutomationViewerIds } from "./automation.route";
 import type { createCreatorWebCapAdapters } from "../services/creatorWebBudget.adapters";
 import type { createCreatorAutoBudgetService } from "../services/creatorAutoBudget.service";
 import type { createCreatorContinuousAutoBudgetService } from "../services/creatorContinuousAutoBudget.service";
+import type { CreatorBudgetRecoveryRequest, CreatorBudgetRecoveryRecord } from "../services/creatorBudgetRecovery.store";
 import { allowsScheduledCreatorAuto, EXTRA_CREATOR_BUDGET_SCOPE_IDS, isExtraCreatorBudgetScope, isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND,
   type ExtraCreatorBudgetScope } from "../services/creatorBudgetScope";
 
@@ -26,7 +27,9 @@ function badInput(): never { throw new WebBudgetError("BUDGET_INPUT_INVALID", 40
 type BudgetService = ReturnType<typeof createCreatorWebBudgetService>;
 type AutoService = ReturnType<typeof createCreatorAutoBudgetService>;
 type ContinuousAutoService = ReturnType<typeof createCreatorContinuousAutoBudgetService>;
-export type ScopedCreatorBudgetServices = Partial<Record<ExtraCreatorBudgetScope, { service: BudgetService; autoService?: AutoService; continuousAutoService?: ContinuousAutoService; activeLegacy?: () => Promise<boolean> }>>;
+export type ScopedCreatorBudgetServices = Partial<Record<ExtraCreatorBudgetScope, { service: BudgetService; autoService?: AutoService; continuousAutoService?: ContinuousAutoService;
+  recoverUnknown?: (ownerId: number, request: CreatorBudgetRecoveryRequest, recheck: () => Promise<boolean>) => Promise<CreatorBudgetRecoveryRecord>;
+  activeLegacy?: () => Promise<boolean> }>>;
 
 export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, capEditor, autoService, continuousAutoService, autoDiagnostics, extraScopes = {}, extraConfigured = () => true, now = Date.now }: {
   viewerIds: () => string | undefined; operatorIds: () => string | undefined;
@@ -111,6 +114,21 @@ export function createCreatorWebBudgetRouter({ viewerIds, operatorIds, service, 
     return scoped.service;
   }
   router.get(scopedPaths("/status"), get, handle((req, id) => serviceFor(req).status(canOperate(id))));
+  router.post("/bubpa_shop189/recover-unknown", onlyOperator, onlyJson, json, handle(async (req, id) => {
+    const value: unknown = req.body;
+    if (!fields(value, ["recoveryId", "oldOperationId", "oldCampaignId", "newCampaignId", "acknowledgedUnknown"]) ||
+      typeof value.recoveryId !== "string" || !WEB_BUDGET_OPERATION_ID.test(value.recoveryId) ||
+      typeof value.oldOperationId !== "string" || !WEB_BUDGET_OPERATION_ID.test(value.oldOperationId) ||
+      typeof value.oldCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.oldCampaignId) ||
+      typeof value.newCampaignId !== "string" || !WEB_BUDGET_CAMPAIGN_ID.test(value.newCampaignId) ||
+      value.oldCampaignId === value.newCampaignId || value.acknowledgedUnknown !== true) badInput();
+    const recover = configuredExtra("bubpa_shop189")?.recoverUnknown;
+    if (!recover) throw new WebBudgetError("BUDGET_RECOVERY_DISABLED", 404, "ยังไม่ได้เปิดการกู้คืนสำหรับบัญชีนี้");
+    if (!await recheck(req, id)) throw new WebBudgetError("BUDGET_OPERATOR_DENIED", 403, "ยังยืนยันสิทธิ์กู้คืนไม่ได้");
+    const result = await recover(id, value as unknown as CreatorBudgetRecoveryRequest, () => recheck(req, id));
+    return { recoveryId: result.recoveryId, clientId: result.clientId, oldCampaignId: result.oldCampaignId,
+      newCampaignId: result.newCampaignId, status: result.status, historicalOutcome: result.historicalOutcome };
+  }));
   router.get(scopedPaths("/operations/:operationId"), get, onlyOperator, handle((req, id) => {
     if (typeof req.params.operationId !== "string" || !WEB_BUDGET_OPERATION_ID.test(req.params.operationId)) badInput();
     return serviceFor(req).operation(id, req.params.operationId);

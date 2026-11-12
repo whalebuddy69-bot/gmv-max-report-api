@@ -5,7 +5,8 @@ import { configuredCreatorScheduledAutoLive, configuredCreatorWebBudgetMode, con
   allowsScheduledCreatorAuto, isExtraCreatorBudgetScope, isVerifiedRoomCreator, LIVE_ROOM_SPEND_TREND, type CreatorBudgetScope } from "./creatorBudgetScope";
 import { createCreatorVerifiedLiveRoomReader } from "./creatorVerifiedLiveRoom.service";
 import { roundedCreatorAutoTarget, type CreatorAutoBudgetRounding } from "./creatorAutoBudgetMoney";
-import { WEB_BUDGET_MAX_MINOR, WebBudgetError, type WebBudgetAdapters, type WebBudgetContext, type WebBudgetPreArmContext, type WebBudgetRoomEvidence,
+import type { CreatorBudgetRecoveryLeaseRequest, CreatorBudgetRecoveryReceipt } from "./creatorBudgetRecovery.store";
+import { WEB_BUDGET_MAX_MINOR, WebBudgetError, type WEB_BUDGET_PROVIDER_FAILURE_CODES, type WebBudgetAdapters, type WebBudgetContext, type WebBudgetPreArmContext, type WebBudgetRoomEvidence,
   type WebBudgetSource } from "./creatorWebBudget.service";
 
 const POLICY_ORIGIN = "https://whale-buddy-ads-control-plane.onrender.com/internal/automation";
@@ -90,17 +91,21 @@ function policyView(value: Data, now: Date, clientId: PolicyClient = "punpan_020
     !positive(value.campaignCapMinor) || !positive(value.clientDailyCapMinor) ||
     value.campaignCapMinor > WEB_BUDGET_MAX_MINOR || value.clientDailyCapMinor > WEB_BUDGET_MAX_MINOR ||
     !fresh(value.readAt, now.getTime(), 15_000) || typeof value.locked !== "boolean") unverified();
+  if ((value.writeCampaignId !== undefined || value.recoveryId !== undefined) &&
+    (clientId !== "bubpa_shop189" || typeof value.writeCampaignId !== "string" || !ID.test(value.writeCampaignId) ||
+      typeof value.recoveryId !== "string" || !UUID.test(value.recoveryId))) unverified();
   return { revision: value.revision, campaignCapMinor: value.campaignCapMinor,
     clientDailyCapMinor: value.clientDailyCapMinor, readAt: value.readAt, locked: value.locked,
     ...(value.capWriteEnabled === true ? { capWriteEnabled: true } : {}),
-    ...(value.autoLineReady === true ? { autoLineReady: true } : {}) };
+    ...(value.autoLineReady === true ? { autoLineReady: true } : {}),
+    ...(typeof value.writeCampaignId === "string" ? { writeCampaignId: value.writeCampaignId, recoveryId: value.recoveryId as string } : {}) };
 }
 
 function createPolicyRequest({ fetchImpl, env, clientId }: { fetchImpl: typeof fetch; env: NodeJS.ProcessEnv; clientId: PolicyClient }) {
   const fixedPath = creatorBudgetPolicyPath(clientId);
   if (!fixedPath) unverified();
   const url = POLICY_ORIGIN + fixedPath;
-  return async function policyRequest(path: "" | "/lease" | "/finish" | "/cap" | "/check-failure-alert" | `/line-result/${string}`, body?: Data) {
+  return async function policyRequest(path: "" | "/lease" | "/finish" | "/cap" | "/check-failure-alert" | "/recover-unknown" | `/line-result/${string}`, body?: Data) {
     const key = env.CREATOR_WEB_POLICY_BRIDGE_KEY;
     if (!key || !/^[A-Za-z0-9_-]{43,100}$/.test(key) ||
       [env.CREATOR_READ_BRIDGE_KEY, env.CREATOR_BUDGET_TEST_KEY, env.INTERNAL_API_KEY, env.JWT_SECRET].includes(key)) unverified();
@@ -142,6 +147,18 @@ export async function readPpanAutoLineStatus(operationId: string, fetchImpl = fe
   if (raw.schemaVersion !== 1 || raw.clientId !== "punpan_020" || raw.operationId !== operationId ||
     (status !== "PENDING" && status !== "ACCEPTED" && status !== "UNCONFIRMED" && status !== "UNKNOWN")) unverified();
   return status;
+}
+
+/** Quarantine a proven-disabled campaign's historical uncertainty; never a TikTok write or success notification. */
+export async function quarantineBubpaUnknownLease(input: CreatorBudgetRecoveryLeaseRequest, fetchImpl = fetch, env = process.env): Promise<CreatorBudgetRecoveryReceipt> {
+  if (env.CREATOR_BUDGET_BUBPA_RECOVERY_ENABLED !== "true" || !UUID.test(input.recoveryId) || !UUID.test(input.oldOperationId) ||
+    !positive(input.operatorUserId) || !positive(input.revision) || !ID.test(input.oldCampaignId) || !ID.test(input.newCampaignId) ||
+    input.oldCampaignId === input.newCampaignId || input.acknowledgedUnknown !== true) unverified();
+  const raw = await createPolicyRequest({ fetchImpl, env, clientId: "bubpa_shop189" })("/recover-unknown", { ...input });
+  if (raw.schemaVersion !== 1 || raw.clientId !== "bubpa_shop189" || raw.recoveryId !== input.recoveryId ||
+    raw.oldOperationId !== input.oldOperationId || raw.oldCampaignId !== input.oldCampaignId || raw.newCampaignId !== input.newCampaignId ||
+    raw.status !== "QUARANTINED" || raw.historicalOutcome !== "OUTCOME_UNKNOWN" || typeof raw.locked !== "boolean") unverified();
+  return raw as unknown as CreatorBudgetRecoveryReceipt;
 }
 
 export function createCreatorWebCapAdapters({ fetchImpl = fetch, now = () => new Date(), env = process.env }:
@@ -206,15 +223,18 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     return value;
   }
 
-  async function getTikTokData(url: URL, accessToken: string) {
-    const r = await fetchImpl(url, { method: "GET", redirect: "error", signal: AbortSignal.timeout(5000),
+  async function getTikTokData(url: URL, accessToken: string, deadline?: number) {
+    const timeout = deadline === undefined ? 5000 : Math.min(5000, deadline - now().getTime());
+    if (!Number.isFinite(timeout) || timeout <= 0) unverified();
+    const r = await fetchImpl(url, { method: "GET", redirect: "error", signal: AbortSignal.timeout(Math.max(1, Math.floor(timeout))),
       headers: { "Access-Token": accessToken, Accept: "application/json", "Cache-Control": "no-cache" } });
     const j = await json(r);
+    if (deadline !== undefined && now().getTime() >= deadline) unverified();
     if (!r.ok || j.code !== 0) unverified();
     return object(j.data);
   }
 
-  async function providerGet(path: typeof INFO | typeof LIST, campaignId: string, accessToken: string) {
+  async function providerGet(path: typeof INFO | typeof LIST, campaignId: string, accessToken: string, deadline?: number) {
     if (!ID.test(campaignId) || (path !== INFO && path !== LIST)) unverified();
     const url = new URL(TIKTOK + path);
     url.searchParams.set("advertiser_id", binding.advertiserId);
@@ -224,11 +244,11 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
       url.searchParams.set("fields", JSON.stringify(["advertiser_id", "campaign_id", "operation_status", "modify_time", "secondary_status"]));
       url.searchParams.set("page", "1"); url.searchParams.set("page_size", "100");
     }
-    return getTikTokData(url, accessToken);
+    return getTikTokData(url, accessToken, deadline);
   }
 
-  async function exactCampaignList(campaignId: string, accessToken: string, allowInactive = false): Promise<CampaignListObservation | null> {
-    const list = await providerGet(LIST, campaignId, accessToken);
+  async function exactCampaignList(campaignId: string, accessToken: string, allowInactive = false, deadline?: number): Promise<CampaignListObservation | null> {
+    const list = await providerGet(LIST, campaignId, accessToken, deadline);
     const page = object(list.page_info);
     if (!Array.isArray(list.list) || page.page !== 1 || (allowInactive &&
       ((list.advertiser_id !== undefined && list.advertiser_id !== binding.advertiserId) ||
@@ -243,10 +263,10 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     return { stamp: row.modify_time, ...(delivery === undefined ? {} : { campaignDeliveryStatus: delivery }) };
   }
 
-  async function sample(campaignId: string, accessToken: string, { preArmStamp, strictIdentity = false }: {
-    preArmStamp?: string; strictIdentity?: boolean;
+  async function sample(campaignId: string, accessToken: string, { preArmStamp, strictIdentity = false, deadline }: {
+    preArmStamp?: string; strictIdentity?: boolean; deadline?: number;
   } = {}): Promise<Sample> {
-    const data = await providerGet(INFO, campaignId, accessToken);
+    const data = await providerGet(INFO, campaignId, accessToken, deadline);
     const verifyRoomIdentity = isVerifiedRoomCreator(clientId) || strictIdentity || preArmStamp !== undefined;
     if (data.advertiser_id !== binding.advertiserId || data.campaign_id !== campaignId ||
       data.shopping_ads_type !== "LIVE" || data.operation_status !== "ENABLE" || data.store_id !== "0" ||
@@ -274,7 +294,7 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     const { budget, modify_time: _, secondary_status: _delivery, ...untouched } = data;
     const budgetMinor = minor(budget);
     if (!positive(budgetMinor)) unverified();
-    const listed: CampaignListObservation | null = preArmStamp === undefined ? await exactCampaignList(campaignId, accessToken) : { stamp: preArmStamp };
+    const listed: CampaignListObservation | null = preArmStamp === undefined ? await exactCampaignList(campaignId, accessToken, false, deadline) : { stamp: preArmStamp };
     if (listed === null) unverified();
     const { stamp, campaignDeliveryStatus: delivery } = listed;
     const native = nativeState(data), unchanged = hash(untouched);
@@ -375,18 +395,21 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
   return {
     async readPolicy() { return checkedPolicy(await policyRequest(""), now()); },
     ...(allowsScheduledCreatorAuto(clientId) ? { readPreArmContext, readScheduledLiveContext, readAutoDetectContext } : {}),
-    async acquireLease(operationId, revision, autoBudget) {
+    async acquireLease(operationId, revision, autoBudget, campaignId) {
       if (!UUID.test(operationId) || !positive(revision)) unverified();
+      if (campaignId !== undefined && (clientId !== "bubpa_shop189" || !ID.test(campaignId))) unverified();
       if (autoBudget) {
         const rounding = autoBudget.rounding;
         if ((rounding !== undefined && (rounding === "ceil-baht" ? !configuredCreatorScheduledAutoLive(env, clientId)
           : rounding !== "floor-satang" || clientId !== "punpan_020")) ||
           !matchesAutoTarget(autoBudget.previousBudgetMinor, autoBudget.targetBudgetMinor, rounding)) unverified();
       }
-      const raw = await policyRequest("/lease", { operationId, revision, ...(autoBudget ? { autoBudget } : {}) });
+      const raw = await policyRequest("/lease", { operationId, revision, ...(autoBudget ? { autoBudget } : {}),
+        ...(campaignId === undefined ? {} : { campaignId }) });
       const at = now();
       const view = checkedPolicy(raw, at);
-      if (!view.locked || view.revision !== revision || raw.operationId !== operationId || !validIso(raw.expiresAt) ||
+      if ((view.writeCampaignId !== undefined && campaignId !== view.writeCampaignId) ||
+        !view.locked || view.revision !== revision || raw.operationId !== operationId || !validIso(raw.expiresAt) ||
         Date.parse(raw.expiresAt) <= at.getTime() || Date.parse(raw.expiresAt) - at.getTime() > 65_000) unverified();
       return { ...view, operationId, expiresAt: raw.expiresAt };
     },
@@ -403,6 +426,8 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
     },
     async dispatch(input) {
       let attempted = false;
+      let failureCode: typeof WEB_BUDGET_PROVIDER_FAILURE_CODES[number] = "PROVIDER_POST_TRANSPORT_UNKNOWN";
+      let providerStatus: number | undefined, providerCode: number | undefined, providerRequestId: string | undefined;
       try {
         const roomTrend = input.evidenceMode === LIVE_ROOM_SPEND_TREND;
         if (input.autoDetectLive !== undefined && (input.autoDetectLive !== true || !roomTrend)) unverified();
@@ -441,20 +466,54 @@ export function createCreatorWebBudgetAdapters({ loadToken, fetchImpl = fetch, n
         const r = await fetchImpl(TIKTOK + UPDATE, { method: "POST", redirect: "error", signal: AbortSignal.timeout(8000),
           headers: { "Access-Token": accessToken, Accept: "application/json", "Content-Type": "application/json" },
           body: JSON.stringify({ advertiser_id: binding.advertiserId, campaign_id: input.campaignId, budget: input.targetBudgetMinor / 100 }) });
+        providerStatus = r.status;
+        failureCode = "PROVIDER_RESPONSE_UNVERIFIED";
         const result = await json(r);
+        if (typeof result.code === "number" && Number.isSafeInteger(result.code)) providerCode = result.code;
+        const requestId = result.request_id ?? result.log_id;
+        if (typeof requestId === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(requestId) &&
+          !requestId.includes(accessToken) && !accessToken.includes(requestId)) providerRequestId = requestId;
         // An HTTP or nonzero provider response is not a documented no-write
         // guarantee for this Creator endpoint. Preserve the fence after any
         // ambiguous POST instead of trusting an immediately stale readback.
+        failureCode = "PROVIDER_RESPONSE_NOT_SUCCESS";
         if (!r.ok || result.code !== 0) unverified();
+        failureCode = "PROVIDER_RESPONSE_SCOPE_MISMATCH";
         const data = opt(result.data);
         if ((data.campaign_id !== undefined && data.campaign_id !== input.campaignId) ||
           (data.advertiser_id !== undefined && data.advertiser_id !== binding.advertiserId)) unverified();
-        const first = await sample(input.campaignId, accessToken, { strictIdentity: roomTrend });
-        const second = await sample(input.campaignId, accessToken, { strictIdentity: roomTrend });
-        if (first.budgetMinor !== input.targetBudgetMinor || second.budgetMinor !== input.targetBudgetMinor ||
-          first.unchanged !== before.unchanged || second.fingerprint !== first.fingerprint) unverified();
-        return { outcome: "APPLIED_VERIFIED", observedBudgetMinor: second.budgetMinor, observedFingerprint: second.fingerprint };
-      } catch { return { outcome: attempted ? "OUTCOME_UNKNOWN" : "NOT_SENT" }; }
+        // Only GET readbacks may retry. Preserve the single POST, exact target,
+        // scope, settings and stable two-sample proof; allow bounded convergence.
+        const maximumPairs = clientId === "bubpa_shop189" ? 3 : 1;
+        const readDeadline = Math.min(Date.parse(input.notAfter), now().getTime() + 20_000);
+        for (let pair = 0; pair < maximumPairs; pair++) {
+          if (pair > 0) {
+            if (readDeadline - now().getTime() < 2500) break;
+            await (sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))))(pair * 1000);
+          }
+          failureCode = "READBACK_UNAVAILABLE";
+          try {
+            const deadline = clientId === "bubpa_shop189" ? readDeadline : undefined;
+            const first = await sample(input.campaignId, accessToken, { strictIdentity: roomTrend, deadline });
+            const second = await sample(input.campaignId, accessToken, { strictIdentity: roomTrend, deadline });
+            if (deadline !== undefined && now().getTime() >= deadline) unverified();
+            if (first.unchanged !== before.unchanged || second.unchanged !== before.unchanged) { failureCode = "READBACK_SETTINGS_CHANGED"; break; }
+            if (first.budgetMinor !== input.targetBudgetMinor || second.budgetMinor !== input.targetBudgetMinor) {
+              failureCode = "READBACK_BUDGET_NOT_CONVERGED"; continue;
+            }
+            if (second.fingerprint !== first.fingerprint) { failureCode = "READBACK_NOT_STABLE"; continue; }
+            return { outcome: "APPLIED_VERIFIED", observedBudgetMinor: second.budgetMinor, observedFingerprint: second.fingerprint };
+          } catch { /* Retain READBACK_UNAVAILABLE; never retry the POST. */ }
+        }
+        unverified();
+      } catch {
+        if (attempted && clientId === "bubpa_shop189") {
+          console.warn("Creator budget outcome requires verification", { clientId, campaignId: input.campaignId,
+            failureCode, providerStatus, providerCode, providerRequestId });
+          return { outcome: "OUTCOME_UNKNOWN", failureCode };
+        }
+        return { outcome: attempted ? "OUTCOME_UNKNOWN" : "NOT_SENT" };
+      }
     },
   };
 }

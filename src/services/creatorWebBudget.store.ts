@@ -4,6 +4,8 @@ import {
 } from "./creatorWebBudget.service";
 import { PPAN_CAMPAIGN_ACTION_FENCE_SQL, PPAN_CAMPAIGN_BUDGET_LOCK_SQL, PPAN_CAMPAIGN_OPERATIONS } from "./creatorCampaignActions.store";
 import type { CreatorBudgetScope } from "./creatorBudgetScope";
+import { CREATOR_BUDGET_RECOVERY_CLIENT, creatorBudgetRecoveryCandidateAllowedSql,
+  creatorBudgetRecoveryQuarantinedWriterSql, ensureCreatorBudgetRecoveryWriterSchema } from "./creatorBudgetRecovery.store";
 
 export type CreatorWebBudgetLedgerClient = CreatorBudgetScope;
 const PPAN_LEDGER = { clientId: "punpan_020", table: "creator_web_budget_operations", fence: "creator_web_budget_one_active_fence" } as const;
@@ -141,16 +143,22 @@ export function createCreatorWebBudgetStore(database: CreatorWebBudgetDatabase, 
     } finally { try { await runner.release(); } catch { /* No connection metadata in responses. */ } }
   }
   return {
-    async ensureSchema() { await run(async runner => { await runner.query(schemaSql(scope)); }); },
+    async ensureSchema() { await run(async runner => {
+      await runner.query(schemaSql(scope));
+      if (clientId === CREATOR_BUDGET_RECOVERY_CLIENT) await ensureCreatorBudgetRecoveryWriterSchema(runner);
+    }); },
     async create(value) {
       await run(async runner => {
-        await runner.query(`INSERT INTO ${table}
+        const inserted = await runner.query(`INSERT INTO ${table}
           (operation_id,owner_id,mode,campaign_id,reporting_date,current_budget_minor,target_budget_minor,
             projected_client_spend_minor,policy_revision,campaign_cap_minor,client_daily_cap_minor,cap_read_at,fingerprint,expires_at,source)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+          ${clientId === CREATOR_BUDGET_RECOVERY_CLIENT ? `SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15
+            WHERE ${creatorBudgetRecoveryCandidateAllowedSql("$4::text")} RETURNING operation_id` :
+          "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)"}`,
         [value.operationId, value.ownerId, value.mode, value.campaignId, value.reportingDate,
           value.currentBudgetMinor, value.targetBudgetMinor, value.projectedClientSpendMinor,
           value.cap.revision, value.cap.campaignCapMinor, value.cap.clientDailyCapMinor, value.cap.readAt, value.fingerprint, value.expiresAt, value.source ?? "manual"]);
+        if (clientId === CREATOR_BUDGET_RECOVERY_CLIENT && rows(inserted).length !== 1) throw new Error("CREATOR_BUDGET_RECOVERY_CAMPAIGN_RESTRICTED");
       });
     },
     async get(ownerId, operationId) {
@@ -159,10 +167,14 @@ export function createCreatorWebBudgetStore(database: CreatorWebBudgetDatabase, 
         return found.length === 1 ? operation(found[0], clientId) : null;
       });
     },
-    async hasFence() {
-      return await run(async runner => await campaignActionFenced(runner, false) || rows(await runner.query(`SELECT 1 FROM ${table}
-        WHERE client_id=$1 AND (status='OUTCOME_UNKNOWN' OR
-          (status='PROCESSING' AND (mode='live' OR expires_at > clock_timestamp()))) LIMIT 1`, [clientId])).length > 0) !== false;
+    async hasFence(campaignId?: string) {
+      return await run(async runner => await campaignActionFenced(runner, false) ||
+        (clientId === CREATOR_BUDGET_RECOVERY_CLIENT && rows(await runner.query(`SELECT 1 WHERE NOT ${creatorBudgetRecoveryCandidateAllowedSql("$1::text")}`,
+          [campaignId ?? null])).length > 0) || rows(await runner.query(`SELECT 1 FROM ${table} w
+        WHERE client_id=$1 AND ((status='OUTCOME_UNKNOWN' ${clientId === CREATOR_BUDGET_RECOVERY_CLIENT ?
+          `AND NOT ${creatorBudgetRecoveryQuarantinedWriterSql("w", "$2::text")}` : ""}) OR
+          (status='PROCESSING' AND (mode='live' OR expires_at > clock_timestamp()))) LIMIT 1`,
+        clientId === CREATOR_BUDGET_RECOVERY_CLIENT ? [clientId, campaignId ?? null] : [clientId])).length > 0) !== false;
     },
     async reserve(ownerId, operationId, mode) {
       return run(async runner => {
@@ -174,6 +186,9 @@ export function createCreatorWebBudgetStore(database: CreatorWebBudgetDatabase, 
           SET status='PROCESSING', reason='SEND_FENCE_COMMITTED', reserved_at=clock_timestamp(), updated_at=clock_timestamp()
           WHERE client_id=$4 AND owner_id=$1 AND operation_id=$2 AND mode=$3 AND status='PREPARED'
             AND expires_at > clock_timestamp()
+            ${clientId === CREATOR_BUDGET_RECOVERY_CLIENT ? `AND ${creatorBudgetRecoveryCandidateAllowedSql("campaign_id")}
+              AND NOT EXISTS(SELECT 1 FROM ${table} w WHERE w.client_id=$4 AND w.status='OUTCOME_UNKNOWN'
+                AND NOT ${creatorBudgetRecoveryQuarantinedWriterSql("w", `${table}.campaign_id`)})` : ""}
           RETURNING *`, [ownerId, operationId, mode, clientId]));
         return matched.length === 1 ? operation(matched[0], clientId) : null;
       }, true);

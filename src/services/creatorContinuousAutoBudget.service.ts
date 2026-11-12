@@ -183,16 +183,16 @@ export function createCreatorContinuousAutoBudgetService({ mode, discover, adapt
     const readContext = evidence === LIVE_ROOM_SPEND_TREND && adapters.readScheduledLiveContext
       ? autoDetectLive ? adapters.readScheduledLiveContext(campaignId, expectedLiveSessionId, true)
         : adapters.readScheduledLiveContext(campaignId, expectedLiveSessionId) : adapters.readContext(campaignId);
-    const [context, policy, fenced] = await Promise.all([readContext, adapters.readPolicy(), ledger.hasFence()]);
+    const [context, policy, fenced] = await Promise.all([readContext, adapters.readPolicy(), ledger.hasFence(campaignId)]);
     return { context, policy, fenced };
   }
   async function readScheduled(campaignId: string) {
-    const [context, policy, fenced] = await Promise.all([adapters.readPreArmContext!(campaignId), adapters.readPolicy(), ledger.hasFence()]);
+    const [context, policy, fenced] = await Promise.all([adapters.readPreArmContext!(campaignId), adapters.readPolicy(), ledger.hasFence(campaignId)]);
     return { context, policy, fenced };
   }
   async function readDetected(campaignId: string, expectedLiveSessionId?: string) {
     if (!adapters.readAutoDetectContext) throw unavailable();
-    const [context, policy, fenced] = await Promise.all([adapters.readAutoDetectContext(campaignId, expectedLiveSessionId), adapters.readPolicy(), ledger.hasFence()]);
+    const [context, policy, fenced] = await Promise.all([adapters.readAutoDetectContext(campaignId, expectedLiveSessionId), adapters.readPolicy(), ledger.hasFence(campaignId)]);
     return { context, policy, fenced };
   }
 

@@ -1,8 +1,11 @@
 import { AppDataSource } from "../db/dataSource";
 import { createExtraCreatorTokenLoader, loadCreatorToken } from "../routes/creatorRead.route";
 import { createCreatorWebBudgetRouter, type ScopedCreatorBudgetServices } from "../routes/creatorWebBudget.route";
-import { createCreatorWebBudgetAdapters, createCreatorWebCapAdapters, queueCreatorAutoCheckFailureAlert, readPpanAutoLineStatus } from "./creatorWebBudget.adapters";
-import { createCreatorWebBudgetService } from "./creatorWebBudget.service";
+import { createCreatorWebBudgetAdapters, createCreatorWebCapAdapters, quarantineBubpaUnknownLease, queueCreatorAutoCheckFailureAlert, readPpanAutoLineStatus } from "./creatorWebBudget.adapters";
+import { createCreatorBudgetRecoveryStore } from "./creatorBudgetRecovery.store";
+import { createCreatorBudgetRecoveryService } from "./creatorBudgetRecovery.service";
+import { createBubpaBudgetRecoveryEvidenceReader } from "./creatorBudgetRecovery.adapters";
+import { createCreatorWebBudgetService, WebBudgetError } from "./creatorWebBudget.service";
 import { createCreatorWebBudgetStore } from "./creatorWebBudget.store";
 import { parseExtraAutomationClients, parseVerifiedAutomationBindings } from "./creatorAutomationRegistry.service";
 import { createCreatorAutoBudgetGrantStore } from "./creatorAutoBudget.policy";
@@ -30,6 +33,8 @@ export function createCreatorWebBudgetRuntime() {
   const sessions = createCreatorContinuousAutoBudgetStore(AppDataSource);
   const diagnostics = createPpanAutoObservabilityStore(AppDataSource);
   const checkHealth = createCreatorAutoCheckHealthStore(AppDataSource);
+  const recoveryStore = createCreatorBudgetRecoveryStore(AppDataSource);
+  let recoveryReady = false;
   const lineConfirmed = new Set<string>();
   let diagnosticsReady = false, checkHealthReady = false;
   const viewerIds = () => process.env.CREATOR_AUTOMATION_VIEWER_USER_IDS;
@@ -112,6 +117,18 @@ export function createCreatorWebBudgetRuntime() {
         discover: async () => (await reader()).campaign?.campaignId ?? null, legacyBusy: () => legacyBusy(clientId) });
       continuousScopes.push({ id: clientId, store: scopedSessions, service: scopedAuto });
       extraScopes[clientId] = { ...runtime, continuousAutoService: scopedAuto,
+        ...(clientId === "bubpa_shop189" ? { recoverUnknown: (async (ownerId, request, recheck) => {
+          if (!recoveryReady || process.env.CREATOR_BUDGET_BUBPA_RECOVERY_ENABLED !== "true") {
+            throw new WebBudgetError("BUDGET_RECOVERY_DISABLED", 503, "การกู้คืนยังไม่พร้อม");
+          }
+          const authorizedAt = new Date().toISOString();
+          const readEvidence = createBubpaBudgetRecoveryEvidenceReader({ binding, loadToken });
+          return createCreatorBudgetRecoveryService({ store: recoveryStore,
+            readEvidence: input => readEvidence(input.oldCampaignId, input.newCampaignId),
+            recheckOperator: async id => id === ownerId && await recheck() && await recheckOwner(id, authorizedAt),
+            releaseOldLease: input => quarantineBubpaUnknownLease(input),
+          }).recover(ownerId, request);
+        }) satisfies NonNullable<ScopedCreatorBudgetServices["bubpa_shop189"]>["recoverUnknown"] } : {}),
         ...(clientId === "nnshop5719" ? { activeLegacy: () => legacyBusy(clientId) } : {}) };
     }
   }
@@ -152,6 +169,9 @@ export function createCreatorWebBudgetRuntime() {
       for (const {id, store} of continuousScopes) {
         if (!ledgerReady.has(id)) continue;
         try { await store.ensureSchema(); continuousReady.add(id); } catch { continuousReady.delete(id); }
+      }
+      if (continuousReady.has("bubpa_shop189") && process.env.CREATOR_BUDGET_BUBPA_RECOVERY_ENABLED === "true") {
+        try { await recoveryStore.ensureSchema(); recoveryReady = true; } catch { recoveryReady = false; }
       }
       if (continuousReady.has("punpan_020")) {
         try { await diagnostics.ensureSchema(); diagnosticsReady = true; } catch { diagnosticsReady = false; }

@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CREATOR_BINDING } from "./creatorRead.service";
-import { createCreatorWebBudgetAdapters, createCreatorWebCapAdapters, queueCreatorAutoCheckFailureAlert } from "./creatorWebBudget.adapters";
+import { createCreatorWebBudgetAdapters, createCreatorWebCapAdapters, quarantineBubpaUnknownLease, queueCreatorAutoCheckFailureAlert } from "./creatorWebBudget.adapters";
 import type { WebAutoBudgetProof, WebBudgetSource } from "./creatorWebBudget.service";
 import { configuredCreatorAutoBudgetMode, configuredCreatorWebBudgetMode, configuredPpanSpendTrendLive, creatorBudgetPolicyPath,
   LIVE_ROOM_SPEND_TREND, type CreatorBudgetScope } from "./creatorBudgetScope";
@@ -51,7 +51,10 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
   campaignInfo?: Record<string, unknown>; campaignList?: Record<string, unknown>; listedStatus?: string; secondaryStatus?: unknown; timezone?: string;
   expectedLeaseBudget?: WebAutoBudgetProof;
   scheduledLive?: boolean; room?: "ONGOING" | "END"; detectRoom?: boolean; roomCost?: string | null;
-  identityLive?: "ongoing" | "ended" | "missing"; now?: () => Date } = {}) {
+  identityLive?: "ongoing" | "ended" | "missing"; now?: () => Date;
+  readbackInfo?: (data: Record<string, unknown>, read: number) => Record<string, unknown>;
+  readbackList?: (data: Record<string, unknown>, read: number) => Record<string, unknown>;
+  providerResponse?: () => Response; sleep?: (ms: number) => Promise<void> } = {}) {
   const calls: { host: string; path: string; method: string }[] = [];
   const queries: { path: string; query: Record<string, string> }[] = [];
   const extra = options.extraClient ? { ...SRIHIW, clientId: options.extraClient,
@@ -63,6 +66,13 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
     { CREATOR_AUTO_BUDGET_LIVE_ENABLED: "true", CREATOR_AUTO_BUDGET_MODE: "live", CREATOR_AUTO_BUDGET_PPAN_CONTINUOUS_LIVE_ENABLED: "true" };
   let budget = 2800, roi = 15, stamp = "2025-03-15 08:55:00", spend = "2100.09", otherSpend = "20.00", secondaryStatus = options.secondaryStatus;
   let detailSecondaryStatus: unknown;
+  let postCount = 0, readbackInfoCount = 0, readbackListCount = 0;
+  const readback = (data: Record<string, unknown>, kind: "info" | "list") => {
+    if (!postCount) return data;
+    if (kind === "info") { readbackInfoCount++; return options.readbackInfo?.(data, readbackInfoCount) ?? data; }
+    readbackListCount++;
+    return options.readbackList?.(data, readbackListCount) ?? data;
+  };
   let daily = options.daily ?? (() => ({ page_info: pageInfo(2), list: [dailyRow(CAMPAIGN), dailyRow(MISSING_CAMPAIGN, 0)] }));
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input));
@@ -92,6 +102,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
     expect(headers.get("access-token")).toBe(TOKEN);
     expect(headers.get("x-creator-web-key")).toBeNull();
     if (method === "POST") {
+      postCount++;
       expect(url.pathname).toBe("/open_api/v1.3/campaign/gmv_max/update/");
       const body = JSON.parse(String(init?.body));
       expect(Object.keys(body).sort()).toEqual(["advertiser_id", "budget", "campaign_id"]);
@@ -103,6 +114,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
       stamp = "2025-03-15 09:00:00";
       if (options.providerResult === "roi-drift") roi++;
       if (options.providerResult === "reject-with-drift") return Response.json({ code: 123 });
+      if (options.providerResponse) return options.providerResponse();
       return Response.json({ code: 0, data: { campaign_id: CAMPAIGN } });
     }
     if (url.pathname.endsWith("/advertiser/info/")) return Response.json({ code: 0, data: { list: [{ advertiser_id: binding.advertiserId,
@@ -116,18 +128,18 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
       return Response.json({ code: 0, data: { live_list: options.identityLive === "missing" ? [] : [{ live_id: ROOM,
         finish_timestamp: options.identityLive === "ended" ? `${TODAY} 09:00:00` : "1970-01-01 00:00:00" }] } });
     }
-    if (url.pathname.endsWith("/gmv_max/campaign/get/")) return Response.json({ code: 0, data: {
+    if (url.pathname.endsWith("/gmv_max/campaign/get/")) return Response.json({ code: 0, data: readback({
       page_info: { page: 1, total_page: 1, total_number: 1 }, list: [{ campaign_id: CAMPAIGN,
         advertiser_id: options.wrongProviderScope ? CREATOR_BINDING.advertiserId : binding.advertiserId, operation_status: options.listedStatus ?? "ENABLE", modify_time: stamp,
         ...(secondaryStatus === undefined ? {} : { secondary_status: secondaryStatus }) }],
-      ...options.campaignList } });
-    if (url.pathname.endsWith("/campaign/gmv_max/info/")) return Response.json({ code: 0, data: {
+      ...options.campaignList }, "list") });
+    if (url.pathname.endsWith("/campaign/gmv_max/info/")) return Response.json({ code: 0, data: readback({
       advertiser_id: binding.advertiserId, campaign_id: CAMPAIGN, campaign_name: "Fixture LIVE", shopping_ads_type: "LIVE",
       store_id: "0", store_authorized_bc_id: "0", operation_status: "ENABLE", budget, roas_bid: roi,
       optimization_goal: "VALUE", deep_bid_type: "VO_MIN_ROAS", schedule_type: "SCHEDULE_FROM_NOW",
       schedule_start_time: "2025-03-15 08:30:00", ...(options.nativeUnknown ? {} : { auto_budget_enabled: options.competing === true }),
       ...(detailSecondaryStatus === undefined ? {} : { secondary_status: detailSecondaryStatus }), promotion_days: { is_enabled: false }, identity_list: [{ identity_id: binding.identityId,
-        identity_type: binding.identityType, identity_authorized_bc_id: binding.identityAuthorizedBcId }], ...options.campaignInfo } });
+        identity_type: binding.identityType, identity_authorized_bc_id: binding.identityAuthorizedBcId }], ...options.campaignInfo }, "info") });
     if (url.pathname.endsWith("/gmv_max/report/get/")) {
       expect(method).toBe("GET");
       expect(headers.get("Cache-Control")).toBe("no-cache");
@@ -151,7 +163,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
     ];
     return Response.json({ code: 0, data: { page_info: pageInfo(list.length), list, ...options.integrated } });
   }) as typeof fetch;
-  const adapters = createCreatorWebBudgetAdapters({ loadToken: async () => TOKEN, fetchImpl, now: options.now ?? (() => new Date(NOW)), sleep: async () => {},
+  const adapters = createCreatorWebBudgetAdapters({ loadToken: async () => TOKEN, fetchImpl, now: options.now ?? (() => new Date(NOW)), sleep: options.sleep ?? (async () => {}),
     extraBinding: extra,
     env: { CREATOR_READ_ENABLED: "true", CREATOR_WEB_BUDGET_MODE: options.mode ?? "live", CREATOR_WEB_BUDGET_LIVE_ENABLED: "true",
       CREATOR_AUTO_BUDGET_PPAN_SPEND_TREND_LIVE_ENABLED: options.spendTrend ? "true" : "false",
@@ -163,6 +175,7 @@ function harness(options: { mode?: string; competing?: boolean; nativeUnknown?: 
   return { adapters, calls, queries, edit(value: number) { budget = value; stamp = "2025-03-15 08:59:30"; }, setSpend(value: string) { spend = value; },
     setRoi(value: number) { roi = value; }, setDetailSecondaryStatus(value: unknown) { detailSecondaryStatus = value; },
     setOtherSpend(value: string) { otherSpend = value; }, setDaily(value: typeof daily) { daily = value; }, setSecondaryStatus(value: unknown) { secondaryStatus = value; },
+    readbackCounts() { return { info: readbackInfoCount, list: readbackListCount }; },
     async input(targetBudgetMinor = 310_000, source?: WebBudgetSource) {
       const ctx = await adapters.readContext(CAMPAIGN, source);
       return { campaignId: CAMPAIGN, reportingDate: TODAY, expectedBudgetMinor: ctx.budgetMinor, targetBudgetMinor,
@@ -697,5 +710,182 @@ describe("Web-only cap policy bridge", () => {
     const unknown = setup([Response.json(current)]);
     await expect(unknown.api.update("punpan_020", 22, 4, 550000, async () => true)).rejects.toMatchObject({ code: "CAP_UPDATE_UNCONFIRMED" });
     expect(unknown.calls.filter(c => c.method === "POST")).toHaveLength(1);
+  });
+});
+
+describe("Bubpa-only bounded readback convergence", () => {
+  const fixture = { extraClient: "bubpa_shop189", extraLive: true } as const;
+
+  it("retries only GETs and accepts two exact target readbacks after a stale first pair", async () => {
+    const pauses: number[] = [];
+    const h = harness({ ...fixture, readbackInfo: (data, read) => read <= 2 ? { ...data, budget: 2800 } : data,
+      sleep: async ms => { pauses.push(ms); } });
+    const sent = await h.adapters.dispatch(await h.input());
+    expect(sent).toMatchObject({ outcome: "APPLIED_VERIFIED", observedBudgetMinor: 310000 });
+    expect(h.providerPosts()).toHaveLength(1);
+    expect(h.readbackCounts()).toEqual({ info: 4, list: 4 });
+    expect(pauses).toContain(1000);
+    expect(h.calls.slice(h.calls.findIndex(c => c.method === "POST") + 1).every(c => c.method === "GET")).toBe(true);
+  });
+
+  it("never exceeds three GET pairs or repeats the POST when the target never converges", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const h = harness({ ...fixture, readbackInfo: data => ({ ...data, budget: 2800 }) });
+      await expect(h.adapters.dispatch(await h.input())).resolves.toEqual({ outcome: "OUTCOME_UNKNOWN", failureCode: "READBACK_BUDGET_NOT_CONVERGED" });
+      expect(h.readbackCounts()).toEqual({ info: 6, list: 6 }); expect(h.providerPosts()).toHaveLength(1);
+      expect(warning).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(warning.mock.calls)).not.toContain(TOKEN);
+      expect(JSON.stringify(warning.mock.calls)).not.toContain(KEY);
+    } finally { warning.mockRestore(); }
+  });
+
+  it("stops before another pair when the 20-second readback window has insufficient time", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      let clock = Date.parse(NOW);
+      const h = harness({ ...fixture, now: () => new Date(clock), readbackInfo: data => {
+        clock += 9000; return { ...data, budget: 2800 };
+      } });
+      await expect(h.adapters.dispatch(await h.input())).resolves.toMatchObject({ outcome: "OUTCOME_UNKNOWN" });
+      expect(h.readbackCounts()).toEqual({ info: 2, list: 2 }); expect(h.providerPosts()).toHaveLength(1);
+      expect(clock - Date.parse(NOW)).toBe(18000);
+    } finally { warning.mockRestore(); }
+  });
+
+  it("does not accept a final matching LIST/body that completes after the 20-second deadline", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      let clock = Date.parse(NOW);
+      const h = harness({ ...fixture, now: () => new Date(clock), readbackList: (data, read) => {
+        if (read === 2) clock += 20001;
+        return data;
+      } });
+      await expect(h.adapters.dispatch(await h.input())).resolves.toEqual({ outcome: "OUTCOME_UNKNOWN", failureCode: "READBACK_UNAVAILABLE" });
+      expect(h.readbackCounts()).toEqual({ info: 2, list: 2 }); expect(h.providerPosts()).toHaveLength(1);
+    } finally { warning.mockRestore(); }
+  });
+
+  it.each(["roas_bid", "campaign_name", "schedule_end_time"])("stops retrying immediately after a complete pair proves %s changed", async field => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const h = harness({ ...fixture, readbackInfo: data => ({ ...data,
+        [field]: field === "roas_bid" ? 14 : field === "campaign_name" ? "unapproved settings edit" : "2035-03-15 09:00:00" }) });
+      await expect(h.adapters.dispatch(await h.input())).resolves.toEqual({ outcome: "OUTCOME_UNKNOWN", failureCode: "READBACK_SETTINGS_CHANGED" });
+      expect(h.readbackCounts()).toEqual({ info: 2, list: 2 }); expect(h.providerPosts()).toHaveLength(1);
+    } finally { warning.mockRestore(); }
+  });
+
+  it("keeps non-Bubpa scopes at one GET pair", async () => {
+    const h = harness({ readbackInfo: data => ({ ...data, budget: 2800 }) });
+    await expect(h.adapters.dispatch(await h.input())).resolves.toEqual({ outcome: "OUTCOME_UNKNOWN" });
+    expect(h.readbackCounts()).toEqual({ info: 2, list: 2 }); expect(h.providerPosts()).toHaveLength(1);
+  });
+
+  it("also converges for verified-room Auto without issuing a second provider POST", async () => {
+    const h = harness({ ...fixture, scheduledLive: true, nativeUnknown: true, room: "ONGOING", detectRoom: true, roomCost: "10.00",
+      readbackInfo: (data, read) => read <= 2 ? { ...data, budget: 2800 } : data });
+    const input = { ...await h.input(336000, "auto"), evidenceMode: LIVE_ROOM_SPEND_TREND, autoDetectLive: true as const, autoRounding: "ceil-baht" as const };
+    await expect(h.adapters.dispatch(input)).resolves.toMatchObject({ outcome: "APPLIED_VERIFIED", observedBudgetMinor: 336000 });
+    expect(h.readbackCounts()).toEqual({ info: 4, list: 4 }); expect(h.providerPosts()).toHaveLength(1);
+  });
+
+  it.each([
+    ["nonzero response", () => Response.json({ code: 123, request_id: "safe-response-id", message: TOKEN }), "PROVIDER_RESPONSE_NOT_SUCCESS"],
+    ["HTTP failure", () => Response.json({ code: 0 }, { status: 503 }), "PROVIDER_RESPONSE_NOT_SUCCESS"],
+    ["malformed body", () => new Response(`not-json:${TOKEN}`), "PROVIDER_RESPONSE_UNVERIFIED"],
+    ["wrong scope", () => Response.json({ code: 0, data: { campaign_id: OTHER_CAMPAIGN } }), "PROVIDER_RESPONSE_SCOPE_MISMATCH"],
+    ["transport failure", () => { throw new Error(TOKEN); }, "PROVIDER_POST_TRANSPORT_UNKNOWN"],
+  ] as const)("records a safe %s without readback retries or POST replay", async (_label, providerResponse, failureCode) => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const h = harness({ ...fixture, providerResponse });
+      const result = await h.adapters.dispatch(await h.input());
+      expect(result).toEqual({ outcome: "OUTCOME_UNKNOWN", failureCode });
+      expect(h.readbackCounts()).toEqual({ info: 0, list: 0 }); expect(h.providerPosts()).toHaveLength(1);
+      expect(JSON.stringify([result, warning.mock.calls])).not.toContain(TOKEN);
+      expect(JSON.stringify(warning.mock.calls)).not.toContain(KEY);
+    } finally { warning.mockRestore(); }
+  });
+
+  it("never logs a token echoed as a provider request ID", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const h = harness({ ...fixture, providerResponse: () => Response.json({ code: 123, request_id: TOKEN, message: TOKEN }) });
+      await h.adapters.dispatch(await h.input());
+      expect(warning).toHaveBeenCalledTimes(1);
+      expect(warning.mock.calls[0][1]).toMatchObject({ failureCode: "PROVIDER_RESPONSE_NOT_SUCCESS", providerCode: 123, providerStatus: 200 });
+      expect(warning.mock.calls[0][1]).not.toHaveProperty("providerRequestId", TOKEN);
+      expect(JSON.stringify(warning.mock.calls)).not.toContain(TOKEN);
+    } finally { warning.mockRestore(); }
+  });
+});
+
+describe("Bubpa recovered policy campaign boundary", () => {
+  const RECOVERY = "bd40b02d-6b7d-4fb7-95f9-5943d79e5272";
+  const binding = { ...SRIHIW, clientId: "bubpa_shop189", identityId: "synthetic-bubpa-recovery-identity" };
+  const recovered = { ...policy, clientId: "bubpa_shop189", configured: true, writeCampaignId: CAMPAIGN, recoveryId: RECOVERY };
+  function setup(raw = recovered, client = "bubpa_shop189") {
+    const calls: { path: string; method: string; body: unknown }[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      expect(url.origin).toBe("https://whale-buddy-ads-control-plane.onrender.com");
+      expect(new Headers(init?.headers).get("x-creator-web-key")).toBe(KEY);
+      expect(new Headers(init?.headers).get("access-token")).toBeNull();
+      calls.push({ path: url.pathname, method: init?.method ?? "GET", body: init?.body ? JSON.parse(String(init.body)) : null });
+      return Response.json(url.pathname.endsWith("/lease") ? { ...raw, locked: true, operationId: OP, expiresAt: LEASE_END } : raw);
+    }) satisfies typeof fetch;
+    return { calls, adapter: createCreatorWebBudgetAdapters({ extraBinding: { ...binding, clientId: client }, loadToken: async () => TOKEN,
+      fetchImpl, now: () => new Date(NOW), env: { CREATOR_WEB_POLICY_BRIDGE_KEY: KEY } }) };
+  }
+
+  it("preserves the recovered campaign restriction and passes only the explicit fourth campaign argument to the lease", async () => {
+    const h = setup();
+    await expect(h.adapter.readPolicy()).resolves.toMatchObject({ writeCampaignId: CAMPAIGN, recoveryId: RECOVERY });
+    await expect(h.adapter.acquireLease(OP, 4, undefined, CAMPAIGN)).resolves.toMatchObject({ writeCampaignId: CAMPAIGN, recoveryId: RECOVERY });
+    expect(h.calls).toEqual([{ path: "/internal/automation/bubpa_shop189/policy", method: "GET", body: null },
+      { path: "/internal/automation/bubpa_shop189/policy/lease", method: "POST", body: { operationId: OP, revision: 4, campaignId: CAMPAIGN } }]);
+  });
+
+  it("rejects missing/mismatched campaign identity on a recovered lease without touching TikTok", async () => {
+    for (const campaignId of [undefined, OTHER_CAMPAIGN]) {
+      const h = setup();
+      await expect(h.adapter.acquireLease(OP, 4, undefined, campaignId)).rejects.toThrow("WEB_BUDGET_ADAPTER_UNVERIFIED");
+      expect(h.calls).toHaveLength(1);
+    }
+    const other = setup({ ...recovered, clientId: "srihiw" }, "srihiw");
+    await expect(other.adapter.acquireLease(OP, 4, undefined, CAMPAIGN)).rejects.toThrow("WEB_BUDGET_ADAPTER_UNVERIFIED");
+    expect(other.calls).toHaveLength(0);
+    await expect(other.adapter.readPolicy()).rejects.toThrow("WEB_BUDGET_ADAPTER_UNVERIFIED");
+  });
+
+  it.each([
+    { ...recovered, recoveryId: undefined }, { ...recovered, writeCampaignId: undefined },
+    { ...recovered, writeCampaignId: "wrong-campaign" }, { ...recovered, recoveryId: "wrong-recovery" },
+  ])("rejects incomplete or invalid recovered policy metadata %#", async raw => {
+    await expect(setup(raw as typeof recovered).adapter.readPolicy()).rejects.toThrow("WEB_BUDGET_ADAPTER_UNVERIFIED");
+  });
+
+  it("sends one explicit mocked quarantine request and requires an exact historical-UNKNOWN receipt", async () => {
+    const input = { recoveryId: RECOVERY, operatorUserId: 22, oldOperationId: OP, oldCampaignId: OTHER_CAMPAIGN,
+      newCampaignId: CAMPAIGN, revision: 4, acknowledgedUnknown: true as const };
+    const receipt = { schemaVersion: 1, clientId: "bubpa_shop189", ...input, status: "QUARANTINED", historicalOutcome: "OUTCOME_UNKNOWN", locked: false };
+    const calls: unknown[] = [];
+    const fetchImpl = (async (inputUrl: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(inputUrl));
+      expect(url.href).toBe("https://whale-buddy-ads-control-plane.onrender.com/internal/automation/bubpa_shop189/policy/recover-unknown");
+      expect(init?.method).toBe("POST"); expect(new Headers(init?.headers).get("access-token")).toBeNull();
+      expect(new Headers(init?.headers).get("x-creator-web-key")).toBe(KEY);
+      calls.push(JSON.parse(String(init?.body))); return Response.json(receipt);
+    }) satisfies typeof fetch;
+    const env = { CREATOR_WEB_POLICY_BRIDGE_KEY: KEY, CREATOR_BUDGET_BUBPA_RECOVERY_ENABLED: "true" };
+    await expect(quarantineBubpaUnknownLease(input, fetchImpl, env)).resolves.toMatchObject({ status: "QUARANTINED", historicalOutcome: "OUTCOME_UNKNOWN" });
+    expect(calls).toEqual([input]);
+    await expect(quarantineBubpaUnknownLease(input, fetchImpl, { ...env, CREATOR_BUDGET_BUBPA_RECOVERY_ENABLED: "false" })).rejects.toThrow();
+    expect(calls).toHaveLength(1);
+    for (const patch of [{ oldCampaignId: CAMPAIGN }, { historicalOutcome: "APPLIED_VERIFIED" }, { newCampaignId: OTHER_CAMPAIGN }]) {
+      const bad = (async () => Response.json({ ...receipt, ...patch })) satisfies typeof fetch;
+      await expect(quarantineBubpaUnknownLease(input, bad, env)).rejects.toThrow("WEB_BUDGET_ADAPTER_UNVERIFIED");
+    }
   });
 });

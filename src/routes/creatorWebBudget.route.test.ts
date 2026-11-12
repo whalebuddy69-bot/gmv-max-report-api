@@ -8,8 +8,9 @@ vi.mock("../services/auth.service", async importOriginal => ({
   ...await importOriginal<typeof import("../services/auth.service")>(), ...auth,
 }));
 import { AuthError } from "../services/auth.service";
-import { createCreatorWebBudgetService } from "../services/creatorWebBudget.service";
+import { createCreatorWebBudgetService, WebBudgetError } from "../services/creatorWebBudget.service";
 import type { CreatorBudgetScope } from "../services/creatorBudgetScope";
+import type { CreatorBudgetRecoveryRecord, CreatorBudgetRecoveryRequest } from "../services/creatorBudgetRecovery.store";
 import { CREATOR_WEB_BUDGET_ORIGIN, createCreatorWebBudgetRouter } from "./creatorWebBudget.route";
 
 const PRIVATE_ERROR = "test-secret-that-must-not-leak";
@@ -33,7 +34,7 @@ afterEach(async () => {
 });
 
 async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigured = true, withContinuous = false, withSrihiwContinuous = false,
-  withVerifiedContinuous = false } = {}) {
+  withVerifiedContinuous = false, withBubpaRecovery = false } = {}) {
   const service: ReturnType<typeof createCreatorWebBudgetService> = {
     status: vi.fn(async operator => ({ clientId: "punpan_020", mode: operator ? "dry-run" : "disabled", cap: null, canPrepare: false, capEditAllowed: false })),
     prepare: vi.fn(async (_id, value) => ({ operationId: ID, mode: "dry-run", campaignId: value.expectedCampaignId,
@@ -96,6 +97,13 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
     status: vi.fn(async (...args: Parameters<typeof continuous.status>) => ({ ...await continuous.status(...args), clientId })) });
   const shopRoom = roomScope("ashopbytheta"), myuRoom = roomScope("myushop4"), bubpaRoom = roomScope("bubpa_shop189"), koolRoom = roomScope("koolkool888");
   const boomService = mockScoped("boomkan").service, boomRoom = roomScope("boomkan");
+  const bubpaService = mockScoped("bubpa_shop189").service;
+  const recoverUnknown = vi.fn(async (ownerId: number, input: CreatorBudgetRecoveryRequest, recheck: () => Promise<boolean>) => {
+    if (!await recheck()) throw new WebBudgetError("BUDGET_OPERATOR_DENIED", 403, "สิทธิ์เปลี่ยนก่อนกู้คืน");
+    return { ...input, clientId: "bubpa_shop189", operatorUserId: ownerId, revision: 1, oldSessionId: ID,
+      status: "QUARANTINED", historicalOutcome: "OUTCOME_UNKNOWN", initialEvidence: { privateDetail: PRIVATE_ERROR },
+      finalEvidence: null, receipt: null, stagedAt: "2026-06-09T04:00:00.000Z", quarantinedAt: "2026-06-09T04:01:00.000Z" } as unknown as CreatorBudgetRecoveryRecord;
+  });
   app.use("/automation/budget", createCreatorWebBudgetRouter({ viewerIds: () => viewerIds, operatorIds: () => operatorIds, service,
     autoService, capEditor, extraConfigured: () => extraCapConfigured,
     continuousAutoService: withContinuous ? continuous : undefined,
@@ -103,16 +111,18 @@ async function start({ viewerIds = "27,42", operatorIds = "27", extraCapConfigur
     extraScopes: { srihiw: { service: srihiwService, continuousAutoService: withSrihiwContinuous ? sriAuto : undefined }, nnshop5719: nn,
       ashopbytheta: { ...ashop, continuousAutoService: withVerifiedContinuous ? shopRoom : undefined },
       ...(withVerifiedContinuous ? { myushop4: { service: mockScoped("myushop4").service, continuousAutoService: myuRoom },
-        bubpa_shop189: { service: mockScoped("bubpa_shop189").service, continuousAutoService: bubpaRoom },
         koolkool888: { service: mockScoped("koolkool888").service, continuousAutoService: koolRoom },
-        boomkan: { service: boomService, continuousAutoService: boomRoom } } : {}) } }));
+        boomkan: { service: boomService, continuousAutoService: boomRoom } } : {}),
+      ...(withVerifiedContinuous || withBubpaRecovery ? { bubpa_shop189: { service: bubpaService,
+        continuousAutoService: withVerifiedContinuous ? bubpaRoom : undefined, recoverUnknown: withBubpaRecovery ? recoverUnknown : undefined } } : {}) } }));
   // Prove this route does not run the general application parser first.
   app.use(express.json());
   server = await new Promise<Server>(resolve => { const instance = app.listen(0, "127.0.0.1", () => resolve(instance)); });
   const { port } = server.address() as { port: number };
   const base = `http://127.0.0.1:${port}/automation/budget`;
   const post = (route: string, body = JSON.stringify(PREPARE), headers = HEADERS) => fetch(base + route, { method: "POST", headers, body });
-  return { service, srihiwService, autoService, base, post, capEditor, nn, ashop, continuous, sriAuto, diagnostics, shopRoom, myuRoom, bubpaRoom, koolRoom, boomService, boomRoom };
+  return { service, srihiwService, autoService, base, post, capEditor, nn, ashop, continuous, sriAuto, diagnostics, shopRoom, myuRoom, bubpaRoom, koolRoom, boomService, boomRoom,
+    bubpaService, recoverUnknown, setOperatorIds: (value: string) => { operatorIds = value; } };
 }
 
 describe("Automation web budget HTTP boundary", () => {
@@ -437,5 +447,110 @@ describe("Automation web budget HTTP boundary", () => {
     for (let i = 0; i < 11; i++) expect((await h.post("/prepare")).status).toBe(200);
     const limited = await h.post("/prepare"); expect(limited.status).toBe(429);
     expect(h.service.prepare).toHaveBeenCalledTimes(12);
+  });
+});
+
+describe("Audited Bubpa historical UNKNOWN recovery boundary", () => {
+  const PATH = "/bubpa_shop189/recover-unknown";
+  const INPUT: CreatorBudgetRecoveryRequest = {
+    recoveryId: ID, oldOperationId: "a47ac10b-58cc-4372-a567-0e02b2c3d479",
+    oldCampaignId: "1881580307345762", newCampaignId: "1881670184981538", acknowledgedUnknown: true,
+  };
+
+  it("passes only the authenticated owner and exact acknowledgement to the configured Bubpa recovery service", async () => {
+    const h = await start({ withBubpaRecovery: true, withVerifiedContinuous: true, withContinuous: true });
+    const response = await h.post(PATH, JSON.stringify(INPUT));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toEqual({ recoveryId: ID, clientId: "bubpa_shop189", oldCampaignId: INPUT.oldCampaignId,
+      newCampaignId: INPUT.newCampaignId, status: "QUARANTINED", historicalOutcome: "OUTCOME_UNKNOWN" });
+    expect(h.recoverUnknown).toHaveBeenCalledTimes(1);
+    expect(h.recoverUnknown).toHaveBeenCalledWith(27, INPUT, expect.any(Function));
+    expect(auth.loadSessionUser).toHaveBeenCalledTimes(3);
+    for (const writer of [h.service, h.srihiwService, h.bubpaService]) {
+      expect(writer.prepare).not.toHaveBeenCalled(); expect(writer.confirm).not.toHaveBeenCalled();
+    }
+    for (const auto of [h.autoService, h.continuous, h.bubpaRoom]) {
+      expect(auto.arm).not.toHaveBeenCalled(); expect(auto.stop).not.toHaveBeenCalled();
+    }
+    expect(h.capEditor.update).not.toHaveBeenCalled();
+  });
+
+  it("does not accept an admin role, internal key, missing session, or foreign Origin instead of operator authority", async () => {
+    const h = await start({ withBubpaRecovery: true });
+    for (const headers of [{ ...HEADERS, Authorization: "" }, { ...HEADERS, Authorization: "", "X-Api-Key": "operator" }]) {
+      expect((await h.post(PATH, JSON.stringify(INPUT), headers)).status).toBe(401);
+    }
+    expect((await h.post(PATH, JSON.stringify(INPUT), { ...HEADERS, Authorization: "Bearer report-admin" })).status).toBe(403);
+    expect((await h.post(PATH, JSON.stringify(INPUT), { ...HEADERS, Origin: "https://report.whalebuddy69.com.attacker.test" })).status).toBe(403);
+    expect((await h.post(PATH, JSON.stringify(INPUT), { ...HEADERS, Origin: "" })).status).toBe(403);
+    expect(h.recoverUnknown).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { ownerId: 42 }, { operatorUserId: 42 }, { revision: 1 }, { advertiserId: "7632368323640115207" },
+    { acknowledgedUnknown: false }, { acknowledgedUnknown: "true" }, { newCampaignId: INPUT.oldCampaignId },
+    { newCampaignId: Number(INPUT.newCampaignId) }, { recoveryId: "not-a-uuid" },
+  ])("rejects caller authority or malformed recovery proof %j", async changed => {
+    const h = await start({ withBubpaRecovery: true });
+    expect((await h.post(PATH, JSON.stringify({ ...INPUT, ...changed }))).status).toBe(400);
+    expect(h.recoverUnknown).not.toHaveBeenCalled();
+  });
+
+  it("keeps recovery off when unconfigured and never routes another scope, spelling or query to Bubpa", async () => {
+    const h = await start({ withBubpaRecovery: true, extraCapConfigured: false });
+    expect((await h.post(PATH, JSON.stringify(INPUT))).status).toBe(404);
+    expect(h.recoverUnknown).not.toHaveBeenCalled();
+    for (const path of ["/ppan/recover-unknown", "/srihiw/recover-unknown", "/myushop4/recover-unknown", "/BUBPA_SHOP189/recover-unknown",
+      "/%62ubpa_shop189/recover-unknown"]) expect((await h.post(path, JSON.stringify(INPUT))).status).toBe(404);
+    expect((await h.post(`${PATH}?campaignId=other`, JSON.stringify(INPUT))).status).toBe(400);
+    expect((await fetch(h.base + PATH, { headers: HEADERS })).status).toBe(404);
+    expect(h.recoverUnknown).not.toHaveBeenCalled();
+  });
+
+  it("returns disabled when the Creator exists but no recovery service was explicitly provided", async () => {
+    const h = await start({ withVerifiedContinuous: true });
+    const response = await h.post(PATH, JSON.stringify(INPUT));
+    expect(response.status).toBe(404);
+    expect(await response.json()).toMatchObject({ error: { code: "BUDGET_RECOVERY_DISABLED" } });
+    expect(h.recoverUnknown).not.toHaveBeenCalled();
+  });
+
+  it("rechecks the current session before any recovery service work", async () => {
+    const h = await start({ withBubpaRecovery: true });
+    auth.loadSessionUser.mockResolvedValueOnce({ role: "viewer" }).mockRejectedValueOnce(new AuthError(PRIVATE_ERROR));
+    const response = await h.post(PATH, JSON.stringify(INPUT));
+    expect(response.status).toBe(403);
+    expect(await response.text()).not.toContain(PRIVATE_ERROR);
+    expect(h.recoverUnknown).not.toHaveBeenCalled();
+  });
+
+  it("supplies a live recheck that detects later session or operator revocation", async () => {
+    const h = await start({ withBubpaRecovery: true });
+    auth.loadSessionUser.mockResolvedValueOnce({ role: "viewer" }).mockResolvedValueOnce({ role: "viewer" })
+      .mockRejectedValueOnce(new AuthError(PRIVATE_ERROR));
+    const response = await h.post(PATH, JSON.stringify(INPUT));
+    expect(response.status).toBe(403);
+    expect(h.recoverUnknown).toHaveBeenCalledTimes(1);
+    expect(await response.text()).not.toContain(PRIVATE_ERROR);
+    h.recoverUnknown.mockImplementationOnce(async (_owner, _input, recheck) => {
+      h.setOperatorIds("");
+      expect(await recheck()).toBe(false);
+      throw new WebBudgetError("BUDGET_OPERATOR_DENIED", 403, "สิทธิ์เปลี่ยนก่อนกู้คืน");
+    });
+    expect((await h.post(PATH, JSON.stringify(INPUT))).status).toBe(403);
+    expect(h.recoverUnknown).toHaveBeenCalledTimes(2);
+  });
+
+  it("bounds JSON input and sanitizes private recovery failures", async () => {
+    const h = await start({ withBubpaRecovery: true });
+    expect((await h.post(PATH, "{}", { ...HEADERS, "Content-Type": "text/plain" })).status).toBe(415);
+    expect((await h.post(PATH, "{malformed")).status).toBe(400);
+    expect((await h.post(PATH, JSON.stringify({ ...INPUT, extra: "x".repeat(3000) }))).status).toBe(413);
+    expect(h.recoverUnknown).not.toHaveBeenCalled();
+    h.recoverUnknown.mockRejectedValueOnce(new Error(PRIVATE_ERROR));
+    const response = await h.post(PATH, JSON.stringify(INPUT));
+    expect(response.status).toBe(503);
+    expect(await response.text()).not.toContain(PRIVATE_ERROR);
   });
 });
