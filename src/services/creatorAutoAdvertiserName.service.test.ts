@@ -10,6 +10,7 @@ const accounts = [
   ["bubpa_shop189", "7632368323640115207", "บริษัท บุบผา ช๊อป 189 จำกัด (Live GMV Max)", "bubpa_shop189"],
   ["koolkool888", "7469805960727379976", "บริษัท จุฑากูล จำกัด0210", "koolkool888"],
   ["boomkan", "7579621103212150801", "บริษัท เทย กะ ทะ เอ็นเตอร์เทนเมนท์ จำกัด", "boomkan"],
+  ["luckyandrich59", "7554249030289866769", "มาดูกันต์", "luckyandrich59"],
 ] as const;
 
 describe("Creator Auto alert identity", () => {

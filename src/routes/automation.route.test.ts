@@ -84,6 +84,28 @@ function extraAdapter(snapshot: unknown = { ...observed, clientId: EXTRA.clientI
 }
 
 describe("private Creator Automation read routes", () => {
+  it("promotes an already monitored advertiser to one managed row without changing its old enrollment", async () => {
+    const clientId = `mon_${EXTRA.advertiserId}`;
+    const adapter = extraAdapter();
+    const monitor = { available: () => true, enroll: vi.fn(), entries: vi.fn(async () => [{
+      creator: { ...EXTRA, clientId, tiktokAccountId: null, monitoringOnly: true as const },
+      adapter: { ...adapter, clientId, binding: { ...EXTRA_BINDING, tiktokAccountId: null } },
+      accessReason: "upstream-unavailable" as const,
+    }]) };
+    const h = await start({ viewerIds: "42", discoveryOperatorIds: "42", monitor,
+      extraConfig: JSON.stringify([EXTRA]), verifiedExtras: [adapter] });
+    const response = await fetch(`${h.url}/overview`, { headers: { Authorization: "Bearer fixture-admin" } });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.clients).toHaveLength(2);
+    const matching = body.clients.filter((row: { advertiserId: string }) => row.advertiserId === EXTRA.advertiserId);
+    expect(matching).toHaveLength(1);
+    expect(matching[0]).toMatchObject({ clientId: EXTRA.clientId, tiktokAccountId: EXTRA.tiktokAccountId });
+    expect(matching[0].monitoringOnly).not.toBe(true);
+    expect(monitor.enroll).not.toHaveBeenCalled();
+    expect(monitor.entries).toHaveBeenCalledWith(42);
+  });
+
   it("lets only the originating admin operator confirm an exact discovered Creator, and grants no ad actions", async () => {
     const admin = { Authorization: "Bearer fixture-admin", Origin: "https://report.whalebuddy69.com", "Content-Type": "application/json" };
     const row = { advertiserId: EXTRA.advertiserId, campaignId: EXTRA_CAMPAIGN, kind: "creator", tiktokUsername: "demo.live" };

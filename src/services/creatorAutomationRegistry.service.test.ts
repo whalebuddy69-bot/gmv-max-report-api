@@ -13,6 +13,27 @@ const ADAPTER: AutomationCreatorReadAdapter = { clientId: EXTRA.clientId, bindin
 const ppan = { readSnapshot: vi.fn(async () => null), readPerformance: vi.fn(async () => null) };
 
 describe("server-only Creator Automation registry", () => {
+  it("keeps all nine managed rows when the eighth independent extra is enrolled", () => {
+    const creators = Array.from({ length: 8 }, (_, index) => ({
+      clientId: `creator-${index}`, displayName: `Creator ${index}`,
+      advertiserId: String(8_000_000_000_000_000_100n + BigInt(index)),
+      tiktokAccountId: String(7_000_000_000_000_000_100n + BigInt(index)),
+    }));
+    const bindings = creators.map(creator => ({ clientId: creator.clientId,
+      advertiserId: creator.advertiserId, tiktokAccountId: creator.tiktokAccountId,
+      identityId: `fixture-identity-${creator.clientId}`, identityType: "BC_AUTH_TT" as const,
+      identityAuthorizedBcId: BINDING.identityAuthorizedBcId }));
+    expect(parseExtraAutomationClients(JSON.stringify(creators))).toEqual(creators);
+    expect(parseVerifiedAutomationBindings(JSON.stringify(bindings), creators)).toEqual(bindings);
+    const registry = createAutomationReadRegistry({ extraConfig: JSON.stringify(creators), ppan,
+      verifiedExtras: creators.map((creator, index) => ({ ...ADAPTER, clientId: creator.clientId, binding: bindings[index] })) });
+    expect(registry).toHaveLength(9);
+    expect(registry.every(entry => entry.adapter !== null)).toBe(true);
+    expect(registry[0].creator).toEqual(PPAN_AUTOMATION_CREATOR);
+    expect(registry.slice(1).map(entry => entry.creator)).toEqual(creators);
+    expect(parseExtraAutomationClients(JSON.stringify([...creators, OTHER]))).toEqual([]);
+  });
+
   it("accepts strict bounded metadata without interpreting IDs as Javascript numbers", () => {
     expect(parseExtraAutomationClients(JSON.stringify([EXTRA, OTHER]))).toEqual([EXTRA, OTHER]);
     expect(validAutomationClientId(EXTRA.clientId)).toBe(true);

@@ -10,9 +10,11 @@ const sessionTables = {
   nnshop5719: "creator_nn_cauto_auto_budget_sessions", ashopbytheta: "creator_ashop_cauto_auto_budget_sessions",
   myushop4: "creator_myu_cauto_auto_budget_sessions", bubpa_shop189: "creator_bubpa_cauto_auto_budget_sessions",
   koolkool888: "creator_kool_cauto_auto_budget_sessions", boomkan: "creator_boom_cauto_auto_budget_sessions",
+  luckyandrich59: "creator_lucky_cauto_auto_budget_sessions",
 } as const;
 const oldScopes = [P, S, "nnshop5719", "ashopbytheta", "myushop4", "bubpa_shop189", "koolkool888"] as const;
-const allScopes = [...oldScopes, "boomkan"] as const;
+const previousScopes = [...oldScopes, "boomkan"] as const;
+const allScopes = [...previousScopes, "luckyandrich59"] as const;
 // The exact published seven-scope schema, with the original generated CHECK
 // names. Do not derive it from the new schema under test.
 const LEGACY_SCHEMA = `
@@ -32,11 +34,29 @@ CREATE TABLE creator_auto_check_incidents (
 CREATE INDEX creator_auto_check_incidents_pending ON creator_auto_check_incidents
   (client_id,session_id,detected_at,incident_id) WHERE accepted_at IS NULL;
 `;
+// Literal published v2 eight-scope schema, independent of the v3 implementation.
+const PREVIOUS_SCHEMA = `
+CREATE TABLE creator_auto_check_health (
+  client_id text PRIMARY KEY CONSTRAINT creator_auto_check_health_scope_v2 CHECK (client_id IN ('punpan_020','srihiw','nnshop5719','ashopbytheta','myushop4','bubpa_shop189','koolkool888','boomkan')),
+  session_id uuid NOT NULL, checked_at timestamptz NOT NULL,
+  consecutive integer NOT NULL CHECK (consecutive BETWEEN 0 AND 10), failed_since timestamptz,
+  CHECK ((consecutive=0)=(failed_since IS NULL)), CHECK (failed_since IS NULL OR failed_since<=checked_at)
+);
+CREATE TABLE creator_auto_check_incidents (
+  incident_id uuid PRIMARY KEY,
+  client_id text NOT NULL CONSTRAINT creator_auto_check_incidents_scope_v2 CHECK (client_id IN ('punpan_020','srihiw','nnshop5719','ashopbytheta','myushop4','bubpa_shop189','koolkool888','boomkan')),
+  session_id uuid NOT NULL, failed_since timestamptz NOT NULL, detected_at timestamptz NOT NULL, accepted_at timestamptz,
+  UNIQUE (client_id,session_id,failed_since), CHECK (detected_at>=failed_since),
+  CHECK (accepted_at IS NULL OR accepted_at>=detected_at)
+);
+CREATE INDEX creator_auto_check_incidents_pending ON creator_auto_check_incidents
+  (client_id,session_id,detected_at,incident_id) WHERE accepted_at IS NULL;
+`;
 const MS = 60_000;
 const dbs: PGlite[] = [];
 afterEach(async () => { for (const db of dbs.splice(0)) await db.close(); });
 
-async function fixture({ legacy = false }: { legacy?: boolean } = {}) {
+async function fixture({ legacy = false, published }: { legacy?: boolean; published?: 7 | 8 } = {}) {
   const db = new PGlite(); dbs.push(db);
   const statements: string[] = [];
   const database = { createQueryRunner: () => ({ connect: async () => undefined, release: async () => undefined,
@@ -51,7 +71,8 @@ async function fixture({ legacy = false }: { legacy?: boolean } = {}) {
     authorized_at timestamptz NOT NULL,status text NOT NULL,keep_auto_across_rooms boolean NOT NULL)`);
   const start = Date.now() - 40 * MS, iso = (n: number) => new Date(n).toISOString();
   const store = createCreatorAutoCheckHealthStore(database);
-  if (legacy) await db.exec(LEGACY_SCHEMA);
+  if (legacy || published === 7) await db.exec(LEGACY_SCHEMA);
+  else if (published === 8) await db.exec(PREVIOUS_SCHEMA);
   else await store.ensureSchema();
   const activate = async (scope: keyof typeof sessionTables = P, { persistent = true, status = "ACTIVE", authorizedAt = start - MS }: {
     persistent?: boolean; status?: string; authorizedAt?: number;
@@ -81,7 +102,7 @@ async function fixture({ legacy = false }: { legacy?: boolean } = {}) {
 }
 
 describe("durable Creator Auto check failures", () => {
-  it("creates all eight exact scopes and retains distinct stable alert identities", async () => {
+  it("creates all nine exact scopes and retains distinct stable alert identities", async () => {
     const f = await fixture();
     await f.store.ensureSchema();
     const byScope = new Map<ContinuousCreatorBudgetScope, NonNullable<Awaited<ReturnType<typeof f.store.pending>>>>();
@@ -97,16 +118,17 @@ describe("durable Creator Auto check failures", () => {
       }
       byScope.set(scope, pending);
     }
-    expect(new Set([...byScope.values()].map(({ incidentId }) => incidentId)).size).toBe(8);
-    expect(await f.incidents()).toHaveLength(8);
+    expect(new Set([...byScope.values()].map(({ incidentId }) => incidentId)).size).toBe(9);
+    expect(await f.incidents()).toHaveLength(9);
     for (const [scope, pending] of byScope) expect(await f.store.markDelivered(scope, pending)).toBe(true);
     expect((await f.incidents()).every(row => row.accepted_at !== null)).toBe(true);
   }, 30_000);
 
-  it("widens the literal seven-scope schema in place without changing streaks or accepted and pending retry identities", async () => {
-    const f = await fixture({ legacy: true });
+  it.each([7, 8] as const)("widens published %i-scope schema in place without changing streaks or accepted and pending retry identities", async published => {
+    const f = await fixture({ published });
+    const priorScopes = published === 7 ? oldScopes : previousScopes;
     const pending = new Map<ContinuousCreatorBudgetScope, NonNullable<Awaited<ReturnType<typeof f.store.pending>>>>();
-    for (const [index, scope] of oldScopes.entries()) {
+    for (const [index, scope] of priorScopes.entries()) {
       const id = await f.activate(scope);
       await f.series(id, f.start, scope === P ? 9 : 10, scope);
       const alert = await f.store.pending(scope);
@@ -116,8 +138,8 @@ describe("durable Creator Auto check failures", () => {
       }
     }
     const before = await f.snapshot(), oldChecks = await f.checks();
-    expect(before.health).toHaveLength(7);
-    expect(before.incidents).toHaveLength(6);
+    expect(before.health).toHaveLength(published);
+    expect(before.incidents).toHaveLength(published - 1);
     expect(before.incidents.some(row => row.accepted_at !== null)).toBe(true);
     expect(before.incidents.some(row => row.accepted_at === null)).toBe(true);
     const indexBefore = (await f.db.query("SELECT oid FROM pg_class WHERE relname='creator_auto_check_incidents_pending'")).rows;
@@ -127,9 +149,10 @@ describe("durable Creator Auto check failures", () => {
     expect(await f.snapshot()).toEqual(before);
     expect(await f.checks()).toEqual(upgradedChecks);
     expect((await f.db.query("SELECT oid FROM pg_class WHERE relname='creator_auto_check_incidents_pending'")).rows).toEqual(indexBefore);
-    expect(upgradedChecks.filter(row => String(row.conname).endsWith("_scope_v2"))).toHaveLength(2);
-    expect(upgradedChecks.filter(row => !String(row.conname).endsWith("_scope_v2")))
-      .toEqual(oldChecks.filter(row => row.conname !== "creator_auto_check_health_client_id_check" && row.conname !== "creator_auto_check_incidents_client_id_check"));
+    expect(upgradedChecks.filter(row => String(row.conname).endsWith("_scope_v3"))).toHaveLength(2);
+    expect(upgradedChecks.filter(row => !String(row.conname).endsWith("_scope_v3")))
+      .toEqual(oldChecks.filter(row => !["creator_auto_check_health_client_id_check", "creator_auto_check_incidents_client_id_check",
+        "creator_auto_check_health_scope_v2", "creator_auto_check_incidents_scope_v2"].includes(String(row.conname))));
     for (const [scope, alert] of pending) {
       const accepted = before.incidents.find(row => row.incident_id === alert.incidentId)?.accepted_at;
       expect(await f.store.pending(scope)).toEqual(accepted ? null : alert);
@@ -141,16 +164,18 @@ describe("durable Creator Auto check failures", () => {
     await f.store.record(P, f.event(oldSession, f.start + 9 * MS));
     expect(await f.state(P)).toBe(10);
     expect(await f.store.pending(P)).toMatchObject({ sessionId: oldSession, failedSince: f.iso(f.start) });
-    const boomkan = await f.activate("boomkan");
-    await f.series(boomkan, f.start, 10, "boomkan");
-    expect(await f.store.pending("boomkan")).toMatchObject({ sessionId: boomkan });
+    for (const scope of allScopes.filter(scope => !(priorScopes as readonly string[]).includes(scope))) {
+      const next = await f.activate(scope);
+      await f.series(next, f.start, 10, scope);
+      expect(await f.store.pending(scope)).toMatchObject({ sessionId: next });
+    }
   }, 30_000);
 
-  it("rolls back both tables when the second legacy scope guard is unexpected", async () => {
-    const f = await fixture({ legacy: true }), s = await f.activate();
+  it.each([7, 8] as const)("rolls back both tables when the second published %i-scope guard is unexpected", async published => {
+    const f = await fixture({ published }), s = await f.activate();
     await f.series(s);
     const pending = (await f.store.pending(P))!;
-    await f.db.exec(`ALTER TABLE creator_auto_check_incidents DROP CONSTRAINT creator_auto_check_incidents_client_id_check;
+    await f.db.exec(`ALTER TABLE creator_auto_check_incidents DROP CONSTRAINT ${published === 7 ? "creator_auto_check_incidents_client_id_check" : "creator_auto_check_incidents_scope_v2"};
       ALTER TABLE creator_auto_check_incidents ADD CONSTRAINT unfamiliar_scope CHECK (client_id IN ('punpan_020','srihiw'));`);
     const before = await f.snapshot(), checksBefore = await f.checks();
     await expect(f.store.ensureSchema()).rejects.toThrow("CREATOR_AUTO_CHECK_HEALTH_UNAVAILABLE");
@@ -158,14 +183,14 @@ describe("durable Creator Auto check failures", () => {
     expect(await f.snapshot()).toEqual(before);
     expect(await f.checks()).toEqual(checksBefore);
     expect(await f.store.pending(P)).toEqual(pending);
-    const boomkan = await f.activate("boomkan");
-    await expect(f.store.record("boomkan", f.event(boomkan, f.start))).rejects.toThrow("CREATOR_AUTO_CHECK_HEALTH_UNAVAILABLE");
-    expect(await f.state("boomkan")).toBeUndefined();
+    const nextScope = published === 7 ? "boomkan" : "luckyandrich59", next = await f.activate(nextScope);
+    await expect(f.store.record(nextScope, f.event(next, f.start))).rejects.toThrow("CREATOR_AUTO_CHECK_HEALTH_UNAVAILABLE");
+    expect(await f.state(nextScope)).toBeUndefined();
   });
 
   it("does not accept a correct current guard that masks an additional client-ID restriction", async () => {
     const f = await fixture();
-    await f.db.exec("ALTER TABLE creator_auto_check_health ADD CONSTRAINT unexpected_exclusion CHECK (client_id <> 'boomkan') NOT VALID");
+    await f.db.exec("ALTER TABLE creator_auto_check_health ADD CONSTRAINT unexpected_exclusion CHECK (client_id <> 'luckyandrich59') NOT VALID");
     const before = await f.checks();
     await expect(f.store.ensureSchema()).rejects.toThrow("CREATOR_AUTO_CHECK_HEALTH_UNAVAILABLE");
     expect(await f.checks()).toEqual(before);
@@ -173,11 +198,47 @@ describe("durable Creator Auto check failures", () => {
 
   it("rejects tampered versioned guards and preserves the original transaction state", async () => {
     const f = await fixture();
-    await f.db.exec(`ALTER TABLE creator_auto_check_incidents DROP CONSTRAINT creator_auto_check_incidents_scope_v2;
-      ALTER TABLE creator_auto_check_incidents ADD CONSTRAINT creator_auto_check_incidents_scope_v2 CHECK (client_id <> 'other');`);
+    await f.db.exec(`ALTER TABLE creator_auto_check_incidents DROP CONSTRAINT creator_auto_check_incidents_scope_v3;
+      ALTER TABLE creator_auto_check_incidents ADD CONSTRAINT creator_auto_check_incidents_scope_v3 CHECK (client_id <> 'other');`);
     const before = await f.checks();
     await expect(f.store.ensureSchema()).rejects.toThrow("CREATOR_AUTO_CHECK_HEALTH_UNAVAILABLE");
     expect(await f.checks()).toEqual(before);
+  });
+
+  it("rejects a hidden cross-column v2 restriction and rolls back the first v3 table upgrade", async () => {
+    const f = await fixture({ published: 8 }), s = await f.activate("boomkan");
+    await f.series(s, f.start, 10, "boomkan");
+    const pending = await f.store.pending("boomkan");
+    await f.db.exec(`ALTER TABLE creator_auto_check_incidents ADD CONSTRAINT hidden_scope_restriction
+      CHECK (client_id <> 'luckyandrich59' OR accepted_at IS NULL) NOT VALID`);
+    const data = await f.snapshot(), checks = await f.checks();
+    await expect(f.store.ensureSchema()).rejects.toThrow("CREATOR_AUTO_CHECK_HEALTH_UNAVAILABLE");
+    expect(await f.snapshot()).toEqual(data); expect(await f.checks()).toEqual(checks);
+    expect(await f.store.pending("boomkan")).toEqual(pending);
+    expect(f.statements.at(-1)).toBe("COMMIT"); // read-only pending did not mutate or recreate the incident
+  });
+
+  it.each(["renamed", "unvalidated", "wrong-version-expression"] as const)("rejects a published v2 guard that is %s", async scenario => {
+    const f = await fixture({ published: 8 });
+    if (scenario === "renamed") await f.db.exec(`ALTER TABLE creator_auto_check_health
+      RENAME CONSTRAINT creator_auto_check_health_scope_v2 TO unfamiliar_scope`);
+    else {
+      const scopes = scenario === "wrong-version-expression" ? allScopes : previousScopes;
+      await f.db.exec(`ALTER TABLE creator_auto_check_health DROP CONSTRAINT creator_auto_check_health_scope_v2;
+        ALTER TABLE creator_auto_check_health ADD CONSTRAINT creator_auto_check_health_scope_v2
+          CHECK(client_id IN (${scopes.map(scope => `'${scope}'`).join(",")})) ${scenario === "unvalidated" ? "NOT VALID" : ""}`);
+    }
+    const checks = await f.checks();
+    await expect(f.store.ensureSchema()).rejects.toThrow("CREATOR_AUTO_CHECK_HEALTH_UNAVAILABLE");
+    expect(f.statements.at(-1)).toBe("ROLLBACK"); expect(await f.checks()).toEqual(checks);
+  });
+
+  it("does not let a correct v3 guard hide a versioned non-scope CHECK", async () => {
+    const f = await fixture();
+    await f.db.exec(`ALTER TABLE creator_auto_check_health ADD CONSTRAINT creator_auto_check_health_scope_v2 CHECK(consecutive>=0)`);
+    const checks = await f.checks();
+    await expect(f.store.ensureSchema()).rejects.toThrow("CREATOR_AUTO_CHECK_HEALTH_UNAVAILABLE");
+    expect(await f.checks()).toEqual(checks);
   });
 
   it("counts ten genuine polls, deduplicates an entire streak and retries the same incident across restart", async () => {
